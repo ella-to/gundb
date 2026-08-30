@@ -28,3 +28,36 @@ func TestHAM(t *testing.T) {
 		}
 	}
 }
+
+func TestApplyConverges(t *testing.T) {
+	// Two peers receiving the same conflicting writes in opposite order end
+	// up with the same value.
+	w1 := graph{"x": {Soul: "x", Fields: map[string]Value{"v": String("one")}, States: map[string]float64{"v": 100}}}
+	w2 := graph{"x": {Soul: "x", Fields: map[string]Value{"v": String("two")}, States: map[string]float64{"v": 100}}}
+	a, b := New(), New()
+	defer a.Close()
+	defer b.Close()
+	a.apply(t.Context(), w1)
+	a.apply(t.Context(), w2)
+	b.apply(t.Context(), w2)
+	b.apply(t.Context(), w1)
+	va, _ := a.Get("x").Get("v").Once[string](t.Context())
+	vb, _ := b.Get("x").Get("v").Once[string](t.Context())
+	if va != "two" || vb != "two" {
+		t.Fatalf("diverged: %q vs %q", va, vb)
+	}
+}
+
+func TestFutureWriteIsAppliedLater(t *testing.T) {
+	db := New()
+	defer db.Close()
+	soon := float64(db.state.nowMs() + 150)
+	db.apply(t.Context(), graph{"x": {Soul: "x", Fields: map[string]Value{"v": Bool(true)}, States: map[string]float64{"v": soon}}})
+	if _, err := db.Get("x").Get("v").Once[bool](t.Context()); err != ErrNotFound {
+		t.Fatal("future write applied too early")
+	}
+	eventually(t, func() bool {
+		v, _ := db.Get("x").Get("v").Once[bool](t.Context())
+		return v
+	})
+}
