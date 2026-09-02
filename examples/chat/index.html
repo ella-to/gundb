@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GUN chat</title>
+<script src="https://cdn.jsdelivr.net/npm/gun@0.2020.1241/gun.js"></script>
+<style>body{font:16px sans-serif;max-width:40em;margin:2em auto}li b{margin-right:.5em}</style>
+<ul id="log"></ul>
+<form id="f"><input id="name" placeholder="name" size="8"> <input id="text" placeholder="say something" autofocus> <button>send</button></form>
+<script>
+  const gun = Gun([location.origin + '/gun']);
+  const chat = gun.get('chat');
+  const seen = {};
+  chat.map().on((m, id) => {
+    if (!m || seen[id]) return;
+    seen[id] = true;
+    const li = document.createElement('li');
+    li.innerHTML = '<b></b><span></span>';
+    li.querySelector('b').textContent = m.who;
+    li.querySelector('span').textContent = m.text;
+    document.getElementById('log').append(li);
+  });
+  document.getElementById('f').onsubmit = (e) => {
+    e.preventDefault();
+    const text = document.getElementById('text');
+    chat.set({ who: document.getElementById('name').value || 'anon', text: text.value, at: Date.now() });
+    text.value = '';
+  };
+</script>
