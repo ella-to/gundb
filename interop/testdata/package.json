@@ -1,0 +1,9 @@
+{
+  "name": "gundb-interop",
+  "private": true,
+  "description": "JavaScript GUN peers used by the Go interop tests",
+  "dependencies": {
+    "gun": "0.2020.1241",
+    "ws": "^8.18.0"
+  }
+}
