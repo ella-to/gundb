@@ -15,3 +15,14 @@ type Store interface {
 	Get(ctx context.Context, soul string) (*Node, error)
 	Put(ctx context.Context, node *Node) error
 }
+
+// FieldStore is an optional extension of Store. When the store implements
+// it, the runtime calls PutFields with only the fields that won HAM in a
+// merge, instead of Put with the whole merged node. Stores that keep history
+// or write field by field use it to avoid rewriting unchanged fields.
+//
+// changed holds the accepted fields of soul; it must not be retained.
+type FieldStore interface {
+	Store
+	PutFields(ctx context.Context, soul string, changed *Node) error
+}

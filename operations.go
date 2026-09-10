@@ -44,7 +44,13 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 			}
 		}
 		if dirty {
-			if err := db.store.Put(ctx, cur); err != nil {
+			var err error
+			if fs, ok := db.store.(FieldStore); ok {
+				err = fs.PutFields(ctx, soul, changed[soul])
+			} else {
+				err = db.store.Put(ctx, cur)
+			}
+			if err != nil {
 				db.mergeMu.Unlock()
 				return nil, err
 			}
