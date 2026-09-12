@@ -39,7 +39,9 @@ program in [`examples/`](examples/).
 - **Offline-first.** Configured peers are re-dialled automatically. Writes
   made while offline are sent on reconnect, and subscriptions are restored.
 - **Pluggable.** Storage is a two-method `Store` interface (in-memory by
-  default). The transport is `transport.Conn`, with WebSocket built in
+  default). `storage/pebblestore` persists to disk on Pebble (an LSM tree)
+  and keeps every accepted write, readable with `History` and `GetAt`.
+  The transport is `transport.Conn`, with WebSocket built in
   (`transport/ws`).
 
 ## Layout
@@ -50,6 +52,7 @@ program in [`examples/`](examples/).
 | `transport/`       | the `Conn` / `Dialer` / `Listener` interfaces         |
 | `transport/ws/`    | WebSocket adapter (default)                           |
 | `storage/memstore` | in-memory store that can list its souls               |
+| `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `examples/`        | runnable programs used by the guide                   |
 | `interop/`         | tests against the JavaScript GUN                      |
 

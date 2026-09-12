@@ -397,6 +397,142 @@ func main() {
 
 ## 8. Persist to disk
 
+By default a DB keeps its data in memory. To keep it on disk, pass a different `Store` in `Options`; nothing else in your code changes. `storage/pebblestore` uses [Pebble](https://github.com/cockroachdb/pebble), an LSM-tree engine: writes are appends to a log and reads are short scans over sorted keys, so it stays fast with large datasets. Run this twice and the counter keeps going.
+
+<!-- example: examples/pebble/main.go -->
+```go
+// Swap the storage: keep the data on disk with Pebble. Run it twice.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"ella.to/gundb"
+	"ella.to/gundb/storage/pebblestore"
+)
+
+func main() {
+	ctx := context.Background()
+	dir := filepath.Join(os.TempDir(), "gundb-pebble-example")
+
+	store, err := pebblestore.Open(dir)
+	check(err)
+	defer store.Close() // deferred first, so it closes after the DB
+
+	db := gundb.New(gundb.Options{Store: store})
+	defer db.Close()
+
+	runs, err := db.Get("stats").Get("runs").Once[int](ctx)
+	if err != nil && !errors.Is(err, gundb.ErrNotFound) {
+		log.Fatal(err)
+	}
+	runs++
+	check(db.Get("stats").Get("runs").Put(ctx, runs))
+	fmt.Printf("run #%d (data in %s)\n", runs, dir)
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+| Store | Where data lives | History | Use it for |
+| ----- | ---------------- | ------- | ---------- |
+| `gundb.NewMemoryStore()` (default) | memory | no | tests, relays that don't need to keep data |
+| `storage/memstore` | memory | no | inspecting what a peer holds (`Souls()`) |
+| `storage/pebblestore` | disk | yes | anything you want to keep |
+
+Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
+
+## 9. Read history
+
+`pebblestore` keeps every write that won HAM, deletions (`null`) included. The DB always reads the latest version; for older ones, ask the store:
+
+- `store.History(ctx, soul, field)` yields every version of a field, newest first. Each `Version` has the `State` (a timestamp) and the `Value`.
+- `store.GetAt(ctx, soul, t)` returns the whole node as it was at state `t`: for each field, the newest version written at or before `t`.
+
+States are GUN's HAM states: milliseconds since the Unix epoch, as a `float64`. Convert with `time.UnixMilli(int64(v.State))` and `float64(t.UnixMilli())`.
+
+<!-- example: examples/history/main.go -->
+```go
+// Read old versions: pebblestore keeps every accepted write.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"ella.to/gundb"
+	"ella.to/gundb/storage/pebblestore"
+)
+
+type Doc struct {
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
+func main() {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "gundb-history-example")
+	check(err)
+	defer os.RemoveAll(dir)
+
+	store, err := pebblestore.Open(dir)
+	check(err)
+	defer store.Close()
+	db := gundb.New(gundb.Options{Store: store})
+	defer db.Close()
+
+	doc := db.Get("readme") // a root node: its soul is "readme"
+	check(doc.Put(ctx, Doc{Title: "Draft", Status: "writing"}))
+	time.Sleep(10 * time.Millisecond)
+	checkpoint := time.Now() // remember a moment in time
+	time.Sleep(10 * time.Millisecond)
+	check(doc.Get("title").Put(ctx, "Final"))
+	check(doc.Get("status").Put(ctx, "published"))
+
+	// The DB always reads the latest version.
+	now, err := doc.Once[Doc](ctx)
+	check(err)
+	fmt.Println("now:", now.Title, now.Status) // now: Final published
+
+	// History reads the store directly, by soul and field, newest first.
+	for v, err := range store.History(ctx, "readme", "title") {
+		check(err)
+		at := time.UnixMilli(int64(v.State)).Format("15:04:05.000")
+		fmt.Println("title was", v.Value, "at", at)
+	}
+
+	// GetAt returns the whole node as it was at a moment. States are
+	// milliseconds since the Unix epoch.
+	old, err := store.GetAt(ctx, "readme", float64(checkpoint.UnixMilli()))
+	check(err)
+	fmt.Println("at checkpoint:", old.Fields["title"], old.Fields["status"]) // Draft writing
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+History is addressed by soul. For `db.Get(key)` the soul is `key`. A nested node such as `db.Get("users").Get("alice")` gets the soul `users/alice` when a `Put` creates it, unless the field already links to another node, as it does after a `Set` or after putting a `*Ref`. Values in `History` and `GetAt` are `gundb.Value`s: `gundb.String`, `gundb.Number`, `gundb.Bool`, `gundb.Null` (deleted) or `gundb.Link` (a reference to another node).
+
+History is kept only by peers whose store is a `pebblestore`, and it is never pruned.
+
+## 10. Write your own Store
+
 A `Store` is two methods. This one keeps each node in a JSON file; run it twice and the counter keeps going.
 
 <!-- example: examples/persist/main.go -->
@@ -472,7 +608,9 @@ func check(err error) {
 }
 ```
 
-## 9. A CLI for any GUN peer
+The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields.
+
+## 11. A CLI for any GUN peer
 
 Works against Go and JS relays alike: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
 
