@@ -54,6 +54,7 @@ program in [`examples/`](examples/).
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `examples/`        | runnable programs used by the guide                   |
+| `loadtest/`        | load generator: throughput, latency, cost per user    |
 | `interop/`         | tests against the JavaScript GUN                      |
 
 ## Tests
@@ -63,6 +64,13 @@ go test -race ./...
 
 # also run against real GUN.js (needs Node.js):
 (cd interop/testdata && npm install) && go test ./interop
+```
+
+Load test a relay with simulated users (the relay runs in its own process;
+pass `-store pebble` or `-store pebble-nosync` to test persistence):
+
+```sh
+go run ./loadtest -users 100,1000,10000 -duration 10s
 ```
 
 ## Not included (yet)
