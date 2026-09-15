@@ -14,6 +14,9 @@ func TestHAM(t *testing.T) {
 		want             hamResult
 	}{
 		{"future write is deferred", 10, 11, 5, String("a"), String("b"), hamDefer},
+		{"next millisecond is deferred", 10.5, 11, 5, String("a"), String("b"), hamDefer},
+		{"same millisecond, later counter is applied", 10, 10.002, 5, String("a"), String("b"), hamIncoming},
+		{"same millisecond, end of it is applied", 10.001, 10.999, 5, String("a"), String("b"), hamIncoming},
 		{"older write is historical", 10, 4, 5, String("a"), String("b"), hamHistorical},
 		{"newer write wins", 10, 6, 5, String("a"), String("b"), hamIncoming},
 		{"first write wins", 10, 6, inf, String("a"), nil, hamIncoming},
