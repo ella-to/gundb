@@ -3,6 +3,7 @@ package gundb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -77,6 +78,35 @@ func TestPutOnceLocal(t *testing.T) {
 	}
 	if _, err := db.Get("nobody").Once[User](ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// Merges are locked per soul: concurrent writes to one node must not lose
+// fields, and writes to different nodes must all land.
+func TestConcurrentLocalMerges(t *testing.T) {
+	ctx := t.Context()
+	db := New()
+	defer db.Close()
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Go(func() {
+			if err := db.Get("shared").Get(fmt.Sprint("f", i)).Put(ctx, i); err != nil {
+				t.Error(err)
+			}
+			if err := db.Get(fmt.Sprint("own", i)).Get("v").Put(ctx, i); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	shared, err := db.Get("shared").Once[map[string]int](ctx)
+	if err != nil || len(shared) != 50 {
+		t.Fatalf("shared node has %d fields, err %v", len(shared), err)
+	}
+	for i := range 50 {
+		if v, err := db.Get(fmt.Sprint("own", i)).Get("v").Once[int](ctx); err != nil || v != i {
+			t.Fatalf("own%d = %d, %v", i, v, err)
+		}
 	}
 }
 

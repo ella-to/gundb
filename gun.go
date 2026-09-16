@@ -3,6 +3,7 @@ package gundb
 import (
 	"context"
 	"errors"
+	"hash/maphash"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -58,7 +59,11 @@ type DB struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mergeMu sync.Mutex // serialises read-merge-write on the store
+	// mergeMu serialises read-merge-write per soul. HAM merges each node on
+	// its own, so writes to different souls run in parallel (and a store
+	// can sync them to disk together).
+	mergeMu   [256]sync.Mutex
+	mergeSeed maphash.Seed
 
 	peersMu  sync.Mutex
 	peers    map[*peer]struct{}
@@ -114,20 +119,21 @@ func New(opts ...Options) *DB {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	db := &DB{
-		pid:      o.PID,
-		store:    o.Store,
-		dialer:   o.Dialer,
-		wait:     o.Wait,
-		log:      o.Logger,
-		state:    newStateGen(),
-		dup:      newDup(0),
-		ctx:      ctx,
-		cancel:   cancel,
-		peers:    map[*peer]struct{}{},
-		changed:  make(chan struct{}),
-		pending:  map[string]*request{},
-		interest: map[string]*interest{},
-		watchers: map[string]map[*watcher]struct{}{},
+		pid:       o.PID,
+		store:     o.Store,
+		dialer:    o.Dialer,
+		wait:      o.Wait,
+		log:       o.Logger,
+		state:     newStateGen(),
+		dup:       newDup(0),
+		ctx:       ctx,
+		cancel:    cancel,
+		peers:     map[*peer]struct{}{},
+		changed:   make(chan struct{}),
+		pending:   map[string]*request{},
+		interest:  map[string]*interest{},
+		watchers:  map[string]map[*watcher]struct{}{},
+		mergeSeed: maphash.MakeSeed(),
 	}
 	for _, url := range o.Peers {
 		db.Connect(url)

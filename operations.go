@@ -3,6 +3,7 @@ package gundb
 import (
 	"context"
 	"errors"
+	"hash/maphash"
 	"math"
 	"sync"
 	"time"
@@ -15,12 +16,13 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 	changed, later := graph{}, graph{}
 	var wake float64
 
-	db.mergeMu.Lock()
 	machine := db.state.Next()
 	for soul, in := range g {
+		mu := db.mergeLock(soul)
+		mu.Lock()
 		cur, err := db.store.Get(ctx, soul)
 		if err != nil {
-			db.mergeMu.Unlock()
+			mu.Unlock()
 			return nil, err
 		}
 		if cur == nil {
@@ -51,12 +53,12 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 				err = db.store.Put(ctx, cur)
 			}
 			if err != nil {
-				db.mergeMu.Unlock()
+				mu.Unlock()
 				return nil, err
 			}
 		}
+		mu.Unlock()
 	}
-	db.mergeMu.Unlock()
 
 	if len(later) > 0 {
 		wait := time.Duration(min(wake-machine, math.MaxInt32)+1) * time.Millisecond
@@ -68,6 +70,11 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 	}
 	db.notify(changed)
 	return changed, nil
+}
+
+// mergeLock returns the lock that serialises merges into soul.
+func (db *DB) mergeLock(soul string) *sync.Mutex {
+	return &db.mergeMu[maphash.String(db.mergeSeed, soul)%uint64(len(db.mergeMu))]
 }
 
 // write applies a local write and sends it to peers. With ack it waits for
