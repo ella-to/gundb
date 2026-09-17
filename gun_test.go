@@ -389,6 +389,48 @@ func TestConcurrentWrites(t *testing.T) {
 	})
 }
 
+// A relay forwards puts only to the peers that asked for the soul, and the
+// index of who asked is cleaned up when a peer leaves.
+func TestRelayForwardsToSubscribersOnly(t *testing.T) {
+	ctx := t.Context()
+	relay, writer, other := newDB(t), newDB(t), newDB(t)
+	fan := New(Options{Wait: 500 * time.Millisecond})
+	defer fan.Close()
+	for _, p := range []*DB{writer, fan, other} {
+		link(t, relay, p)
+	}
+	if err := writer.Get("news").Get("v").PutAck(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := fan.Get("news").Get("v").Once[string](ctx); err != nil || v != "first" {
+		t.Fatalf("fan read %q, %v", v, err)
+	}
+	relay.subsMu.Lock()
+	n := len(relay.subs["news"])
+	relay.subsMu.Unlock()
+	if n != 1 {
+		t.Fatalf("news has %d subscribers, want 1", n)
+	}
+
+	if err := writer.Get("news").Get("v").PutAck(ctx, "second"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool {
+		n, _ := fan.store.Get(ctx, "news")
+		return n != nil && n.Fields["v"] == String("second")
+	})
+	if n, _ := other.store.Get(ctx, "news"); n != nil {
+		t.Fatalf("a peer that never asked got %+v", n)
+	}
+
+	fan.Close()
+	eventually(t, func() bool {
+		relay.subsMu.Lock()
+		defer relay.subsMu.Unlock()
+		return len(relay.subs) == 0
+	})
+}
+
 func TestSelfConnectionIsDropped(t *testing.T) {
 	a := New(Options{PID: "same"})
 	defer a.Close()

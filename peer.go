@@ -14,7 +14,6 @@ import (
 type peer struct {
 	db     *DB
 	conn   transport.Conn
-	dialed bool      // we dialled it (an upstream peer)
 	origin *outbound // the configured peer this connection belongs to, if dialled
 	out    chan []byte
 	ctx    context.Context
@@ -40,7 +39,7 @@ const maxQueue = 10_000
 // run serves one connection until it closes.
 func (db *DB) run(conn transport.Conn, o *outbound) {
 	ctx, cancel := context.WithCancel(db.ctx)
-	p := &peer{db: db, conn: conn, dialed: o != nil, origin: o, out: make(chan []byte, 4096), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	p := &peer{db: db, conn: conn, origin: o, out: make(chan []byte, 4096), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -76,6 +75,7 @@ func (db *DB) run(conn transport.Conn, o *outbound) {
 	}
 	db.signalLocked()
 	db.peersMu.Unlock()
+	db.unsubscribe(p)
 	db.peerGone(p)
 	db.log.Debug("gundb: peer disconnected", "peer", conn.RemoteAddr())
 }
@@ -174,21 +174,60 @@ func (p *peer) getPID() string {
 	return p.pid
 }
 
+// want records that the remote asked for soul, so it gets later changes.
+// It is called from p's own read loop, so it never races with unsubscribe.
 func (p *peer) want(soul string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	known := p.wants[soul]
 	p.wants[soul] = true
+	p.mu.Unlock()
+	if known {
+		return
+	}
+	db := p.db
+	db.subsMu.Lock()
+	defer db.subsMu.Unlock()
+	if db.subs[soul] == nil {
+		db.subs[soul] = map[*peer]struct{}{}
+	}
+	db.subs[soul][p] = struct{}{}
 }
 
-func (p *peer) wantsAny(g graph) bool {
+// unsubscribe forgets everything a disconnected peer asked for.
+func (db *DB) unsubscribe(p *peer) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for soul := range g {
-		if p.wants[soul] {
-			return true
+	souls := slices.Collect(maps.Keys(p.wants))
+	p.mu.Unlock()
+	db.subsMu.Lock()
+	defer db.subsMu.Unlock()
+	for _, soul := range souls {
+		delete(db.subs[soul], p)
+		if len(db.subs[soul]) == 0 {
+			delete(db.subs, soul)
 		}
 	}
-	return false
+}
+
+// recipients returns the peers that get changes to the souls in g: those
+// that asked for one of them, plus our upstream peers. The cost depends on
+// the number of subscribers, not on the number of connected peers.
+func (db *DB) recipients(g graph) []*peer {
+	set := map[*peer]struct{}{}
+	db.subsMu.Lock()
+	for soul := range g {
+		for p := range db.subs[soul] {
+			set[p] = struct{}{}
+		}
+	}
+	db.subsMu.Unlock()
+	db.peersMu.Lock()
+	for _, o := range db.outbound {
+		if o.live != nil {
+			set[o.live] = struct{}{}
+		}
+	}
+	db.peersMu.Unlock()
+	return slices.Collect(maps.Keys(set))
 }
 
 func (db *DB) livePeers() []*peer {

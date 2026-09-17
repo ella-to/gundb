@@ -108,8 +108,8 @@ func (db *DB) handlePut(p *peer, m *message) {
 		return
 	}
 	raw := db.encode(m)
-	for _, q := range db.livePeers() {
-		if q != p && !m.sentTo(q.getPID()) && (q.dialed || q.wantsAny(changed)) {
+	for _, q := range db.recipients(changed) {
+		if q != p && !m.sentTo(q.getPID()) {
 			q.send(raw)
 		}
 	}

@@ -78,6 +78,9 @@ type DB struct {
 
 	watchMu  sync.Mutex
 	watchers map[string]map[*watcher]struct{}
+
+	subsMu sync.Mutex
+	subs   map[string]map[*peer]struct{} // soul -> peers that asked for it
 }
 
 // Errors returned by DB and Ref methods.
@@ -134,6 +137,7 @@ func New(opts ...Options) *DB {
 		interest:  map[string]*interest{},
 		watchers:  map[string]map[*watcher]struct{}{},
 		mergeSeed: maphash.MakeSeed(),
+		subs:      map[string]map[*peer]struct{}{},
 	}
 	for _, url := range o.Peers {
 		db.Connect(url)
