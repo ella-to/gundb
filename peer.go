@@ -15,9 +15,15 @@ type peer struct {
 	db     *DB
 	conn   transport.Conn
 	origin *outbound // the configured peer this connection belongs to, if dialled
-	out    chan []byte
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Outgoing messages. The queue holds no memory while empty and grows
+	// only while messages wait, so idle peers are cheap.
+	outMu   sync.Mutex
+	out     [][]byte
+	outWake chan struct{} // capacity 1: something is queued
+	outRoom chan struct{} // closed when a full queue gets room again
 
 	mu    sync.Mutex
 	pid   string
@@ -36,10 +42,20 @@ type outbound struct {
 // maxQueue bounds the writes buffered for a disconnected peer.
 const maxQueue = 10_000
 
+// maxOut bounds the messages queued for a connected peer, and maxBatch the
+// messages sent together in one frame.
+const (
+	maxOut   = 4096
+	maxBatch = 100
+)
+
+// slowPeer is how long a peer's queue may stay full before it is dropped.
+var slowPeer = 5 * time.Second
+
 // run serves one connection until it closes.
 func (db *DB) run(conn transport.Conn, o *outbound) {
 	ctx, cancel := context.WithCancel(db.ctx)
-	p := &peer{db: db, conn: conn, origin: o, out: make(chan []byte, 4096), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	p := &peer{db: db, conn: conn, origin: o, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -111,12 +127,17 @@ func (p *peer) writeLoop() {
 			return
 		case <-t.C:
 			frame = heartbeat
-		case raw := <-p.out:
-			frame = raw
-			if n := min(len(p.out), 99); n > 0 {
-				frame = append([]byte{'['}, raw...)
-				for range n {
-					frame = append(append(frame, ','), <-p.out...)
+		case <-p.outWake:
+			batch := p.next()
+			switch len(batch) {
+			case 0:
+				continue
+			case 1:
+				frame = batch[0]
+			default:
+				frame = append([]byte{'['}, batch[0]...)
+				for _, raw := range batch[1:] {
+					frame = append(append(frame, ','), raw...)
 				}
 				frame = append(frame, ']')
 			}
@@ -131,28 +152,66 @@ func (p *peer) writeLoop() {
 	}
 }
 
-// send queues one encoded message. A peer that stays backed up for 5s is
-// disconnected rather than allowed to stall the rest of the mesh.
+// send queues one encoded message. A peer that stays backed up for
+// slowPeer is disconnected rather than allowed to stall the rest of the mesh.
 func (p *peer) send(raw []byte) {
 	if raw == nil {
 		return
 	}
-	select {
-	case p.out <- raw:
-		return
-	case <-p.ctx.Done():
-		return
-	default:
+	var timeout <-chan time.Time
+	for {
+		p.outMu.Lock()
+		if len(p.out) < maxOut {
+			p.out = append(p.out, raw)
+			p.outMu.Unlock()
+			select {
+			case p.outWake <- struct{}{}:
+			default:
+			}
+			return
+		}
+		if p.outRoom == nil {
+			p.outRoom = make(chan struct{})
+		}
+		room := p.outRoom
+		p.outMu.Unlock()
+		if timeout == nil {
+			t := time.NewTimer(slowPeer)
+			defer t.Stop()
+			timeout = t.C
+		}
+		select {
+		case <-room:
+		case <-p.ctx.Done():
+			return
+		case <-timeout:
+			p.db.log.Warn("gundb: peer too slow, disconnecting", "peer", p.conn.RemoteAddr())
+			p.close()
+			return
+		}
 	}
-	t := time.NewTimer(5 * time.Second)
-	defer t.Stop()
-	select {
-	case p.out <- raw:
-	case <-p.ctx.Done():
-	case <-t.C:
-		p.db.log.Warn("gundb: peer too slow, disconnecting", "peer", p.conn.RemoteAddr())
-		p.close()
+}
+
+// next takes up to maxBatch queued messages, oldest first.
+func (p *peer) next() [][]byte {
+	p.outMu.Lock()
+	defer p.outMu.Unlock()
+	n := min(len(p.out), maxBatch)
+	batch := p.out[:n:n]
+	if n == len(p.out) {
+		p.out = nil // drained: let the backing array go
+	} else {
+		p.out = p.out[n:]
+		select { // more to send
+		case p.outWake <- struct{}{}:
+		default:
+		}
 	}
+	if p.outRoom != nil {
+		close(p.outRoom)
+		p.outRoom = nil
+	}
+	return batch
 }
 
 func (p *peer) close() {
