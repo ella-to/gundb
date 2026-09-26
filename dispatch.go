@@ -75,6 +75,13 @@ func (db *DB) handleDam(p *peer, m *message) {
 
 func (db *DB) handleAck(p *peer, m *message) {
 	if len(m.Put) > 0 {
+		// Data answering a get counts as a write by whoever sent it.
+		if err := db.allowWrite(p, m.Put); err != nil {
+			db.log.Debug("gundb: dropped reply", "peer", p.conn.RemoteAddr(), "err", err)
+			m.Put = nil
+		}
+	}
+	if len(m.Put) > 0 {
 		if err := m.Put.check(); err != nil {
 			db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
 		} else if _, err := db.apply(db.ctx, m.Put); err != nil {
@@ -83,18 +90,22 @@ func (db *DB) handleAck(p *peer, m *message) {
 	}
 	if r := db.answer(p, m); r != nil {
 		if r.to != nil && len(m.Put) > 0 { // data for a get we are relaying
-			r.to.send(db.encode(m))
+			db.sendTo(r.to, m, db.encode(m))
 		}
 		return
 	}
 	if to := db.dup.via(m.Ack); to != nil && to != p {
 		db.dup.track(m.Ack, nil) // keep the route alive for chunked replies
-		to.send(db.encode(m))
+		db.sendTo(to, m, db.encode(m))
 	}
 }
 
 func (db *DB) handlePut(p *peer, m *message) {
 	if err := m.Put.check(); err != nil {
+		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
+		return
+	}
+	if err := db.allowWrite(p, m.Put); err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
@@ -110,7 +121,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 	raw := db.encode(m)
 	for _, q := range db.recipients(changed) {
 		if q != p && !m.sentTo(q.getPID()) {
-			q.send(raw)
+			db.sendTo(q, m, raw)
 		}
 	}
 }
@@ -119,6 +130,10 @@ func (db *DB) handleGet(p *peer, m *message) {
 	q := m.Get
 	if q.Soul == "" { // LEX queries over souls are not supported
 		db.reply(p, &message{Ack: m.ID})
+		return
+	}
+	if !db.allowRead(p, q.Soul) {
+		db.reply(p, &message{Ack: m.ID, Err: errJSON(fmt.Errorf("%w: %q may not read %s", ErrForbidden, p.user, q.Soul))})
 		return
 	}
 	p.want(q.Soul)

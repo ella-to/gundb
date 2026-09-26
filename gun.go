@@ -36,6 +36,27 @@ type Options struct {
 
 	// PID is this peer's ID in the DAM handshake. Default: random.
 	PID string
+
+	// Authenticate identifies the user behind an incoming WebSocket
+	// connection from its upgrade request: a token in the query string,
+	// a cookie or a header. Return "" for an anonymous user, or an error to
+	// refuse the connection with 401 Unauthorized. Default: everyone is
+	// anonymous.
+	//
+	// Authenticate, CanRead and CanWrite apply to peers that connect to
+	// this DB. The DB's own calls (db.Get(...).Put) and the peers it dials
+	// (Peers) are trusted.
+	Authenticate func(r *http.Request) (user string, err error)
+
+	// CanRead reports whether user may read the node soul. Nodes a user may
+	// not read are never sent to them: not as an answer, not as a live
+	// update. Default: everyone may read everything.
+	CanRead func(user, soul string) bool
+
+	// CanWrite reports whether user may write field of the node soul. A put
+	// with any field denied is rejected whole, and PutAck on the writer
+	// returns ErrForbidden. Default: everyone may write everything.
+	CanWrite func(user, soul, field string) bool
 }
 
 // DB is a GUN peer: a local graph that syncs with other peers in real time.
@@ -81,6 +102,10 @@ type DB struct {
 
 	subsMu sync.Mutex
 	subs   map[string]map[*peer]struct{} // soul -> peers that asked for it
+
+	authenticate func(*http.Request) (string, error)
+	canRead      func(user, soul string) bool
+	canWrite     func(user, soul, field string) bool
 }
 
 // Errors returned by DB and Ref methods.
@@ -138,6 +163,10 @@ func New(opts ...Options) *DB {
 		watchers:  map[string]map[*watcher]struct{}{},
 		mergeSeed: maphash.MakeSeed(),
 		subs:      map[string]map[*peer]struct{}{},
+
+		authenticate: o.Authenticate,
+		canRead:      o.CanRead,
+		canWrite:     o.CanWrite,
 	}
 	for _, url := range o.Peers {
 		db.Connect(url)
@@ -197,7 +226,7 @@ func (db *DB) dialLoop(o *outbound) {
 			db.signalLocked()
 			db.peersMu.Unlock()
 		} else {
-			db.run(conn, o)
+			db.run(conn, o, "")
 		}
 		db.peersMu.Lock()
 		self := o.self
@@ -217,7 +246,7 @@ func (db *DB) dialLoop(o *outbound) {
 // until it closes. Use it to plug in any transport:
 //
 //	go db.Attach(conn)
-func (db *DB) Attach(conn transport.Conn) { db.run(conn, nil) }
+func (db *DB) Attach(conn transport.Conn) { db.run(conn, nil, "") }
 
 // Serve accepts peers from l until l is closed or ctx is done.
 func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
@@ -235,12 +264,21 @@ func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
 
 // ServeHTTP upgrades the request to a WebSocket and serves it as a peer.
 func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var user string
+	if db.authenticate != nil {
+		var err error
+		if user, err = db.authenticate(r); err != nil {
+			db.log.Debug("gundb: authentication failed", "remote", r.RemoteAddr, "err", err)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	conn, err := ws.Accept(w, r)
 	if err != nil {
 		db.log.Debug("gundb: websocket upgrade failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
-	db.Attach(conn)
+	db.run(conn, nil, user)
 }
 
 // signalLocked wakes everyone waiting for connectivity to change.

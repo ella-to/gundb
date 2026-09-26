@@ -2,7 +2,6 @@ package gundb
 
 import (
 	"context"
-	"errors"
 	"hash/maphash"
 	"math"
 	"sync"
@@ -93,7 +92,8 @@ func (db *DB) write(ctx context.Context, g graph, ack bool) error {
 		r = db.newRequest(id, true, nil)
 		defer db.endRequest(id)
 	}
-	db.sendOwn(db.encode(&message{ID: id, Put: g}))
+	m := &message{ID: id, Put: g}
+	db.sendOwn(m, db.encode(m))
 	if !ack {
 		return nil
 	}
@@ -154,7 +154,7 @@ func (db *DB) answer(p *peer, m *message) *request {
 	default:
 	}
 	if e := m.errText(); e != "" {
-		r.err = errors.New(e)
+		r.err = remoteError(e)
 	}
 	last := len(m.More) == 0
 	if last {

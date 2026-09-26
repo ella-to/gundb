@@ -15,6 +15,7 @@ type peer struct {
 	db     *DB
 	conn   transport.Conn
 	origin *outbound // the configured peer this connection belongs to, if dialled
+	user   string    // who connected, from Options.Authenticate
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -53,9 +54,9 @@ const (
 var slowPeer = 5 * time.Second
 
 // run serves one connection until it closes.
-func (db *DB) run(conn transport.Conn, o *outbound) {
+func (db *DB) run(conn transport.Conn, o *outbound, user string) {
 	ctx, cancel := context.WithCancel(db.ctx)
-	p := &peer{db: db, conn: conn, origin: o, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	p := &peer{db: db, conn: conn, origin: o, user: user, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -295,9 +296,9 @@ func (db *DB) livePeers() []*peer {
 	return slices.Collect(maps.Keys(db.peers))
 }
 
-// sendOwn sends a message we created to every peer, and queues it for
-// configured peers that are currently disconnected.
-func (db *DB) sendOwn(raw []byte) {
+// sendOwn sends a message we created to every peer (only what each may
+// read), and queues it for configured peers that are currently disconnected.
+func (db *DB) sendOwn(m *message, raw []byte) {
 	db.peersMu.Lock()
 	peers := slices.Collect(maps.Keys(db.peers))
 	for _, o := range db.outbound {
@@ -307,6 +308,6 @@ func (db *DB) sendOwn(raw []byte) {
 	}
 	db.peersMu.Unlock()
 	for _, p := range peers {
-		p.send(raw)
+		db.sendTo(p, m, raw)
 	}
 }
