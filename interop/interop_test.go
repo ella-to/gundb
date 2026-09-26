@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -124,6 +125,34 @@ func TestJSClientsWithGoRelay(t *testing.T) {
 		runJS(t, peer, "set", "todo", `{"title":"b"}`)
 		assertJSON(t, wait(), `["a","b"]`)
 	})
+}
+
+// GUN.js browser clients logging in to a Go relay with write rules. The
+// token rides in the peer URL, as browsers cannot set WebSocket headers.
+func TestJSClientsWithAuthRelay(t *testing.T) {
+	requireNode(t)
+	relay := gundb.New(gundb.Options{
+		Authenticate: func(r *http.Request) (string, error) {
+			return strings.TrimPrefix(r.URL.Query().Get("token"), "tok-"), nil
+		},
+		CanWrite: func(user, soul, field string) bool {
+			owner, _, _ := strings.Cut(strings.TrimPrefix(soul, "users/"), "/")
+			return !strings.HasPrefix(soul, "users/") || owner == user
+		},
+	})
+	defer relay.Close()
+	srv := httptest.NewServer(relay)
+	defer srv.Close()
+	peer := srv.URL + "/gun"
+
+	assertJSON(t, runJS(t, peer+"?token=tok-ali", "put", "users/ali", `{"text":"hi"}`), `{"ok":true}`)
+
+	var res struct{ Err string }
+	out := runJS(t, peer+"?token=tok-bob", "put", "users/ali", `{"text":"hacked"}`)
+	if json.Unmarshal([]byte(out), &res) != nil || !strings.Contains(res.Err, "forbidden") {
+		t.Fatalf("bob's write: got %s, want a forbidden error", out)
+	}
+	assertJSON(t, runJS(t, peer+"?token=tok-bob", "once", "users/ali", "text"), `"hi"`)
 }
 
 // ---- helpers ----
