@@ -36,6 +36,9 @@ program in [`examples/`](examples/).
 - **Relays.** Any DB relays like a GUN.js server (AXE-style). Puts go to
   the peers that asked for those souls. Gets that miss locally are forwarded,
   and acks are routed back to whoever asked.
+- **Permissions.** A relay can authenticate each connection and decide
+  per user what it may read and write (`Authenticate`, `CanRead`,
+  `CanWrite`), for Go and GUN.js clients alike.
 - **Offline-first.** Configured peers are re-dialled automatically. Writes
   made while offline are sent on reconnect, and subscriptions are restored.
 - **Pluggable.** Storage is a two-method `Store` interface (in-memory by

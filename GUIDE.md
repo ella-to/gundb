@@ -338,7 +338,169 @@ func main() {
 }
 ```
 
-## 7. Browser + Go chat
+## 7. Permissions: who can read and write
+
+A relay decides what each connected user may do. Three `Options` set it up:
+
+| Option | Called | Decides |
+| ------ | ------ | ------- |
+| `Authenticate(r *http.Request) (user, error)` | once per connection, on the WebSocket upgrade | who is connecting: read a token, cookie or header; `""` is anonymous, an error refuses the connection (401) |
+| `CanWrite(user, soul, field) bool` | for every field of every incoming put | whether `user` may write it; one denied field rejects the whole put, and the writer's `PutAck` returns `gundb.ErrForbidden` |
+| `CanRead(user, soul) bool` | for every get, and for every node the relay sends out | whether `user` may see the node; denied nodes are never sent, so `Once` returns `gundb.ErrNotFound` and `On` never fires |
+
+Rules see souls and fields, not chain paths, so it helps to know how a path is stored. This write
+
+```go
+db.Get("users").Get("ali").Get("messages").Get("m1").Put(ctx, Message{Text: "hi"})
+```
+
+touches these nodes:
+
+| soul | field | value |
+| ---- | ----- | ----- |
+| `users` | `ali` | link to `users/ali` |
+| `users/ali` | `messages` | link to `users/ali/messages` |
+| `users/ali/messages` | `m1` | link to `users/ali/messages/m1` |
+| `users/ali/messages/m1` | `text` | `"hi"` |
+
+So a write rule that checks `soul + "/" + field` sees the path `users/ali/...` at every level, including the `users` → `ali` link, which stops Bob from pointing Ali's name at a node of his own. The example gives every user write access to their own `users/<name>/...`, read access to everything except `users/<name>/private`, and lets anonymous users read only.
+
+<!-- example: examples/auth/main.go -->
+```go
+// Read and write permissions on a relay. Everyone can read
+// users/<name>/messages, only <name> can write it, and users/<name>/private
+// is for <name>'s eyes only.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+
+	"ella.to/gundb"
+)
+
+type Message struct {
+	Text string `json:"text"`
+}
+
+// tokens stands in for your real login: sessions, JWTs, API keys...
+var tokens = map[string]string{"tok-ali": "ali", "tok-bob": "bob"}
+
+// owner returns who a path belongs to: "users/ali/messages/m1" -> "ali".
+func owner(path string) string {
+	rest, ok := strings.CutPrefix(path, "users/")
+	if !ok {
+		return ""
+	}
+	name, _, _ := strings.Cut(rest, "/")
+	return name
+}
+
+func main() {
+	ctx := context.Background()
+
+	relay := gundb.New(gundb.Options{
+		// Who is connecting? Browsers cannot set WebSocket headers, so the
+		// token comes in the URL. No token: an anonymous, read-only user.
+		Authenticate: func(r *http.Request) (string, error) {
+			token := r.URL.Query().Get("token")
+			if token == "" {
+				return "", nil
+			}
+			if user, ok := tokens[token]; ok {
+				return user, nil
+			}
+			return "", errors.New("unknown token")
+		},
+		// Write: users/<name>/... belongs to <name>. The check is on
+		// soul + "/" + field, so the link users -> ali is protected too.
+		CanWrite: func(user, soul, field string) bool {
+			if o := owner(soul + "/" + field); o != "" {
+				return o == user
+			}
+			return user != "" // anything else: any logged-in user
+		},
+		// Read: everything, except users/<name>/private.
+		CanRead: func(user, soul string) bool {
+			if o := owner(soul); o != "" && strings.HasPrefix(soul, "users/"+o+"/private") {
+				return o == user
+			}
+			return true
+		},
+	})
+	defer relay.Close()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	check(err)
+	go http.Serve(l, relay)
+	url := "ws://" + l.Addr().String() + "/gun"
+
+	ali := gundb.New(gundb.Options{Peers: []string{url + "?token=tok-ali"}})
+	bob := gundb.New(gundb.Options{Peers: []string{url + "?token=tok-bob"}})
+	defer ali.Close()
+	defer bob.Close()
+
+	// Ali writes her own messages. Use keyed Puts, not Set, for protected
+	// data: m1 gets the soul users/ali/messages/m1, which the rules can
+	// match; Set would give it a random soul.
+	messages := ali.Get("users").Get("ali").Get("messages")
+	check(messages.Get("m1").PutAck(ctx, Message{Text: "Hello from Ali"}))
+	check(ali.Get("users").Get("ali").Get("private").Get("note").PutAck(ctx, "buy a gift for Bob"))
+
+	// Bob can read them...
+	m, err := bob.Get("users").Get("ali").Get("messages").Get("m1").Once[Message](ctx)
+	check(err)
+	fmt.Println("bob reads:", m.Text) // bob reads: Hello from Ali
+
+	// ...but not write them. PutAck reports the relay's answer.
+	err = bob.Get("users").Get("ali").Get("messages").Get("m1").PutAck(ctx, Message{Text: "hacked"})
+	fmt.Println("bob writes:", errors.Is(err, gundb.ErrForbidden)) // bob writes: true
+
+	// And Ali's private node is never sent to him.
+	_, err = bob.Get("users").Get("ali").Get("private").Get("note").Once[string](ctx)
+	fmt.Println("bob reads the private note:", err) // gundb: not found
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+### Logging in from a client
+
+The token travels with the WebSocket upgrade request.
+
+- **Browsers** cannot set headers on a WebSocket, so put the token in the URL, `Gun(['https://example.com/gun?token=' + token])`, or rely on a cookie: same-site cookies are sent with the upgrade, so `Authenticate` can read `r.Cookie("session")`.
+- **Go clients** can use the URL the same way, or send a header through the dialer:
+
+```go
+db := gundb.New(gundb.Options{
+	Peers: []string{"wss://example.com/gun"},
+	Dialer: ws.Dialer{Options: &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
+	}},
+})
+```
+
+- **Other transports**: identify the user yourself and hand the connection over with `db.AttachAs(conn, user)`.
+
+### Things to know
+
+- **The relay enforces the rules.** They apply to peers that connect to it. The relay's own code (`relay.Get(...).Put`) and the peers it dials itself (`Options.Peers`) are trusted. If you run several relays, give each one the same rules.
+- **Use keyed `Put` for protected data, not `Set`.** `Set` gives each item a random soul, which a path rule cannot tell apart from anyone else's. `messages.Get(id).Put(ctx, msg)` gives it `users/ali/messages/<id>`.
+- **Check `PutAck`.** Like in GUN, a write is applied locally first and then sent. If the relay rejects it, nobody else ever sees it, but the writer's own copy keeps it until it is overwritten. `Put` does not wait for the answer, `PutAck` does.
+- **Reads are per node.** A user who may read `users/ali` sees its `private` field, but that field is only a link: the node it points to, with the content, is never sent. Put private data in its own node, as the example does.
+- **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
+- **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
+- **This is not SEA.** GUN.js's SEA signs data with each user's key pair so that any peer can verify it without trusting a server. gundb does not implement SEA. With relay rules, clients trust the relay that enforces them.
+
+## 8. Browser + Go chat
 
 A Go bot and browsers running GUN.js share one chat room. Open http://localhost:8765 in two tabs. The page is [`examples/chat/index.html`](examples/chat/index.html).
 
@@ -395,7 +557,7 @@ func main() {
 }
 ```
 
-## 8. Persist to disk
+## 9. Persist to disk
 
 By default a DB keeps its data in memory. To keep it on disk, pass a different `Store` in `Options`; nothing else in your code changes. `storage/pebblestore` uses [Pebble](https://github.com/cockroachdb/pebble), an LSM-tree engine: writes are appends to a log and reads are short scans over sorted keys, so it stays fast with large datasets. Run this twice and the counter keeps going.
 
@@ -451,7 +613,7 @@ func check(err error) {
 
 Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
 
-## 9. Read history
+## 10. Read history
 
 `pebblestore` keeps every write that won HAM, deletions (`null`) included. The DB always reads the latest version; for older ones, ask the store:
 
@@ -531,7 +693,7 @@ History is addressed by soul. For `db.Get(key)` the soul is `key`. A nested node
 
 History is kept only by peers whose store is a `pebblestore`, and it is never pruned.
 
-## 10. Write your own Store
+## 11. Write your own Store
 
 A `Store` is two methods. This one keeps each node in a JSON file; run it twice and the counter keeps going.
 
@@ -610,7 +772,7 @@ func check(err error) {
 
 The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields.
 
-## 11. A CLI for any GUN peer
+## 12. A CLI for any GUN peer
 
 Works against Go and JS relays alike: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
 
