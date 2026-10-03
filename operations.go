@@ -12,6 +12,9 @@ import (
 // and returns the accepted writes. Writes stamped in the future are held and
 // retried when their time comes, like the reference does.
 func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
+	if err := checkSEA(g); err != nil {
+		return nil, err
+	}
 	changed, later := graph{}, graph{}
 	var wake float64
 

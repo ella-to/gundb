@@ -31,7 +31,8 @@ func (r *reader) node(soul string) (*Node, error) {
 	if r.net {
 		r.db.sync(r.ctx, soul)
 	}
-	return r.db.store.Get(r.ctx, soul)
+	n, err := r.db.store.Get(r.ctx, soul)
+	return unsign(n), err
 }
 
 // at follows path from its root node through links and returns the value

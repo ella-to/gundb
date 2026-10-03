@@ -73,10 +73,12 @@ func (db *DB) sendTo(q *peer, m *message, raw []byte) {
 }
 
 // remoteError turns an error text received from a peer back into an error
-// that matches ErrForbidden.
+// that matches ErrForbidden or ErrUnverified.
 func remoteError(text string) error {
-	if rest, ok := strings.CutPrefix(text, ErrForbidden.Error()); ok {
-		return fmt.Errorf("%w%s", ErrForbidden, rest)
+	for _, known := range []error{ErrForbidden, ErrUnverified} {
+		if rest, ok := strings.CutPrefix(text, known.Error()); ok {
+			return fmt.Errorf("%w%s", known, rest)
+		}
 	}
 	return errors.New(text)
 }

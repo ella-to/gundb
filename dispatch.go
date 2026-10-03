@@ -2,6 +2,7 @@ package gundb
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -75,8 +76,9 @@ func (db *DB) handleDam(p *peer, m *message) {
 
 func (db *DB) handleAck(p *peer, m *message) {
 	if len(m.Put) > 0 {
-		// Data answering a get counts as a write by whoever sent it.
-		if err := db.allowWrite(p, m.Put); err != nil {
+		// Data answering a get counts as a write by whoever sent it, and is
+		// dropped, not relayed, if SEA rejects it.
+		if err := errors.Join(db.allowWrite(p, m.Put), checkSEA(m.Put)); err != nil {
 			db.log.Debug("gundb: dropped reply", "peer", p.conn.RemoteAddr(), "err", err)
 			m.Put = nil
 		}
