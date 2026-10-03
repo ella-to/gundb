@@ -420,3 +420,105 @@ func b64std(s string) ([]byte, error) {
 	s = strings.NewReplacer("-", "+", "_", "/").Replace(strings.TrimRight(s, "="))
 	return base64.RawStdEncoding.DecodeString(s)
 }
+
+// ---- graph data ----
+
+// SignField signs one field of a node in a user's space the way SEA's put
+// hook does: the signature covers the soul, field, value (as JSON) and HAM
+// state. It returns the string GUN stores as the field's value,
+// {":":value,"~":signature}.
+func SignField(soul, field string, value json.RawMessage, state float64, pair *Pair) (string, error) {
+	val, err := js.Restringify(value)
+	if err != nil {
+		return "", err
+	}
+	sig, err := sign(fieldPayload(soul, field, val, state), pair)
+	if err != nil {
+		return "", err
+	}
+	return `{":":` + string(val) + `,"~":` + js.Quote(sig) + `}`, nil
+}
+
+// VerifyField checks a stored field value made by SignField against the
+// owner's key pub, and returns the plain value as JSON. Writes made by
+// someone else under a SEA certificate are not supported and fail.
+func VerifyField(soul, field, stored string, state float64, pub string) (json.RawMessage, error) {
+	val, sig, err := splitField(stored)
+	if err != nil {
+		return nil, err
+	}
+	if err := verify(fieldPayload(soul, field, val, state), sig, pub); err != nil {
+		return nil, err
+	}
+	return val, nil
+}
+
+// FieldValue returns the plain value inside a stored signed field without
+// checking the signature (peers check it when the data arrives).
+func FieldValue(stored string) (json.RawMessage, bool) {
+	val, _, err := splitField(stored)
+	return val, err == nil
+}
+
+func splitField(stored string) (val json.RawMessage, sig string, err error) {
+	var f struct {
+		V    json.RawMessage `json:":"`
+		S    *string         `json:"~"`
+		Cert json.RawMessage `json:"+"`
+		By   json.RawMessage `json:"*"`
+	}
+	if json.Unmarshal([]byte(stored), &f) != nil || f.V == nil || f.S == nil {
+		return nil, "", errors.New("sea: unsigned data")
+	}
+	if f.Cert != nil || f.By != nil {
+		return nil, "", errors.New("sea: certificates are not supported")
+	}
+	if val, err = js.Restringify(f.V); err != nil {
+		return nil, "", err
+	}
+	return val, *f.S, nil
+}
+
+// fieldPayload is JSON.stringify({"#": soul, ".": field, ":": value, ">": state}).
+func fieldPayload(soul, field string, val json.RawMessage, state float64) string {
+	return `{"#":` + js.Quote(soul) + `,".":` + js.Quote(field) + `,":":` + string(val) + `,">":` + js.Number(state) + `}`
+}
+
+// PubOf returns the public key a soul belongs to, or "" if it is not in a
+// user's space: "~x.y" and "~x.y/profile" belong to "x.y" (SEA.opt.pub).
+func PubOf(soul string) string {
+	_, rest, ok := strings.Cut(soul, "~")
+	if !ok {
+		return ""
+	}
+	if i := strings.IndexByte(rest, '~'); i >= 0 {
+		rest = rest[:i] // split('~')[1]
+	}
+	parts := splitKeep(rest)
+	if len(parts) < 2 || strings.HasPrefix(parts[0], "@") {
+		return ""
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// splitKeep splits s on every non-word character like JS's split(/[^\w_-]/).
+// JS works on UTF-16 code units, so a character above U+FFFF is two
+// separators with an empty part between them.
+func splitKeep(s string) []string {
+	var parts []string
+	start := 0
+	for i, r := range s {
+		if !isWord(r) {
+			parts = append(parts, s[start:i])
+			if r > 0xFFFF {
+				parts = append(parts, "")
+			}
+			start = i + len(string(r))
+		}
+	}
+	return append(parts, s[start:])
+}
+
+func isWord(r rune) bool {
+	return r == '_' || r == '-' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') || ('0' <= r && r <= '9')
+}
