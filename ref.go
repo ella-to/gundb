@@ -19,11 +19,12 @@ import (
 type Ref struct {
 	db   *DB
 	path []string
+	user *User // signs writes into the user's space; nil for other refs
 }
 
 // Get returns a reference to the field key of this node.
 func (r *Ref) Get(key string) *Ref {
-	return &Ref{db: r.db, path: append(slices.Clip(r.path), key)}
+	return &Ref{db: r.db, path: append(slices.Clip(r.path), key), user: r.user}
 }
 
 // Key returns the last key of the path (the soul, for a root ref).
@@ -64,6 +65,11 @@ func (r *Ref) put(ctx context.Context, v any, ack bool) error {
 	if err := rd.build(g, r.path[0], obj, r.db.state.Next()); err != nil {
 		return err
 	}
+	if r.user != nil {
+		if err := r.user.sign(g); err != nil {
+			return err
+		}
+	}
 	return r.db.write(ctx, g, ack)
 }
 
@@ -85,12 +91,15 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 	if !isLink {
 		if soul = metaSoul(m); soul == "" {
 			soul = uuid()
+			if r.user != nil { // like GUN, a user's items live in their space
+				soul = "~" + r.user.Pub() + "/" + soul
+			}
 		}
-		if err := r.db.Get(soul).Put(ctx, m); err != nil {
+		if err := r.root(soul).Put(ctx, m); err != nil {
 			return nil, err
 		}
 	}
-	return r.db.Get(soul), r.Get(soul).Put(ctx, Link{Soul: soul})
+	return r.root(soul), r.Get(soul).Put(ctx, Link{Soul: soul})
 }
 
 // Once reads the current value into T. Data not yet known locally is
@@ -153,6 +162,9 @@ func (r *Ref) On[T any](fn func(T)) (off func()) {
 		fn(val)
 	})
 }
+
+// root returns a ref to the node soul that signs like r does.
+func (r *Ref) root(soul string) *Ref { return &Ref{db: r.db, path: []string{soul}, user: r.user} }
 
 // Map returns a view over the items of the node at this ref (the entries of
 // a Set, or the fields of any node), like gun.map() in JS.

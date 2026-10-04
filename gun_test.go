@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-type User struct {
-	Name string `json:"name"`
-	Age  int    `json:"age,omitempty"`
-	Boss *User  `json:"boss,omitempty"`
+type Member struct {
+	Name string  `json:"name"`
+	Age  int     `json:"age,omitempty"`
+	Boss *Member `json:"boss,omitempty"`
 }
 
 func eventually(t *testing.T, ok func() bool) {
@@ -65,10 +65,10 @@ func TestPutOnceLocal(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
 
-	if err := db.Get("alice").Put(ctx, User{Name: "Alice", Age: 30}); err != nil {
+	if err := db.Get("alice").Put(ctx, Member{Name: "Alice", Age: 30}); err != nil {
 		t.Fatal(err)
 	}
-	u, err := db.Get("alice").Once[User](ctx)
+	u, err := db.Get("alice").Once[Member](ctx)
 	if err != nil || u.Name != "Alice" || u.Age != 30 {
 		t.Fatalf("%+v %v", u, err)
 	}
@@ -76,7 +76,7 @@ func TestPutOnceLocal(t *testing.T) {
 	if err != nil || name != "Alice" {
 		t.Fatalf("%q %v", name, err)
 	}
-	if _, err := db.Get("nobody").Once[User](ctx); !errors.Is(err, ErrNotFound) {
+	if _, err := db.Get("nobody").Once[Member](ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
 	}
 }
@@ -125,21 +125,21 @@ func TestPutMergesFields(t *testing.T) {
 func TestNestedStructsBecomeLinkedNodes(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
-	db.Get("mark").Put(ctx, User{Name: "Mark", Boss: &User{Name: "Fluffy"}})
+	db.Get("mark").Put(ctx, Member{Name: "Mark", Boss: &Member{Name: "Fluffy"}})
 
 	// Same souls GUN JS would create.
 	n, _ := db.store.Get(ctx, "mark")
 	if n.Fields["boss"] != (Link{Soul: "mark/boss"}) {
 		t.Fatalf("boss = %#v", n.Fields["boss"])
 	}
-	u, _ := db.Get("mark").Once[User](ctx)
+	u, _ := db.Get("mark").Once[Member](ctx)
 	if u.Boss == nil || u.Boss.Name != "Fluffy" {
 		t.Fatalf("%+v", u)
 	}
 
 	// Writing through the path updates the same linked node.
 	db.Get("mark").Get("boss").Get("name").Put(ctx, "Fluffy II")
-	boss, _ := db.Get("mark").Get("boss").Once[User](ctx)
+	boss, _ := db.Get("mark").Get("boss").Once[Member](ctx)
 	if boss.Name != "Fluffy II" {
 		t.Fatalf("%+v", boss)
 	}
@@ -148,11 +148,11 @@ func TestNestedStructsBecomeLinkedNodes(t *testing.T) {
 func TestPutRefStoresLink(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
-	db.Get("bob").Put(ctx, User{Name: "Bob"})
-	db.Get("alice").Put(ctx, User{Name: "Alice"})
+	db.Get("bob").Put(ctx, Member{Name: "Bob"})
+	db.Get("alice").Put(ctx, Member{Name: "Alice"})
 	db.Get("alice").Get("boss").Put(ctx, db.Get("bob"))
 
-	u, _ := db.Get("alice").Once[User](ctx)
+	u, _ := db.Get("alice").Once[Member](ctx)
 	if u.Boss == nil || u.Boss.Name != "Bob" {
 		t.Fatalf("%+v", u)
 	}
@@ -176,7 +176,7 @@ func TestCyclesAreSafe(t *testing.T) {
 func TestDelete(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
-	db.Get("alice").Put(ctx, User{Name: "Alice", Age: 3})
+	db.Get("alice").Put(ctx, Member{Name: "Alice", Age: 3})
 	db.Get("alice").Get("age").Put(ctx, nil)
 	if _, err := db.Get("alice").Get("age").Once[int](ctx); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
@@ -197,22 +197,22 @@ func TestPutErrors(t *testing.T) {
 func TestOn(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
-	var c collector[User]
+	var c collector[Member]
 	off := db.Get("alice").On(c.add)
 	defer off()
 
-	db.Get("alice").Put(ctx, User{Name: "Alice"})
+	db.Get("alice").Put(ctx, Member{Name: "Alice"})
 	eventually(t, func() bool { u, _ := c.last(); return u.Name == "Alice" })
 
 	// Changes in a linked node fire too.
-	db.Get("alice").Get("boss").Put(ctx, User{Name: "Bob"})
+	db.Get("alice").Get("boss").Put(ctx, Member{Name: "Bob"})
 	eventually(t, func() bool { u, _ := c.last(); return u.Boss != nil && u.Boss.Name == "Bob" })
 	db.Get("alice").Get("boss").Get("name").Put(ctx, "Robert")
 	eventually(t, func() bool { u, _ := c.last(); return u.Boss != nil && u.Boss.Name == "Robert" })
 
 	off()
 	n := len(c.got)
-	db.Get("alice").Put(ctx, User{Name: "Changed"})
+	db.Get("alice").Put(ctx, Member{Name: "Changed"})
 	time.Sleep(50 * time.Millisecond)
 	if len(c.got) != n {
 		t.Fatal("callback fired after off")
@@ -278,16 +278,16 @@ func TestSyncBetweenPeers(t *testing.T) {
 	a, b := newDB(t), newDB(t)
 	link(t, a, b)
 
-	var c collector[User]
+	var c collector[Member]
 	defer b.Get("alice").On(c.add)()
 
-	a.Get("alice").Put(ctx, User{Name: "Alice", Boss: &User{Name: "Bob"}})
+	a.Get("alice").Put(ctx, Member{Name: "Alice", Boss: &Member{Name: "Bob"}})
 	eventually(t, func() bool { u, _ := c.last(); return u.Boss != nil && u.Boss.Name == "Bob" })
 
 	// Once on a peer that has never seen the data asks the network.
 	d := newDB(t)
 	link(t, a, d)
-	u, err := d.Get("alice").Once[User](ctx)
+	u, err := d.Get("alice").Once[Member](ctx)
 	if err != nil || u.Boss == nil || u.Boss.Name != "Bob" {
 		t.Fatalf("%+v %v", u, err)
 	}
