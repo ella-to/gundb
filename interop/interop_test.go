@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -91,6 +92,35 @@ func TestGoClientWithJSServer(t *testing.T) {
 	})
 }
 
+// Go SEA users through a stock JS relay, which verifies every signed
+// write itself and would refuse to store Go signatures it rejects.
+func TestGoUsersThroughJSRelay(t *testing.T) {
+	requireNode(t)
+	ctx := t.Context()
+	peer := startJSServer(t)
+	a := gundb.New(gundb.Options{Peers: []string{peer}})
+	defer a.Close()
+	u, err := a.CreateUser(ctx, "relayuser", "relay password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := u.Get("profile").PutAck(ctx, Person{Name: "Signed in Go"}); err != nil {
+		t.Fatalf("JS relay refused the Go-signed write: %v", err)
+	}
+
+	b := gundb.New(gundb.Options{Peers: []string{peer}}) // knows nothing yet
+	defer b.Close()
+	again, err := b.Login(ctx, "relayuser", "relay password")
+	if err != nil || again.Pub() != u.Pub() {
+		t.Fatalf("login through the JS relay: %v", err)
+	}
+	name, err := b.User(u.Pub()).Get("profile").Get("name").Once[string](ctx)
+	if err != nil || name != "Signed in Go" {
+		t.Fatalf("read through the JS relay: %q, %v", name, err)
+	}
+	assertJSON(t, runScript(t, "user-client.js", peer, "read", u.Pub(), "profile", "name"), `"Signed in Go"`)
+}
+
 // JS browser clients using a Go relay.
 func TestJSClientsWithGoRelay(t *testing.T) {
 	requireNode(t)
@@ -153,6 +183,77 @@ func TestJSClientsWithAuthRelay(t *testing.T) {
 		t.Fatalf("bob's write: got %s, want a forbidden error", out)
 	}
 	assertJSON(t, runJS(t, peer+"?token=tok-bob", "once", "users/ali", "text"), `"hi"`)
+}
+
+// SEA users between GUN.js and Go, through a Go relay that verifies every
+// signed write.
+func TestSEAUsersWithJS(t *testing.T) {
+	requireNode(t)
+	ctx := t.Context()
+	relay := gundb.New()
+	defer relay.Close()
+	srv := httptest.NewServer(relay)
+	defer srv.Close()
+	peer := srv.URL + "/gun"
+	goClient := func() *gundb.DB {
+		db := gundb.New(gundb.Options{Peers: []string{peer}})
+		t.Cleanup(func() { db.Close() })
+		return db
+	}
+	var res struct{ Pub, Err string }
+	parse := func(out string) {
+		t.Helper()
+		res.Pub, res.Err = "", ""
+		if json.Unmarshal([]byte(out), &res) != nil || res.Err != "" {
+			t.Fatalf("JS: %s", out)
+		}
+	}
+
+	t.Run("Go logs in to a user created in JS", func(t *testing.T) {
+		parse(runScript(t, "user-client.js", peer, "create", "jsuser", "js password"))
+		jsPub := res.Pub
+		assertJSON(t, runScript(t, "user-client.js", peer, "put", "jsuser", "js password", "profile", `{"name":"From JS"}`), `{"ok":true}`)
+
+		db := goClient()
+		u, err := db.Login(ctx, "jsuser", "js password")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if u.Pub() != jsPub {
+			t.Fatalf("Go got pub %s, JS created %s", u.Pub(), jsPub)
+		}
+		name, err := db.User(jsPub).Get("profile").Get("name").Once[string](ctx)
+		if err != nil || name != "From JS" {
+			t.Fatalf("Go read %q, %v", name, err)
+		}
+		if _, err := db.Login(ctx, "jsuser", "wrong password"); !errors.Is(err, gundb.ErrWrongLogin) {
+			t.Fatalf("wrong password: %v", err)
+		}
+	})
+
+	t.Run("JS logs in to a user created in Go", func(t *testing.T) {
+		db := goClient()
+		u, err := db.CreateUser(ctx, "gouser", "go password")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := u.Get("profile").PutAck(ctx, Person{Name: "From Go"}); err != nil {
+			t.Fatal(err)
+		}
+		parse(runScript(t, "user-client.js", peer, "login", "gouser", "go password"))
+		if res.Pub != u.Pub() {
+			t.Fatalf("JS got pub %s, Go created %s", res.Pub, u.Pub())
+		}
+		// sea.js verifies the Go signatures before it shows the data.
+		assertJSON(t, runScript(t, "user-client.js", peer, "read", u.Pub(), "profile", "name"), `"From Go"`)
+
+		// JS writes as the Go-created user; Go reads it back.
+		assertJSON(t, runScript(t, "user-client.js", peer, "put", "gouser", "go password", "status", `{"text":"hi from JS"}`), `{"ok":true}`)
+		text, err := goClient().User(u.Pub()).Get("status").Get("text").Once[string](ctx)
+		if err != nil || text != "hi from JS" {
+			t.Fatalf("Go read %q, %v", text, err)
+		}
+	})
 }
 
 // ---- helpers ----
@@ -246,6 +347,23 @@ func startJS(t *testing.T, peer string, args ...string) func() string {
 func runJS(t *testing.T, peer string, args ...string) string {
 	t.Helper()
 	return startJS(t, peer, args...)()
+}
+
+// runScript runs a testdata script and returns what it printed after RESULT.
+func runScript(t *testing.T, script string, args ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "node", append([]string{script}, args...)...)
+	cmd.Dir = "testdata"
+	out, _ := cmd.CombinedOutput()
+	for line := range strings.Lines(string(out)) {
+		if r, ok := strings.CutPrefix(strings.TrimSpace(line), "RESULT "); ok {
+			return r
+		}
+	}
+	t.Fatalf("%s %q: no result; output:\n%s", script, args, out)
+	return ""
 }
 
 func assertJSON(t *testing.T, got, want string) {
