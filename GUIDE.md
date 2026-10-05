@@ -498,9 +498,128 @@ db := gundb.New(gundb.Options{
 - **Reads are per node.** A user who may read `users/ali` sees its `private` field, but that field is only a link: the node it points to, with the content, is never sent. Put private data in its own node, as the example does.
 - **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
 - **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
-- **This is not SEA.** GUN.js's SEA signs data with each user's key pair so that any peer can verify it without trusting a server. gundb does not implement SEA. With relay rules, clients trust the relay that enforces them.
+- **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#8-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
 
-## 8. Browser + Go chat
+## 8. Users and encryption (SEA)
+
+SEA is GUN's security layer. A user is a key pair; the part of the graph they own, their *space*, is the node `~<pub>` and every soul under it (`~<pub>/profile`, ...). Everything written there is signed with the user's key, and **every peer checks every signature**, so nobody can write into someone else's space, and no server has to be trusted to enforce it. Accounts are stored exactly like `gun.user()` stores them: a user created in Go can log in from GUN.js with the same alias and password, and the other way around.
+
+<!-- example: examples/sea/main.go -->
+```go
+// SEA users: signed data only its owner can write, and encrypted messages
+// only the recipient can read. Compatible with gun.user() in GUN.js.
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+
+	"ella.to/gundb"
+	"ella.to/gundb/sea"
+)
+
+type Profile struct {
+	Name string `json:"name"`
+}
+
+func main() {
+	ctx := context.Background()
+
+	// A relay and three devices. No rules to configure: every peer checks
+	// SEA signatures on every write.
+	relay := gundb.New()
+	defer relay.Close()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	check(err)
+	go http.Serve(l, relay)
+	url := "ws://" + l.Addr().String() + "/gun"
+	phone := gundb.New(gundb.Options{Peers: []string{url}})  // ali's
+	laptop := gundb.New(gundb.Options{Peers: []string{url}}) // ali's
+	bobs := gundb.New(gundb.Options{Peers: []string{url}})   // bob's
+	defer phone.Close()
+	defer laptop.Close()
+	defer bobs.Close()
+
+	// Sign up on the phone. Writes through ali's refs are signed by her key.
+	ali, err := phone.CreateUser(ctx, "ali", "correct horse battery")
+	check(err)
+	check(ali.Get("profile").PutAck(ctx, Profile{Name: "Ali"}))
+
+	// Anyone can read her space, by public key.
+	p, err := laptop.User(ali.Pub()).Get("profile").Once[Profile](ctx)
+	check(err)
+	fmt.Println("profile:", p.Name) // profile: Ali
+
+	// Nobody else can write it: unsigned writes are rejected everywhere.
+	err = laptop.User(ali.Pub()).Get("profile").Get("name").Put(ctx, "Mallory")
+	fmt.Println("forged write:", errors.Is(err, gundb.ErrUnverified)) // forged write: true
+
+	// Log in on the laptop with the password: same keys, same space.
+	ali, err = laptop.Login(ctx, "ali", "correct horse battery")
+	check(err)
+	check(ali.Get("profile").Get("name").PutAck(ctx, "Ali N."))
+
+	// Private messages: encrypt with a secret only ali and bob can derive.
+	bob, err := bobs.CreateUser(ctx, "bob", "staple battery horse")
+	check(err)
+	bobEPub, err := laptop.User(bob.Pub()).Get("epub").Once[string](ctx)
+	check(err)
+	secret, err := sea.Secret(bobEPub, ali.Pair())
+	check(err)
+	enc, err := sea.Encrypt("meet at 6", secret)
+	check(err)
+	check(ali.Get("to-bob").PutAck(ctx, enc)) // public, but unreadable
+
+	// Bob, on his device, derives the same secret from ali's public epub.
+	stored, err := bobs.User(ali.Pub()).Get("to-bob").Once[string](ctx)
+	check(err)
+	aliEPub, err := bobs.User(ali.Pub()).Get("epub").Once[string](ctx)
+	check(err)
+	shared, err := sea.Secret(aliEPub, bob.Pair())
+	check(err)
+	plain, err := sea.Decrypt(stored, shared)
+	check(err)
+	var msg string
+	check(json.Unmarshal(plain, &msg))
+	fmt.Println("bob reads:", msg) // bob reads: meet at 6
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+| gundb | GUN.js |
+| ----- | ------ |
+| `user, err := db.CreateUser(ctx, alias, pass)` | `gun.user().create(alias, pass)` |
+| `user, err := db.Login(ctx, alias, pass)` | `gun.user().auth(alias, pass)` |
+| `user := db.LoginPair(pair)` | `gun.user().auth(pair)` |
+| `user.Get("profile").Put(ctx, p)` | `gun.user().get('profile').put(p)` |
+| `db.User(pub).Get("profile")` | `gun.user(pub).get('profile')` |
+| `sea.NewPair`, `Sign`, `Verify`, `Encrypt`, `Decrypt`, `Secret`, `Work` | `SEA.pair`, `sign`, `verify`, `encrypt`, `decrypt`, `secret`, `work` |
+
+### How it works
+
+- **Signed values.** In a user's space every value is stored as `{":":value,"~":signature}`. The signature covers the soul, the field, the value and its HAM state, so it cannot be moved to another field or replayed as a newer write. Reads (`Once`, `On`, `Map`) give you the plain value.
+- **Every write is checked**, local or from a peer, as GUN.js peers do: unsigned or wrongly signed data in a user's space fails with `gundb.ErrUnverified` and is never stored or relayed. `~@alias` entries must point at themselves, and souls containing `#` hold content whose SHA-256 is its key.
+- **Accounts.** `~@alice` lists the public keys that claim the alias. `~<pub>` holds `pub`, the signed `alias` and `epub`, and `auth`: the private keys, encrypted with a key derived from the password (PBKDF2, 100,000 rounds).
+
+### Things to know
+
+- **Signed is not secret.** Anyone can read a user's space. Encrypt what is private: `sea.Encrypt(data, user.Pair().EPriv)` for yourself, or with `sea.Secret(theirEPub, user.Pair())` for someone else, as the example does.
+- **Aliases are not unique**, as in GUN: anyone can add their key to `~@alice`, and `Login` tries each key with the password. Identify people by `Pub()`, not by alias.
+- **A lost password is a lost account.** The keys can only be unlocked with it. To sign in without one, keep `user.Pair()` somewhere safe and use `db.LoginPair`.
+- **Outside users' spaces nothing changes**: anyone can write, unless your relay has [rules](#7-permissions-who-can-read-and-write).
+- **Not supported:** SEA certificates (`SEA.certify`, which GUN.js marks experimental) and signatures from before 2020. Writes that use them are rejected.
+
+## 9. Browser + Go chat
 
 A Go bot and browsers running GUN.js share one chat room. Open http://localhost:8765 in two tabs. The page is [`examples/chat/index.html`](examples/chat/index.html).
 
@@ -557,7 +676,7 @@ func main() {
 }
 ```
 
-## 9. Persist to disk
+## 10. Persist to disk
 
 By default a DB keeps its data in memory. To keep it on disk, pass a different `Store` in `Options`; nothing else in your code changes. `storage/pebblestore` uses [Pebble](https://github.com/cockroachdb/pebble), an LSM-tree engine: writes are appends to a log and reads are short scans over sorted keys, so it stays fast with large datasets. Run this twice and the counter keeps going.
 
@@ -613,7 +732,7 @@ func check(err error) {
 
 Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
 
-## 10. Read history
+## 11. Read history
 
 `pebblestore` keeps every write that won HAM, deletions (`null`) included. The DB always reads the latest version; for older ones, ask the store:
 
@@ -693,7 +812,7 @@ History is addressed by soul. For `db.Get(key)` the soul is `key`. A nested node
 
 History is kept only by peers whose store is a `pebblestore`, and it is never pruned.
 
-## 11. Write your own Store
+## 12. Write your own Store
 
 A `Store` is two methods. This one keeps each node in a JSON file; run it twice and the counter keeps going.
 
@@ -772,7 +891,7 @@ func check(err error) {
 
 The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields.
 
-## 12. A CLI for any GUN peer
+## 13. A CLI for any GUN peer
 
 Works against Go and JS relays alike: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
 

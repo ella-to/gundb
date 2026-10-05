@@ -36,6 +36,9 @@ program in [`examples/`](examples/).
 - **Relays.** Any DB relays like a GUN.js server (AXE-style). Puts go to
   the peers that asked for those souls. Gets that miss locally are forwarded,
   and acks are routed back to whoever asked.
+- **SEA users.** `CreateUser` / `Login` like `gun.user()`, signed user
+  spaces that every peer verifies, and package `sea` for signing and
+  encryption, byte-compatible with GUN.js.
 - **Permissions.** A relay can authenticate each connection and decide
   per user what it may read and write (`Authenticate`, `CanRead`,
   `CanWrite`), for Go and GUN.js clients alike.
@@ -54,6 +57,7 @@ program in [`examples/`](examples/).
 | `.`                | the `gundb` package: `DB`, `Ref`, `Store`, protocol   |
 | `transport/`       | the `Conn` / `Dialer` / `Listener` interfaces         |
 | `transport/ws/`    | WebSocket adapter (default)                           |
+| `sea/`             | SEA crypto: key pairs, sign, verify, encrypt, ECDH    |
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `examples/`        | runnable programs used by the guide                   |
@@ -78,7 +82,7 @@ go run ./loadtest -users 100,1000,10000 -duration 10s
 
 ## Not included (yet)
 
-SEA (users and encryption), RAD storage, and LEX queries over souls.
+RAD storage, LEX queries over souls, and SEA certificates (`SEA.certify`).
 
 ## License
 
