@@ -304,7 +304,180 @@ func check(err error) {
 }
 ```
 
-## 6. Run a relay
+## 6. Work offline, sync later
+
+A DB is a complete database on its own, so reads and writes keep working without a connection. Peers in `Options.Peers` are re-dialled every 2 seconds. When the connection is back, writes made in the meantime are sent, and the DB asks again for everything it has read, so changes made elsewhere arrive too. Run this one to watch a relay go down and come back while two devices keep editing the same note.
+
+<!-- example: examples/offline/main.go -->
+```go
+// Offline-first: devices keep reading and writing while the relay is down,
+// and everything syncs once it is back. Takes a few seconds: peers are
+// re-dialled every 2s.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"time"
+
+	"ella.to/gundb"
+)
+
+type Note struct {
+	Title  string `json:"title,omitempty"`
+	Body   string `json:"body,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
+func main() {
+	ctx := context.Background()
+
+	// Pick the relay's address now; nothing listens on it yet.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	check(err)
+	addr := l.Addr().String()
+	l.Close()
+	url := "ws://" + addr + "/gun"
+
+	// Two devices configured with the relay. They start offline.
+	phone := gundb.New(gundb.Options{Peers: []string{url}})
+	laptop := gundb.New(gundb.Options{Peers: []string{url}})
+	defer phone.Close()
+	defer laptop.Close()
+
+	// 1. Offline: writes are saved locally and queued for the relay.
+	note := phone.Get("notes").Get("trip")
+	check(note.Put(ctx, Note{Title: "Trip", Status: "draft"}))
+	err = note.PutAck(ctx, Note{Body: "pack light"})
+	fmt.Println("ack while offline:", errors.Is(err, gundb.ErrNoPeers)) // still saved and queued
+	n, err := note.Once[Note](ctx)
+	check(err)
+	fmt.Printf("phone reads offline: %s, %q\n", n.Title, n.Body) // phone reads offline: Trip, "pack light"
+
+	// 2. The relay comes up. The phone reconnects and sends its queue;
+	// the laptop, which never saw the note, gets it from the relay.
+	store := gundb.NewMemoryStore() // shared by every relay run, like a disk
+	stop := startRelay(addr, store)
+	waitOnline(phone, laptop)
+	n, err = laptop.Get("notes").Get("trip").Once[Note](ctx)
+	check(err)
+	fmt.Printf("laptop reads: %s, %q\n", n.Title, n.Body) // laptop reads: Trip, "pack light"
+
+	// 3. The relay goes down. Both devices edit the note while offline,
+	// including the same field.
+	stop()
+	waitOffline(phone, laptop)
+	check(phone.Get("notes").Get("trip").Get("body").Put(ctx, "pack light, bring a map"))
+	check(phone.Get("notes").Get("trip").Get("status").Put(ctx, "ready"))
+	time.Sleep(10 * time.Millisecond) // the laptop's edit is the later one
+	check(laptop.Get("notes").Get("trip").Get("status").Put(ctx, "booked"))
+
+	// 4. Back online: queued writes cross over, and HAM settles the
+	// conflict the same way on every peer (the later write wins).
+	stop = startRelay(addr, store)
+	defer stop()
+	waitOnline(phone, laptop)
+	for _, d := range []struct {
+		name string
+		db   *gundb.DB
+	}{{"phone", phone}, {"laptop", laptop}} {
+		n := waitFor(d.db, func(n Note) bool { return n.Status == "booked" && n.Body == "pack light, bring a map" })
+		fmt.Printf("%s after resync: %s, %q, %s\n", d.name, n.Title, n.Body, n.Status)
+	}
+	// phone after resync: Trip, "pack light, bring a map", booked
+	// laptop after resync: Trip, "pack light, bring a map", booked
+}
+
+// startRelay serves a relay on addr until stop is called. Closing the DB
+// drops every connection, as a crashed or restarted server would.
+func startRelay(addr string, store gundb.Store) (stop func()) {
+	relay := gundb.New(gundb.Options{Store: store})
+	l, err := net.Listen("tcp", addr)
+	check(err)
+	srv := &http.Server{Handler: relay}
+	go srv.Serve(l)
+	return func() {
+		srv.Close()
+		relay.Close()
+	}
+}
+
+func waitOnline(dbs ...*gundb.DB) {
+	until(func() bool {
+		for _, db := range dbs {
+			if len(db.Peers()) == 0 {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+func waitOffline(dbs ...*gundb.DB) {
+	until(func() bool {
+		for _, db := range dbs {
+			if len(db.Peers()) > 0 {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// waitFor waits until the note on db satisfies ok. Updates from peers
+// arrive in the background; On delivers each one.
+func waitFor(db *gundb.DB, ok func(Note) bool) Note {
+	got := make(chan Note, 16)
+	off := db.Get("notes").Get("trip").On(func(n Note) { got <- n })
+	defer off()
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case n := <-got:
+			if ok(n) {
+				return n
+			}
+		case <-timeout:
+			log.Fatal("peers did not converge")
+		}
+	}
+}
+
+func until(ok func() bool) {
+	for deadline := time.Now().Add(10 * time.Second); !ok(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			log.Fatal("timed out")
+		}
+	}
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+The `wait` helpers only make the output above predictable. In an app you rarely wait: write with `Put`, and show data with `On`, which runs again whenever a change arrives, before or after a reconnect.
+
+### How offline changes merge
+
+- **Different fields merge.** HAM resolves every field on its own, so the phone's `body` and the laptop's `status` both survive.
+- **The same field: the later write wins**, by the writer's clock at the time of the write, not by who reconnects first. A tie goes to the larger value. Every peer applies the same rule, so all of them end up with the same note.
+- **Deletes are writes too.** `Put(ctx, nil)` while offline is queued like any other write and wins or loses by the same rule.
+
+### Things to know
+
+- **`Put` while offline succeeds**: the write is applied locally and queued. `PutAck` returns `gundb.ErrNoPeers` when nobody is connected, but the write is still saved and queued.
+- **The queue lives in memory.** If the program exits before it reconnects, offline writes stay in its store but are not sent later. Up to 10,000 writes are queued per peer; later ones are kept locally only.
+- **Keep offline data across restarts** with a disk store such as [`pebblestore`](#11-persist-to-disk). The default store is in memory, so a restart starts empty.
+- **Clocks matter.** HAM compares the writers' clocks. A device whose clock is far ahead wins conflicts, and other peers hold its writes back until their own clock catches up.
+
+## 7. Run a relay
 
 This is all a server needs. JS clients connect with `Gun(['http://localhost:8765/gun'])`.
 
@@ -338,7 +511,7 @@ func main() {
 }
 ```
 
-## 7. Permissions: who can read and write
+## 8. Permissions: who can read and write
 
 A relay decides what each connected user may do. Three `Options` set it up:
 
@@ -498,9 +671,9 @@ db := gundb.New(gundb.Options{
 - **Reads are per node.** A user who may read `users/ali` sees its `private` field, but that field is only a link: the node it points to, with the content, is never sent. Put private data in its own node, as the example does.
 - **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
 - **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
-- **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#8-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
+- **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#9-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
 
-## 8. Users and encryption (SEA)
+## 9. Users and encryption (SEA)
 
 SEA is GUN's security layer. A user is a key pair; the part of the graph they own, their *space*, is the node `~<pub>` and every soul under it (`~<pub>/profile`, ...). Everything written there is signed with the user's key, and **every peer checks every signature**, so nobody can write into someone else's space, and no server has to be trusted to enforce it. Accounts are stored exactly like `gun.user()` stores them: a user created in Go can log in from GUN.js with the same alias and password, and the other way around.
 
@@ -616,10 +789,10 @@ func check(err error) {
 - **Signed is not secret.** Anyone can read a user's space. Encrypt what is private: `sea.Encrypt(data, user.Pair().EPriv)` for yourself, or with `sea.Secret(theirEPub, user.Pair())` for someone else, as the example does.
 - **Aliases are not unique**, as in GUN: anyone can add their key to `~@alice`, and `Login` tries each key with the password. Identify people by `Pub()`, not by alias.
 - **A lost password is a lost account.** The keys can only be unlocked with it. To sign in without one, keep `user.Pair()` somewhere safe and use `db.LoginPair`.
-- **Outside users' spaces nothing changes**: anyone can write, unless your relay has [rules](#7-permissions-who-can-read-and-write).
+- **Outside users' spaces nothing changes**: anyone can write, unless your relay has [rules](#8-permissions-who-can-read-and-write).
 - **Not supported:** SEA certificates (`SEA.certify`, which GUN.js marks experimental) and signatures from before 2020. Writes that use them are rejected.
 
-## 9. Browser + Go chat
+## 10. Browser + Go chat
 
 A Go bot and browsers running GUN.js share one chat room. Open http://localhost:8765 in two tabs. The page is [`examples/chat/index.html`](examples/chat/index.html).
 
@@ -676,7 +849,7 @@ func main() {
 }
 ```
 
-## 10. Persist to disk
+## 11. Persist to disk
 
 By default a DB keeps its data in memory. To keep it on disk, pass a different `Store` in `Options`; nothing else in your code changes. `storage/pebblestore` uses [Pebble](https://github.com/cockroachdb/pebble), an LSM-tree engine: writes are appends to a log and reads are short scans over sorted keys, so it stays fast with large datasets. Run this twice and the counter keeps going.
 
@@ -732,7 +905,7 @@ func check(err error) {
 
 Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
 
-## 11. Read history
+## 12. Read history
 
 `pebblestore` keeps every write that won HAM, deletions (`null`) included. The DB always reads the latest version; for older ones, ask the store:
 
@@ -812,7 +985,7 @@ History is addressed by soul. For `db.Get(key)` the soul is `key`. A nested node
 
 History is kept only by peers whose store is a `pebblestore`, and it is never pruned.
 
-## 12. Write your own Store
+## 13. Write your own Store
 
 A `Store` is two methods. This one keeps each node in a JSON file; run it twice and the counter keeps going.
 
@@ -891,7 +1064,7 @@ func check(err error) {
 
 The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields.
 
-## 13. A CLI for any GUN peer
+## 14. A CLI for any GUN peer
 
 Works against Go and JS relays alike: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
 
