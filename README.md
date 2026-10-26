@@ -31,7 +31,7 @@ program in [`examples/`](examples/).
 - **Wire-compatible with GUN.js.** This covers the DAM handshake and dedup,
   HAM conflict resolution (including JS's UTF-16 string order for
   tie-breaks), GUN's number formatting, batched and chunked messages, and
-  LEX key queries. The [interop tests](interop/) run real GUN.js peers
+  LEX queries over keys and souls (`db.Souls`). The [interop tests](interop/) run real GUN.js peers
   against Go peers in both directions.
 - **Relays.** Any DB relays like a GUN.js server (AXE-style). Puts go to
   the peers that asked for those souls. Gets that miss locally are forwarded,
@@ -82,7 +82,12 @@ go run ./loadtest -users 100,1000,10000 -duration 10s
 
 ## Not included (yet)
 
-RAD storage, LEX queries over souls, and SEA certificates (`SEA.certify`).
+- **RAD storage.** There is no Go port of GUN's radix/radisk on-disk format.
+  Persistence uses `storage/pebblestore` instead. Go peers still sync over
+  the wire with JS relays that use radisk.
+- **SEA certificates (`SEA.certify`).** You can't issue certificates, and
+  signed fields that carry a certificate (`+`/`*`) fail verification. That
+  means writes into another user's space are rejected.
 
 ## License
 

@@ -26,3 +26,13 @@ type FieldStore interface {
 	Store
 	PutFields(ctx context.Context, soul string, changed *Node) error
 }
+
+// SoulStore is an optional extension of Store that lists souls. A DB needs
+// it to answer LEX queries over souls, like {"#": {"*": "chat/"}} from GUN.js
+// or DB.Souls; without it such gets are passed on to other peers.
+//
+// ListSouls returns every stored soul that starts with prefix, in any order.
+type SoulStore interface {
+	Store
+	ListSouls(ctx context.Context, prefix string) ([]string, error)
+}

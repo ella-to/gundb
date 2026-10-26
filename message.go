@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -64,12 +65,14 @@ func (m *message) sentTo(pid string) bool {
 // getQuery is the body of a "get": {"#": soul} for a whole node or
 // {"#": soul, ".": key} for one field. Both "#" and "." may also be LEX
 // objects such as {"*": "prefix"}; the original JSON is kept so it can be
-// relayed unchanged.
+// relayed unchanged. A LEX over souls selects many nodes; like radisk, "."
+// is then ignored.
 type getQuery struct {
-	Soul   string
-	Key    string
-	KeyLex *lex
-	raw    json.RawMessage
+	Soul    string
+	SoulLex *lex
+	Key     string
+	KeyLex  *lex
+	raw     json.RawMessage
 }
 
 func (q *getQuery) UnmarshalJSON(data []byte) error {
@@ -80,8 +83,12 @@ func (q *getQuery) UnmarshalJSON(data []byte) error {
 	*q = getQuery{raw: bytes.Clone(data)}
 	if r, ok := obj["#"]; ok && json.Unmarshal(r, &q.Soul) != nil {
 		var l lex
-		if json.Unmarshal(r, &l) == nil && l.Eq != nil {
+		switch {
+		case json.Unmarshal(r, &l) != nil: // not a soul; answered as not found
+		case l.Eq != nil:
 			q.Soul = *l.Eq
+		default:
+			q.SoulLex = &l
 		}
 	}
 	if r, ok := obj["."]; ok && json.Unmarshal(r, &q.Key) != nil {
@@ -97,12 +104,20 @@ func (q *getQuery) MarshalJSON() ([]byte, error) {
 	if q.raw != nil {
 		return q.raw, nil
 	}
+	if q.SoulLex != nil {
+		return []byte(`{"#":` + q.SoulLex.json() + `,"%":` + strconv.Itoa(lexBudget) + `}`), nil
+	}
 	s := `{"#":` + jsQuote(q.Soul)
 	if q.Key != "" {
 		s += `,".":` + jsQuote(q.Key)
 	}
 	return []byte(s + "}"), nil
 }
+
+// lexBudget is the "%" we send with a LEX over souls: how many bytes of
+// matches radisk may read for one reply. Without it radisk returns only the
+// first match; 100000 is the most it allows (gun/lib/store.js).
+const lexBudget = 100000
 
 // match reports whether field name k is selected by the query.
 func (q *getQuery) match(k string) bool {
@@ -150,6 +165,32 @@ func (o *lex) match(t string) bool {
 		return true
 	}
 	return o.Lt != nil && jsCompare(t, *o.Lt) <= 0
+}
+
+// matchSoul reports whether soul is selected by a LEX over souls. radisk
+// reads one as a prefix plus an inclusive range (in JS string order), not
+// with String.match's either/or rules.
+func (o *lex) matchSoul(soul string) bool {
+	if o.Eq != nil {
+		return soul == *o.Eq
+	}
+	return (o.Prefix == nil || strings.HasPrefix(soul, *o.Prefix)) &&
+		(o.Gt == nil || jsCompare(soul, *o.Gt) >= 0) &&
+		(o.Lt == nil || jsCompare(soul, *o.Lt) <= 0)
+}
+
+// json encodes o with keys in a fixed order.
+func (o *lex) json() string {
+	var parts []string
+	for _, f := range []struct {
+		k string
+		v *string
+	}{{"=", o.Eq}, {"*", o.Prefix}, {">", o.Gt}, {"<", o.Lt}} {
+		if f.v != nil {
+			parts = append(parts, jsQuote(f.k)+":"+jsQuote(*f.v))
+		}
+	}
+	return "{" + strings.Join(parts, ",") + "}"
 }
 
 func cmpOr(a, b *string, ok func(*string) bool) *string {

@@ -210,18 +210,22 @@ func (db *DB) sync(ctx context.Context, soul string) {
 	}
 }
 
-func (db *DB) ask(soul string) {
-	ctx, cancel := context.WithTimeout(db.ctx, db.wait)
+func (db *DB) ask(soul string) { db.query(db.ctx, &getQuery{Soul: soul}) }
+
+// query sends q to every peer and waits (at most db.wait) until the answers
+// are in. The data that comes back is merged into the store.
+func (db *DB) query(ctx context.Context, q *getQuery) {
+	ctx, cancel := context.WithTimeout(ctx, db.wait)
 	defer cancel()
 	if !db.connected(ctx) {
-		return // resubscribe asks once a peer connects
+		return // for souls of interest, resubscribe asks once a peer connects
 	}
 	id := randomID(9)
 	db.dup.track(id, nil)
 	peers := db.livePeers()
 	r := db.newRequest(id, false, peers)
 	defer db.endRequest(id)
-	raw := db.encode(&message{ID: id, Get: &getQuery{Soul: soul}})
+	raw := db.encode(&message{ID: id, Get: q})
 	for _, p := range peers {
 		p.send(raw)
 	}

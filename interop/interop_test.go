@@ -92,6 +92,41 @@ func TestGoClientWithJSServer(t *testing.T) {
 	})
 }
 
+// LEX queries over souls, answered by radisk on a stock JS relay and by a
+// Go relay for a JS client.
+func TestSoulLex(t *testing.T) {
+	requireNode(t)
+	ctx := t.Context()
+
+	t.Run("Go asks a JS relay", func(t *testing.T) {
+		peer := startJSServer(t)
+		for _, s := range []string{"note/1", "note/2", "notes", "other"} {
+			assertJSON(t, runJS(t, peer, "put", s, `{"v":"`+s+`"}`), `{"ok":true}`)
+		}
+		db := gundb.New(gundb.Options{Peers: []string{peer}}) // knows nothing yet
+		defer db.Close()
+		souls, err := db.Souls(ctx, gundb.Lex{Prefix: "note/"})
+		if err != nil || !slices.Equal(souls, []string{"note/1", "note/2"}) {
+			t.Fatalf("%q %v", souls, err)
+		}
+		v, err := db.Get("note/2").Get("v").Once[string](ctx)
+		if err != nil || v != "note/2" {
+			t.Fatalf("%q %v", v, err)
+		}
+	})
+
+	t.Run("JS asks a Go relay", func(t *testing.T) {
+		relay := gundb.New()
+		defer relay.Close()
+		srv := httptest.NewServer(relay)
+		defer srv.Close()
+		for _, s := range []string{"note/1", "note/2", "notes"} {
+			relay.Get(s).Put(ctx, map[string]string{"v": s})
+		}
+		assertJSON(t, runJS(t, srv.URL+"/gun", "souls", "note/", "2"), `["note/1","note/2"]`)
+	})
+}
+
 // Go SEA users through a stock JS relay, which verifies every signed
 // write itself and would refuse to store Go signatures it rejects.
 func TestGoUsersThroughJSRelay(t *testing.T) {

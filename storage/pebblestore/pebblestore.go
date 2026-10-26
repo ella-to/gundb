@@ -39,14 +39,18 @@ type Options struct {
 	Pebble *pebble.Options
 }
 
-// Store is a gundb.FieldStore backed by Pebble. It is safe for concurrent use.
+// Store is a gundb.FieldStore and gundb.SoulStore backed by Pebble. It is
+// safe for concurrent use.
 type Store struct {
 	db    *pebble.DB
 	sync  *pebble.WriteOptions
 	close func() error
 }
 
-var _ gundb.FieldStore = (*Store)(nil)
+var (
+	_ gundb.FieldStore = (*Store)(nil)
+	_ gundb.SoulStore  = (*Store)(nil)
+)
 
 // Version is one past write of a field.
 type Version struct {
@@ -132,6 +136,30 @@ func (s *Store) write(soul string, n *gundb.Node) error {
 		return fmt.Errorf("pebblestore: %w", err)
 	}
 	return nil
+}
+
+// ListSouls implements gundb.SoulStore. It seeks from soul to soul, so it
+// costs one step per soul, not per field.
+func (s *Store) ListSouls(_ context.Context, prefix string) ([]string, error) {
+	lower := latestPrefix(prefix)
+	lower = lower[:len(lower)-2] // drop the terminator: any soul starting with prefix
+	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper(lower)})
+	if err != nil {
+		return nil, fmt.Errorf("pebblestore: %w", err)
+	}
+	defer it.Close()
+	var souls []string
+	for ok := it.First(); ok; {
+		soul, _, err := unescape(it.Key()[1:])
+		if err != nil {
+			return nil, err
+		}
+		souls = append(souls, soul)
+		next := latestPrefix(soul) // ends 0x00 0x01; 0x00 0x02 is past all its fields
+		next[len(next)-1]++
+		ok = it.SeekGE(next)
+	}
+	return souls, it.Error()
 }
 
 // History returns every stored version of a field, newest first.

@@ -72,6 +72,29 @@ func TestGetPut(t *testing.T) {
 	sameNode(t, got, n)
 }
 
+func TestListSouls(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, t.TempDir())
+	for _, soul := range []string{"a", "a\x00b", "ab", "b", "chat/1", "chat/2"} {
+		n := gundb.NewNode(soul)
+		n.Set("x", gundb.Number(1), 1)
+		n.Set("y", gundb.Number(2), 2) // several fields, one soul
+		s.Put(ctx, n)
+	}
+	for prefix, want := range map[string][]string{
+		"":      {"a", "a\x00b", "ab", "b", "chat/1", "chat/2"},
+		"a":     {"a", "a\x00b", "ab"},
+		"a\x00": {"a\x00b"},
+		"chat/": {"chat/1", "chat/2"},
+		"z":     nil,
+	} {
+		got, err := s.ListSouls(ctx, prefix)
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("ListSouls(%q) = %q, %v; want %q", prefix, got, err, want)
+		}
+	}
+}
+
 func TestHistoryAndGetAt(t *testing.T) {
 	ctx := t.Context()
 	s := open(t, t.TempDir())

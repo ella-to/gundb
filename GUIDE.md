@@ -23,6 +23,7 @@ go get ella.to/gundb   # needs Go 1.27+
 | `.map().on(cb)`                          | `.Map().On(func(key string, v T) {...})`            |
 | `.put(null)`                             | `.Put(ctx, nil)`                                    |
 | `.get('a').put(gun.get('b'))`            | `.Get("a").Put(ctx, db.Get("b"))`                   |
+| `get: {'#': {'*': 'chat/'}}` (radisk)    | `souls, err := db.Souls(ctx, gundb.Lex{Prefix: "chat/"})` |
 
 Rules worth knowing:
 
@@ -1062,7 +1063,7 @@ func check(err error) {
 }
 ```
 
-The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields.
+The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields. A store that implements `gundb.SoulStore` (`ListSouls(ctx, prefix)`) can also answer LEX queries over souls (`db.Souls`, or `{"#": {"*": prefix}}` from GUN.js). The default store, `memstore` and `pebblestore` all do.
 
 ## 14. A CLI for any GUN peer
 

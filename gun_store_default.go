@@ -2,6 +2,7 @@ package gundb
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
 
@@ -27,4 +28,16 @@ func (s *memoryStore) Put(_ context.Context, n *Node) error {
 	defer s.mu.Unlock()
 	s.nodes[n.Soul] = n.Clone()
 	return nil
+}
+
+func (s *memoryStore) ListSouls(_ context.Context, prefix string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var souls []string
+	for soul := range s.nodes {
+		if strings.HasPrefix(soul, prefix) {
+			souls = append(souls, soul)
+		}
+	}
+	return souls, nil
 }

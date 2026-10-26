@@ -8,16 +8,19 @@ import (
 	"context"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 
 	"ella.to/gundb"
 )
 
-// Store is an in-memory gundb.Store.
+// Store is an in-memory gundb.SoulStore.
 type Store struct {
 	mu    sync.RWMutex
 	nodes map[string]*gundb.Node
 }
+
+var _ gundb.SoulStore = (*Store)(nil)
 
 // New returns an empty Store.
 func New() *Store { return &Store{nodes: map[string]*gundb.Node{}} }
@@ -45,4 +48,17 @@ func (s *Store) Souls() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return slices.Sorted(maps.Keys(s.nodes))
+}
+
+// ListSouls implements gundb.SoulStore.
+func (s *Store) ListSouls(_ context.Context, prefix string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var souls []string
+	for soul := range s.nodes {
+		if strings.HasPrefix(soul, prefix) {
+			souls = append(souls, soul)
+		}
+	}
+	return souls, nil
 }

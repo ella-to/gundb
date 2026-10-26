@@ -6,6 +6,7 @@
 //   node client.js <peer> set <soul> <json>          set and wait for an ack
 //   node client.js <peer> watch <soul> <key> <want>  .on() until the value equals want
 //   node client.js <peer> map <soul> <n>             .map().on() until n items are seen
+//   node client.js <peer> souls <prefix> <n>         get {"#":{"*":prefix}} until n souls arrive
 const WebSocket = require('ws');
 const Gun = require('gun/gun');
 const [peer, cmd, soul, ...args] = process.argv.slice(2);
@@ -38,6 +39,22 @@ switch (cmd) {
       if (v && v.title) seen[k] = v.title;
       if (Object.keys(seen).length >= +args[0]) done(Object.values(seen).sort());
     });
+    break;
+  }
+  case 'souls': {
+    // The chain API has no soul LEX, so send the raw get and read the raw
+    // replies (the root does not pass acks for unknown gets to listeners).
+    const id = String.random(9), seen = new Set(), mesh = gun._.opt.mesh, hear = mesh.hear;
+    mesh.hear = function (raw, peer) {
+      try {
+        [].concat(JSON.parse(raw)).forEach((msg) => {
+          if (msg['@'] === id && msg.put) Object.keys(msg.put).forEach((s) => seen.add(s));
+        });
+      } catch (e) {}
+      if (seen.size >= +args[0]) done([...seen].sort());
+      return hear.apply(this, arguments);
+    };
+    setTimeout(() => gun._.on('out', { '#': id, get: { '#': { '*': soul } } }), 500);
     break;
   }
 }

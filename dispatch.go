@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -130,7 +131,11 @@ func (db *DB) handlePut(p *peer, m *message) {
 
 func (db *DB) handleGet(p *peer, m *message) {
 	q := m.Get
-	if q.Soul == "" { // LEX queries over souls are not supported
+	if q.SoulLex != nil {
+		db.handleSoulLex(p, m)
+		return
+	}
+	if q.Soul == "" {
 		db.reply(p, &message{Ack: m.ID})
 		return
 	}
@@ -157,6 +162,65 @@ func (db *DB) handleGet(p *peer, m *message) {
 		}
 	}
 	db.relayGet(p, m)
+}
+
+// lexChunk is how many nodes go in one reply to a LEX query over souls.
+const lexChunk = 100
+
+// handleSoulLex answers a get for every soul matching a LEX, like radisk
+// does: the matching nodes p may read, in chunks marked "%" but the last.
+// p is subscribed to each one. With no store support or no match, the get
+// is passed on to other peers.
+func (db *DB) handleSoulLex(p *peer, m *message) {
+	l := m.Get.SoulLex
+	ss, ok := db.store.(SoulStore)
+	if !ok {
+		db.relayGet(p, m)
+		return
+	}
+	souls, err := ss.ListSouls(db.ctx, deref(l.Prefix))
+	if err != nil {
+		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
+		return
+	}
+	slices.SortFunc(souls, jsCompare)
+	var chunks []graph
+	for _, soul := range souls {
+		if !l.matchSoul(soul) || !db.allowRead(p, soul) {
+			continue
+		}
+		n, err := db.store.Get(db.ctx, soul)
+		if err != nil {
+			db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
+			return
+		}
+		if n == nil || len(n.Fields) == 0 {
+			continue
+		}
+		p.want(soul)
+		if len(chunks) == 0 || len(chunks[len(chunks)-1]) == lexChunk {
+			chunks = append(chunks, graph{})
+		}
+		chunks[len(chunks)-1][soul] = n
+	}
+	if len(chunks) == 0 {
+		db.relayGet(p, m)
+		return
+	}
+	for i, g := range chunks {
+		r := &message{Ack: m.ID, Put: g}
+		if i < len(chunks)-1 {
+			r.More = json.RawMessage("1")
+		}
+		db.reply(p, r)
+	}
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // relayGet asks our other peers for data we don't have. Their data is passed
