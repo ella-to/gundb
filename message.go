@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"ella.to/gundb/internal/js"
 )
 
 // message is one GUN wire message. Captured from a JS peer, typical ones are:
@@ -100,18 +102,20 @@ func (q *getQuery) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (q *getQuery) MarshalJSON() ([]byte, error) {
+func (q *getQuery) MarshalJSON() ([]byte, error) { return q.appendJSON(nil), nil }
+
+func (q *getQuery) appendJSON(b []byte) []byte {
 	if q.raw != nil {
-		return q.raw, nil
+		return appendRaw(b, q.raw)
 	}
 	if q.SoulLex != nil {
-		return []byte(`{"#":` + q.SoulLex.json() + `,"%":` + strconv.Itoa(lexBudget) + `}`), nil
+		return append(append(append(b, `{"#":`...), q.SoulLex.json()...), `,"%":`+strconv.Itoa(lexBudget)+`}`...)
 	}
-	s := `{"#":` + jsQuote(q.Soul)
+	b = js.AppendQuote(append(b, `{"#":`...), q.Soul)
 	if q.Key != "" {
-		s += `,".":` + jsQuote(q.Key)
+		b = js.AppendQuote(append(b, `,".":`...), q.Key)
 	}
-	return []byte(s + "}"), nil
+	return append(b, '}')
 }
 
 // lexBudget is the "%" we send with a LEX over souls: how many bytes of

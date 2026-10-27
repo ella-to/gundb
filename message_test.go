@@ -109,7 +109,7 @@ func TestLexMatch(t *testing.T) {
 func TestMarshalWireKeepsHTML(t *testing.T) {
 	n := NewNode("a<b")
 	n.Set("x>y", String("<&>"), 1)
-	b, err := marshalWire(&message{ID: "1", Put: graph{"a<b": n}})
+	b, err := (&message{ID: "1", Put: graph{"a<b": n}}).appendWire(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

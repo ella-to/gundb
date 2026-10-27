@@ -269,7 +269,7 @@ func (db *DB) reply(p *peer, m *message) {
 }
 
 func (db *DB) encode(m *message) []byte {
-	raw, err := marshalWire(m)
+	raw, err := m.appendWire(nil)
 	if err != nil {
 		db.log.Error("gundb: encode failed", "err", err)
 		return nil

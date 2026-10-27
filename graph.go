@@ -3,9 +3,11 @@ package gundb
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
-	"slices"
 )
 
 // Node is one vertex of the graph: a soul (its globally unique ID) plus
@@ -37,69 +39,99 @@ func (n *Node) Clone() *Node {
 }
 
 // MarshalJSON writes the GUN wire form with sorted keys.
-func (n *Node) MarshalJSON() ([]byte, error) {
-	keys := slices.Sorted(maps.Keys(n.Fields))
-	var buf bytes.Buffer
-	buf.WriteString(`{"_":{"#":`)
-	buf.WriteString(jsQuote(n.Soul))
-	buf.WriteString(`,">":{`)
-	for i, k := range keys {
-		s, ok := n.States[k]
-		if !ok {
-			return nil, fmt.Errorf("gundb: node %q has no state for %q", n.Soul, k)
-		}
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		buf.WriteString(jsQuote(k))
-		buf.WriteByte(':')
-		buf.WriteString(jsonNumber(s))
-	}
-	buf.WriteString("}}")
-	for _, k := range keys {
-		// Call the variant's MarshalJSON directly: json.Marshal would
-		// HTML-escape strings, which JS does not do.
-		v, err := n.Fields[k].(json.Marshaler).MarshalJSON()
-		if err != nil {
-			return nil, fmt.Errorf("gundb: node %q field %q: %w", n.Soul, k, err)
-		}
-		buf.WriteByte(',')
-		buf.WriteString(jsQuote(k))
-		buf.WriteByte(':')
-		buf.Write(v)
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
+func (n *Node) MarshalJSON() ([]byte, error) { return n.appendJSON(nil) }
 
 // UnmarshalJSON parses the GUN wire form. Like the reference it rejects
 // nodes without a soul, fields without a state, and invalid values.
 func (n *Node) UnmarshalJSON(data []byte) error {
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("gundb: node: %w", err)
+	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	if err := n.UnmarshalJSONFrom(dec); err != nil {
+		return err
+	}
+	if _, err := dec.ReadToken(); err != io.EOF {
+		return errors.New("gundb: node: trailing data")
+	}
+	return nil
+}
+
+// UnmarshalJSONFrom is UnmarshalJSON reading straight from the decoder of
+// the enclosing message, so a node is parsed once, in a single pass.
+func (n *Node) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if tok, err := dec.ReadToken(); err != nil || tok.Kind() != '{' {
+		return fmt.Errorf("gundb: node: not an object")
 	}
 	var meta struct {
 		Soul   string             `json:"#"`
 		States map[string]float64 `json:">"`
 	}
-	if m, ok := raw["_"]; !ok || json.Unmarshal(m, &meta) != nil || meta.Soul == "" {
+	hasMeta := false
+	fields := map[string]Value{}
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return fmt.Errorf("gundb: node: %w", err)
+		}
+		k := name.String()
+		if k == "_" {
+			raw, err := dec.ReadValue()
+			if err != nil {
+				return fmt.Errorf("gundb: node: %w", err)
+			}
+			meta.Soul, meta.States = "", nil // a repeated "_" replaces the first
+			hasMeta = json.Unmarshal(raw, &meta) == nil
+			continue
+		}
+		v, err := readValue(dec)
+		if err != nil {
+			return fmt.Errorf("gundb: node field %q: %w", k, err)
+		}
+		fields[k] = v
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return fmt.Errorf("gundb: node: %w", err)
+	}
+	if !hasMeta || meta.Soul == "" {
 		return fmt.Errorf("gundb: node has no valid _ metadata")
 	}
-	delete(raw, "_")
-	*n = *NewNode(meta.Soul)
-	for k, r := range raw {
+	*n = Node{Soul: meta.Soul, Fields: fields, States: make(map[string]float64, len(fields))}
+	for k := range fields {
 		state, ok := meta.States[k]
 		if !ok {
 			return fmt.Errorf("gundb: node %q field %q has no state", meta.Soul, k)
 		}
-		v, err := decodeValue(r)
-		if err != nil {
-			return fmt.Errorf("gundb: node %q field %q: %w", meta.Soul, k, err)
-		}
-		n.Set(k, v, state)
+		n.States[k] = state
 	}
 	return nil
+}
+
+// readValue reads one field value. Scalars are taken from their token;
+// objects (links) and anything else go through decodeValue.
+func readValue(dec *jsontext.Decoder) (Value, error) {
+	switch dec.PeekKind() {
+	case 'n', 't', 'f', '"', '0':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		switch tok.Kind() {
+		case 'n':
+			return Null{}, nil
+		case 't', 'f':
+			return Bool(tok.Bool()), nil
+		case '"':
+			return String(tok.String()), nil
+		}
+		f, err := tok.Float()
+		if err != nil {
+			return nil, fmt.Errorf("gundb: invalid number: %w", err)
+		}
+		return Number(f), nil
+	}
+	raw, err := dec.ReadValue()
+	if err != nil {
+		return nil, err
+	}
+	return decodeValue(json.RawMessage(raw))
 }
 
 // graph is soul -> node: the payload of a "put" message.

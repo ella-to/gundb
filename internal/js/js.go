@@ -34,44 +34,75 @@ func Number(f float64) string {
 // characters are escaped. (encoding/json additionally escapes <, >, &,
 // U+2028 and U+2029, which would break HAM's lexical tie-break.)
 func Quote(s string) string {
+	if plain(s) {
+		return `"` + s + `"`
+	}
+	return string(AppendQuote(make([]byte, 0, len(s)+8), s))
+}
+
+// AppendQuote appends Quote(s) to dst.
+func AppendQuote(dst []byte, s string) []byte {
 	const hex = "0123456789abcdef"
-	var b strings.Builder
-	b.Grow(len(s) + 2)
-	b.WriteByte('"')
+	dst = append(dst, '"')
+	if plain(s) {
+		return append(append(dst, s...), '"')
+	}
 	for _, r := range s {
 		switch r {
 		case '"':
-			b.WriteString(`\"`)
+			dst = append(dst, `\"`...)
 		case '\\':
-			b.WriteString(`\\`)
+			dst = append(dst, `\\`...)
 		case '\b':
-			b.WriteString(`\b`)
+			dst = append(dst, `\b`...)
 		case '\f':
-			b.WriteString(`\f`)
+			dst = append(dst, `\f`...)
 		case '\n':
-			b.WriteString(`\n`)
+			dst = append(dst, `\n`...)
 		case '\r':
-			b.WriteString(`\r`)
+			dst = append(dst, `\r`...)
 		case '\t':
-			b.WriteString(`\t`)
+			dst = append(dst, `\t`...)
 		default:
 			if r < 0x20 {
-				b.WriteString(`\u00`)
-				b.WriteByte(hex[r>>4])
-				b.WriteByte(hex[r&0xF])
+				dst = append(dst, `\u00`...)
+				dst = append(dst, hex[r>>4], hex[r&0xF])
 			} else {
-				b.WriteRune(r)
+				dst = utf8.AppendRune(dst, r) // invalid UTF-8 becomes U+FFFD
 			}
 		}
 	}
-	b.WriteByte('"')
-	return b.String()
+	return append(dst, '"')
+}
+
+// plain reports whether s is valid UTF-8 with nothing to escape, so it can
+// be quoted as is.
+func plain(s string) bool {
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c == '"' || c == '\\' {
+			return false
+		}
+		ascii = ascii && c < utf8.RuneSelf
+	}
+	return ascii || utf8.ValidString(s)
 }
 
 // Compare compares two strings the way JavaScript's < operator does: by
 // UTF-16 code units rather than by UTF-8 bytes. The two orders differ for
 // characters above U+FFFF versus U+E000..U+FFFF.
 func Compare(a, b string) int {
+	// Equal bytes are equal code units: skip the common prefix, backing up
+	// to the start of the rune it ends in.
+	i := 0
+	for i < len(a) && i < len(b) && a[i] == b[i] {
+		i++
+	}
+	for i > 0 && i < len(a) && !utf8.RuneStart(a[i]) {
+		i--
+	}
+	a, b = a[i:], b[i:]
 	for len(a) > 0 && len(b) > 0 {
 		ra, na := utf8.DecodeRuneInString(a)
 		rb, nb := utf8.DecodeRuneInString(b)
