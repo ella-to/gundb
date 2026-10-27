@@ -213,7 +213,8 @@ func (db *DB) sync(ctx context.Context, soul string) {
 func (db *DB) ask(soul string) { db.query(db.ctx, &getQuery{Soul: soul}) }
 
 // query sends q to every peer and waits (at most db.wait) until the answers
-// are in. The data that comes back is merged into the store.
+// are in. The data that comes back is merged into the store. A get for one
+// soul also offers the peers our copy of it.
 func (db *DB) query(ctx context.Context, q *getQuery) {
 	ctx, cancel := context.WithTimeout(ctx, db.wait)
 	defer cancel()
@@ -223,6 +224,9 @@ func (db *DB) query(ctx context.Context, q *getQuery) {
 	id := randomID(9)
 	db.dup.track(id, nil)
 	peers := db.livePeers()
+	if q.Soul != "" {
+		db.offer(q.Soul, peers)
+	}
 	r := db.newRequest(id, false, peers)
 	defer db.endRequest(id)
 	raw := db.encode(&message{ID: id, Get: q})
@@ -236,7 +240,8 @@ func (db *DB) query(ctx context.Context, q *getQuery) {
 }
 
 // resubscribe re-sends a get for every soul of interest to a new peer, like
-// the reference does on "hi", so it pushes us their changes too.
+// the reference does on "hi", so it pushes us their changes too. It offers
+// our copy of each as well.
 func (db *DB) resubscribe(p *peer) {
 	db.interestMu.Lock()
 	souls := make([]string, 0, len(db.interest))
@@ -245,9 +250,28 @@ func (db *DB) resubscribe(p *peer) {
 	}
 	db.interestMu.Unlock()
 	for _, soul := range souls {
+		db.offer(soul, []*peer{p})
 		m := &message{ID: randomID(9), Get: &getQuery{Soul: soul}}
 		db.dup.track(m.ID, nil)
 		p.send(db.encode(m))
+	}
+}
+
+// offer sends peers our copy of soul. They already have most of it, and HAM
+// drops what they have, but it delivers writes they never got: those made
+// offline in an earlier session (the send queue lives in memory, so a page
+// reload loses it, while the store keeps the data), or data a relay lost
+// when it restarted.
+func (db *DB) offer(soul string, peers []*peer) {
+	n, err := db.store.Get(db.ctx, soul)
+	if err != nil || n == nil || len(n.Fields) == 0 || len(peers) == 0 {
+		return
+	}
+	m := &message{ID: randomID(9), Put: graph{soul: n}}
+	db.dup.track(m.ID, nil)
+	raw := db.encode(m)
+	for _, p := range peers {
+		db.sendTo(p, m, raw)
 	}
 }
 

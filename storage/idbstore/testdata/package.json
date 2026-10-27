@@ -1,0 +1,8 @@
+{
+  "name": "gundb-idbstore-test",
+  "private": true,
+  "description": "IndexedDB for Node, so the idbstore tests can run outside a browser",
+  "dependencies": {
+    "fake-indexeddb": "6.2.6"
+  }
+}

@@ -372,6 +372,32 @@ func TestOfflineWritesSyncOnConnect(t *testing.T) {
 	})
 }
 
+// A write made offline is only in the store once the DB that made it is
+// gone (a page reload). The next DB on that store must still deliver it.
+func TestOfflineWritesSurviveRestart(t *testing.T) {
+	ctx := t.Context()
+	store := NewMemoryStore()
+	offline := New(Options{Store: store})
+	if err := offline.Get("notes").Put(ctx, map[string]any{"b": "written offline"}); err != nil {
+		t.Fatal(err)
+	}
+	offline.Close()
+
+	relay, watcher := newDB(t), newDB(t)
+	link(t, relay, watcher)
+	var got collector[string]
+	defer watcher.Get("notes").Get("b").On(got.add)()
+	time.Sleep(100 * time.Millisecond) // the watcher's get finds nothing
+
+	restarted := New(Options{Store: store, Wait: 500 * time.Millisecond})
+	defer restarted.Close()
+	link(t, relay, restarted)
+	if _, err := restarted.Get("notes").Once[map[string]any](ctx); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { v, _ := got.last(); return v == "written offline" })
+}
+
 func TestConcurrentWrites(t *testing.T) {
 	ctx := t.Context()
 	a, b := newDB(t), newDB(t)

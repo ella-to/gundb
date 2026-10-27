@@ -43,7 +43,11 @@ program in [`examples/`](examples/).
   per user what it may read and write (`Authenticate`, `CanRead`,
   `CanWrite`), for Go and GUN.js clients alike.
 - **Offline-first.** Configured peers are re-dialled automatically. Writes
-  made while offline are sent on reconnect, and subscriptions are restored.
+  made while offline are sent on reconnect, even after a restart, and
+  subscriptions are restored.
+- **Runs in the browser.** The package compiles to WebAssembly
+  (`GOOS=js GOARCH=wasm`); `storage/idbstore` keeps a browser app's data in
+  IndexedDB. See `examples/browser`.
 - **Pluggable.** Storage is a two-method `Store` interface (in-memory by
   default). `storage/pebblestore` persists to disk on Pebble (an LSM tree)
   and keeps every accepted write, readable with `History` and `GetAt`.
@@ -60,6 +64,7 @@ program in [`examples/`](examples/).
 | `sea/`             | SEA crypto: key pairs, sign, verify, encrypt, ECDH    |
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
+| `storage/idbstore` | IndexedDB store for browsers (js/wasm only)           |
 | `examples/`        | runnable programs used by the guide                   |
 | `loadtest/`        | load generator: throughput, latency, cost per user    |
 | `interop/`         | tests against the JavaScript GUN                      |
@@ -71,6 +76,9 @@ go test -race ./...
 
 # also run against real GUN.js (needs Node.js):
 (cd interop/testdata && npm install) && go test ./interop
+
+# and run the IndexedDB store's wasm tests in Node:
+(cd storage/idbstore/testdata && npm install) && go test ./storage/idbstore
 ```
 
 Load test a relay with simulated users (the relay runs in its own process;

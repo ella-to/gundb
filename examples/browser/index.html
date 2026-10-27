@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gundb notes</title>
+<style>body{font:16px sans-serif;max-width:40em;margin:2em auto;padding:0 1em}#status{color:#666}</style>
+<p id="status">loading…</p>
+<form id="form"><input id="text" placeholder="write a note" autofocus> <button>add</button> <span id="count"></span></form>
+<ul id="notes"></ul>
+<script src="wasm_exec.js"></script>
+<script>navigator.serviceWorker?.register("sw.js");</script>
+<script>
+  const go = new Go();
+  WebAssembly.instantiateStreaming(fetch("app.wasm"), go.importObject).then((r) => go.run(r.instance));
+</script>

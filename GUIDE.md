@@ -474,8 +474,8 @@ The `wait` helpers only make the output above predictable. In an app you rarely 
 ### Things to know
 
 - **`Put` while offline succeeds**: the write is applied locally and queued. `PutAck` returns `gundb.ErrNoPeers` when nobody is connected, but the write is still saved and queued.
-- **The queue lives in memory.** If the program exits before it reconnects, offline writes stay in its store but are not sent later. Up to 10,000 writes are queued per peer; later ones are kept locally only.
-- **Keep offline data across restarts** with a disk store such as [`pebblestore`](#11-persist-to-disk). The default store is in memory, so a restart starts empty.
+- **The queue lives in memory**, up to 10,000 writes per peer. If the program exits before it reconnects, its offline writes are still in its store, and they are sent once the restarted program reads those nodes: every time a DB asks peers for a node (the first read, and again on each reconnect), it also offers them its own copy. Peers keep only what is newer than what they have.
+- **Keep offline data across restarts** with a store that persists: [`pebblestore`](#11-persist-to-disk) on disk, or [`idbstore`](#15-run-in-the-browser-webassembly) in a browser. The default store is in memory, so a restart starts empty.
 - **Clocks matter.** HAM compares the writers' clocks. A device whose clock is far ahead wins conflicts, and other peers hold its writes back until their own clock catches up.
 
 ## 7. Run a relay
@@ -827,6 +827,7 @@ To log out, delete the token from `sessions`. The open connection stays authenti
 - **Use keyed `Put` for protected data, not `Set`.** `Set` gives each item a random soul, which a path rule cannot tell apart from anyone else's. `messages.Get(id).Put(ctx, msg)` gives it `users/ali/messages/<id>`.
 - **Check `PutAck`.** Like in GUN, a write is applied locally first and then sent. If the relay rejects it, nobody else ever sees it, but the writer's own copy keeps it until it is overwritten. `Put` does not wait for the answer, `PutAck` does.
 - **Reads are per node.** A user who may read `users/ali` sees its `private` field, but that field is only a link: the node it points to, with the content, is never sent. Put private data in its own node, as the example does.
+- **Clients offer what they read.** When a DB asks a peer for a node, it also sends its own copy, so writes made offline get through (see [section 6](#6-work-offline-sync-later)). For a node the client may only read, the relay rejects that copy like any other forbidden write, and the client ignores the error.
 - **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
 - **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
 - **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#9-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
@@ -1060,6 +1061,7 @@ func check(err error) {
 | `gundb.NewMemoryStore()` (default) | memory | no | tests, relays that don't need to keep data |
 | `storage/memstore` | memory | no | inspecting what a peer holds (`Souls()`) |
 | `storage/pebblestore` | disk | yes | anything you want to keep |
+| `storage/idbstore` | browser IndexedDB | no | Go compiled to WebAssembly ([section 15](#15-run-in-the-browser-webassembly)) |
 
 Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
 
@@ -1296,6 +1298,124 @@ func show(v any) {
 	fmt.Println(string(b))
 }
 ```
+
+## 15. Run in the browser (WebAssembly)
+
+The `gundb` package compiles to WebAssembly (`GOOS=js GOARCH=wasm`), so the same Go code runs in a browser tab. It connects to peers over the browser's WebSocket, and [`storage/idbstore`](storage/idbstore) keeps its data in IndexedDB, so the app keeps working offline and survives reloads and browser restarts.
+
+This example is a notes app that syncs between browsers:
+
+```sh
+go run ./examples/browser   # builds app/ to wasm, serves it and a relay
+```
+
+Open http://localhost:8766 in two browsers (or a normal and a private window: tabs of one browser share their IndexedDB, so they always look in sync). Add notes in both. Then stop the server and add a note in one of them. Reload it, or quit and reopen the browser: the page still loads and the notes are still there. Start the server again, and the other browser receives the note written offline.
+
+The browser half, compiled to wasm:
+
+<!-- example: examples/browser/app/main.go -->
+```go
+//go:build js && wasm
+
+// The browser half of examples/browser: Go compiled to WebAssembly, with its
+// data in IndexedDB. Notes survive reloads, can be written offline, and sync
+// with every other tab through the relay.
+package main
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+	"sync"
+	"syscall/js"
+	"time"
+
+	"ella.to/gundb"
+	"ella.to/gundb/storage/idbstore"
+)
+
+type Note struct {
+	Text string `json:"text"`
+	At   int64  `json:"at"`
+}
+
+var document = js.Global().Get("document")
+
+func main() {
+	ctx := context.Background()
+	store, err := idbstore.Open(ctx, "gundb-example")
+	if err != nil {
+		setText("status", err.Error())
+		return
+	}
+	origin := js.Global().Get("location").Get("origin").String()
+	db := gundb.New(gundb.Options{Store: store, Peers: []string{origin + "/gun"}})
+
+	// Show every note, oldest first. Local ones appear at once, even offline.
+	notes := db.Get("notes")
+	var mu sync.Mutex
+	seen := map[string]Note{}
+	notes.Map().On(func(id string, n Note) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen[id] = n
+		render(seen)
+	})
+
+	// Add a note on submit. Never block inside a js.Func: use a goroutine.
+	input := document.Call("getElementById", "text")
+	onSubmit := js.FuncOf(func(_ js.Value, args []js.Value) any {
+		args[0].Call("preventDefault")
+		text := input.Get("value").String()
+		input.Set("value", "")
+		if text != "" {
+			go notes.Set(ctx, Note{Text: text, At: time.Now().UnixMilli()})
+		}
+		return nil
+	})
+	document.Call("getElementById", "form").Call("addEventListener", "submit", onSubmit)
+
+	for {
+		if n := len(db.Peers()); n > 0 {
+			setText("status", "online: syncing with the relay")
+		} else {
+			setText("status", "offline: notes are saved in IndexedDB and sync when the relay is back")
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func render(seen map[string]Note) {
+	ids := slices.SortedFunc(maps.Keys(seen), func(a, b string) int { return cmp.Compare(seen[a].At, seen[b].At) })
+	list := document.Call("getElementById", "notes")
+	list.Set("textContent", "")
+	for _, id := range ids {
+		li := document.Call("createElement", "li")
+		li.Set("textContent", seen[id].Text)
+		list.Call("append", li)
+	}
+	setText("count", fmt.Sprintf("%d notes", len(ids)))
+}
+
+func setText(id, text string) { document.Call("getElementById", id).Set("textContent", text) }
+```
+
+The rest of [`examples/browser`](examples/browser) is plumbing every Go wasm app needs:
+
+- [`main.go`](examples/browser/main.go) builds the app with `GOOS=js GOARCH=wasm go build`, then serves `app.wasm`, Go's loader `$(go env GOROOT)/lib/wasm/wasm_exec.js` and the page. It also runs the relay at `/gun`.
+- [`index.html`](examples/browser/index.html) loads `wasm_exec.js` and starts `app.wasm`.
+- [`sw.js`](examples/browser/sw.js) is a service worker that caches those files, so the page opens while the server is down. Without it the app still keeps its data, but the browser can't load the page to show it.
+
+### Things to know
+
+- **Never block inside a `js.Func`.** IndexedDB, like WebSocket, answers through browser callbacks, so `Put`, `Once` and the store wait for the browser. Called directly from an event handler, they wait for a callback that can't run until the handler returns, and the page deadlocks. Start a goroutine (`go notes.Set(...)`), as the submit handler above does. `On` callbacks already run on their own goroutine.
+- **One database per origin and name.** `idbstore.Open(ctx, name)` opens the IndexedDB database `name`. Every tab of your site that opens the same name shares the data. Each node is one record (soul → its GUN wire JSON) in the object store `nodes`, readable in the browser's developer tools under Application → IndexedDB.
+- **Browsers may evict storage.** Under storage pressure a browser can clear a site's data unless it was granted persistent storage. Ask for it with `navigator.storage.persist()` if the data matters. Some private-browsing modes have no IndexedDB; `Open` returns an error there.
+- **Only the client side works in a browser.** `ServeHTTP`, `ws.Listen` and `pebblestore` need a real server. `idbstore` builds only for `js/wasm`.
+- **Size.** A Go wasm app is several MB (about 2 MB gzipped for this one with `-ldflags="-s -w"`). Serve it compressed.
+- **Testing.** `go test ./storage/idbstore` runs the store's tests in Node with an IndexedDB emulation, after `(cd storage/idbstore/testdata && npm install)`.
 
 ## Bring your own transport
 
