@@ -100,6 +100,15 @@ func (c *Conn) Recv(ctx context.Context) ([]byte, error) {
 	return data, nil
 }
 
+// Ping sends a WebSocket ping and waits for the pong. It needs Recv to be
+// running at the same time, which is how gundb uses a Conn.
+func (c *Conn) Ping(ctx context.Context) error {
+	if err := c.ws.Ping(ctx); err != nil {
+		return closedOr(err)
+	}
+	return nil
+}
+
 // Close closes the connection with a normal closure.
 func (c *Conn) Close() error {
 	err := transport.ErrClosed

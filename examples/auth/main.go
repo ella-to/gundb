@@ -38,15 +38,15 @@ func main() {
 	relay := gundb.New(gundb.Options{
 		// Who is connecting? Browsers cannot set WebSocket headers, so the
 		// token comes in the URL. No token: an anonymous, read-only user.
-		Authenticate: func(r *http.Request) (string, error) {
+		Authenticate: func(r *http.Request) (string, string, error) {
 			token := r.URL.Query().Get("token")
 			if token == "" {
-				return "", nil
+				return "", "", nil
 			}
 			if user, ok := tokens[token]; ok {
-				return user, nil
+				return user, "", nil
 			}
-			return "", errors.New("unknown token")
+			return "", "", errors.New("unknown token")
 		},
 		// Write: users/<name>/... belongs to <name>. The check is on
 		// soul + "/" + field, so the link users -> ali is protected too.

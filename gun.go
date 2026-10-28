@@ -43,10 +43,15 @@ type Options struct {
 	// refuse the connection with 401 Unauthorized. Default: everyone is
 	// anonymous.
 	//
+	// customID is any label you want for the connection, such as a device
+	// ID the client sends, so OnConnect and OnDisconnect can tell several
+	// tabs of one browser from different devices. It is reported back as
+	// PeerInfo.CustomID and nothing else; "" is fine.
+	//
 	// Authenticate, CanRead and CanWrite apply to peers that connect to
 	// this DB. The DB's own calls (db.Get(...).Put) and the peers it dials
 	// (Peers) are trusted.
-	Authenticate func(r *http.Request) (user string, err error)
+	Authenticate func(r *http.Request) (user, customID string, err error)
 
 	// CanRead reports whether user may read the node soul. Nodes a user may
 	// not read are never sent to them: not as an answer, not as a live
@@ -57,6 +62,27 @@ type Options struct {
 	// with any field denied is rejected whole, and PutAck on the writer
 	// returns ErrForbidden. Default: everyone may write everything.
 	CanWrite func(user, soul, field string) bool
+
+	// OnConnect is called when a peer connects: one we dialled (Peers),
+	// one that connected to us, or one handed to Attach. OnDisconnect is
+	// called once that connection is gone, with the same PeerInfo. A peer
+	// that vanishes without closing (a phone losing Wi-Fi) is noticed within
+	// about 40s.
+	//
+	// Both run on the connection's goroutine, so they must return quickly;
+	// OnDisconnect always comes after the OnConnect it belongs to.
+	OnConnect    func(PeerInfo)
+	OnDisconnect func(PeerInfo)
+}
+
+// PeerInfo describes one connection, for Options.OnConnect and
+// Options.OnDisconnect.
+type PeerInfo struct {
+	PeerID   string // unique to this connection, chosen by gundb
+	CustomID string // from Options.Authenticate or AttachAs
+	User     string // from Options.Authenticate or AttachAs; "" if anonymous
+	URL      string // the configured peer's URL, if this DB dialled it
+	Remote   string // the remote address
 }
 
 // DB is a GUN peer: a local graph that syncs with other peers in real time.
@@ -71,6 +97,8 @@ type DB struct {
 	store  Store
 	dialer transport.Dialer
 	wait   time.Duration
+	beat   time.Duration // heartbeatEvery, read once in New
+	pong   time.Duration // pongWait, read once in New
 	log    *slog.Logger
 
 	state *stateGen
@@ -103,9 +131,11 @@ type DB struct {
 	subsMu sync.Mutex
 	subs   map[string]map[*peer]struct{} // soul -> peers that asked for it
 
-	authenticate func(*http.Request) (string, error)
+	authenticate func(*http.Request) (string, string, error)
 	canRead      func(user, soul string) bool
 	canWrite     func(user, soul, field string) bool
+	onConnect    func(PeerInfo)
+	onDisconnect func(PeerInfo)
 }
 
 // Errors returned by DB and Ref methods.
@@ -120,6 +150,11 @@ var heartbeatEvery = 20 * time.Second
 
 // redialEvery matches the 2s reconnect delay of gun/src/websocket.js.
 var redialEvery = 2 * time.Second
+
+// pongWait is how long a peer has to answer a ping before its connection
+// is considered dead. Without it, a peer that vanishes without closing the
+// connection would look connected until TCP gives up, many minutes later.
+var pongWait = 20 * time.Second
 
 // New creates a DB. With no options it is a standalone in-memory database:
 //
@@ -151,6 +186,8 @@ func New(opts ...Options) *DB {
 		store:     o.Store,
 		dialer:    o.Dialer,
 		wait:      o.Wait,
+		beat:      heartbeatEvery,
+		pong:      pongWait,
 		log:       o.Logger,
 		state:     newStateGen(),
 		dup:       newDup(0),
@@ -167,6 +204,8 @@ func New(opts ...Options) *DB {
 		authenticate: o.Authenticate,
 		canRead:      o.CanRead,
 		canWrite:     o.CanWrite,
+		onConnect:    o.OnConnect,
+		onDisconnect: o.OnDisconnect,
 	}
 	for _, url := range o.Peers {
 		db.Connect(url)
@@ -226,7 +265,7 @@ func (db *DB) dialLoop(o *outbound) {
 			db.signalLocked()
 			db.peersMu.Unlock()
 		} else {
-			db.run(conn, o, "")
+			db.run(conn, o, "", "")
 		}
 		db.peersMu.Lock()
 		self := o.self
@@ -246,7 +285,7 @@ func (db *DB) dialLoop(o *outbound) {
 // until it closes. Use it to plug in any transport:
 //
 //	go db.Attach(conn)
-func (db *DB) Attach(conn transport.Conn) { db.run(conn, nil, "") }
+func (db *DB) Attach(conn transport.Conn) { db.run(conn, nil, "", "") }
 
 // Serve accepts peers from l until l is closed or ctx is done.
 func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
@@ -264,10 +303,10 @@ func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
 
 // ServeHTTP upgrades the request to a WebSocket and serves it as a peer.
 func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var user string
+	var user, customID string
 	if db.authenticate != nil {
 		var err error
-		if user, err = db.authenticate(r); err != nil {
+		if user, customID, err = db.authenticate(r); err != nil {
 			db.log.Debug("gundb: authentication failed", "remote", r.RemoteAddr, "err", err)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -278,7 +317,7 @@ func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		db.log.Debug("gundb: websocket upgrade failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
-	db.run(conn, nil, user)
+	db.run(conn, nil, user, customID)
 }
 
 // signalLocked wakes everyone waiting for connectivity to change.

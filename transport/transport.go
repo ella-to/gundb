@@ -36,6 +36,14 @@ type Conn interface {
 	RemoteAddr() string
 }
 
+// Pinger is implemented by a Conn that can check the remote is still there.
+// gundb pings such connections periodically and closes them when Ping
+// fails, so a peer that vanished without closing is noticed.
+type Pinger interface {
+	// Ping blocks until the remote answers or ctx is done.
+	Ping(ctx context.Context) error
+}
+
 // Dialer establishes a Conn to a remote address (URL for WebSocket, etc.).
 type Dialer interface {
 	Dial(ctx context.Context, addr string) (Conn, error)

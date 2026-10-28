@@ -518,7 +518,7 @@ A relay decides what each connected user may do. Three `Options` set it up:
 
 | Option | Called | Decides |
 | ------ | ------ | ------- |
-| `Authenticate(r *http.Request) (user, error)` | once per connection, on the WebSocket upgrade | who is connecting: read a token, cookie or header; `""` is anonymous, an error refuses the connection (401) |
+| `Authenticate(r *http.Request) (user, customID, error)` | once per connection, on the WebSocket upgrade | who is connecting: read a token, cookie or header; `""` is anonymous, an error refuses the connection (401). `customID` is your own label for the connection (e.g. a device ID), reported in `PeerInfo` |
 | `CanWrite(user, soul, field) bool` | for every field of every incoming put | whether `user` may write it; one denied field rejects the whole put, and the writer's `PutAck` returns `gundb.ErrForbidden` |
 | `CanRead(user, soul) bool` | for every get, and for every node the relay sends out | whether `user` may see the node; denied nodes are never sent, so `Once` returns `gundb.ErrNotFound` and `On` never fires |
 
@@ -581,15 +581,15 @@ func main() {
 	relay := gundb.New(gundb.Options{
 		// Who is connecting? Browsers cannot set WebSocket headers, so the
 		// token comes in the URL. No token: an anonymous, read-only user.
-		Authenticate: func(r *http.Request) (string, error) {
+		Authenticate: func(r *http.Request) (string, string, error) {
 			token := r.URL.Query().Get("token")
 			if token == "" {
-				return "", nil
+				return "", "", nil
 			}
 			if user, ok := tokens[token]; ok {
-				return user, nil
+				return user, "", nil
 			}
-			return "", errors.New("unknown token")
+			return "", "", errors.New("unknown token")
 		},
 		// Write: users/<name>/... belongs to <name>. The check is on
 		// soul + "/" + field, so the link users -> ali is protected too.
@@ -662,7 +662,7 @@ db := gundb.New(gundb.Options{
 })
 ```
 
-- **Other transports**: identify the user yourself and hand the connection over with `db.AttachAs(conn, user)`.
+- **Other transports**: identify the user yourself and hand the connection over with `db.AttachAs(conn, user, customID)`.
 
 ### Example: a chat with user names and passwords
 
@@ -734,14 +734,14 @@ func main() {
 		// Authentication: who is connecting? The token comes in the URL
 		// (browsers cannot set WebSocket headers). No valid token, no
 		// connection: only logged-in users can read or post.
-		Authenticate: func(r *http.Request) (string, error) {
+		Authenticate: func(r *http.Request) (string, string, error) {
 			mu.Lock()
 			user, ok := sessions[r.URL.Query().Get("token")]
 			mu.Unlock()
 			if !ok {
-				return "", errors.New("not logged in")
+				return "", "", errors.New("not logged in")
 			}
-			return user, nil
+			return user, "", nil
 		},
 		// Authorization: what may they do? Messages live at
 		// chat/<user>/<id>, and only <user> may write there.
@@ -831,6 +831,34 @@ To log out, delete the token from `sessions`. The open connection stays authenti
 - **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
 - **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
 - **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#9-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
+
+### Who is online
+
+`Options.OnConnect` and `Options.OnDisconnect` are called for every connection, with a `PeerInfo`:
+
+| Field | What it is |
+|---|---|
+| `PeerID` | unique to this connection, chosen by gundb; a reconnect gets a new one |
+| `User`, `CustomID` | what `Authenticate` returned |
+| `URL` | on a client: which of its `Peers` connected |
+| `Remote` | the remote address |
+
+On a client, they tell you when you are online. On a relay, every tab is its own connection, so a user is online while they have at least one. To tell tabs from devices, have the client send a device ID (kept in `localStorage`, which every tab of a browser shares) and return it as the custom ID:
+
+```go
+Authenticate: func(r *http.Request) (string, string, error) {
+	user, err := lookUp(r.URL.Query().Get("token"))
+	return user, r.URL.Query().Get("device"), err
+},
+OnConnect:    func(p gundb.PeerInfo) { /* p.User, p.CustomID, p.PeerID */ },
+OnDisconnect: func(p gundb.PeerInfo) { /* same PeerInfo as its OnConnect */ },
+```
+
+[examples/presence](examples/presence/main.go) counts tabs per user and device. Things to know:
+
+- **The hooks run on the connection's goroutine.** Return quickly; hand slow work to another goroutine.
+- **A vanished peer is noticed within about 40s.** A closed tab or a stopped client is reported straight away. A phone that loses Wi-Fi closes nothing, so gundb pings every peer every 20s and drops one that does not answer within 20s. Browsers and Node answer pings on their own.
+- **The custom ID comes from the client.** It labels connections; it proves nothing. Base permissions on the user only.
 
 ## 9. Users and encryption (SEA)
 

@@ -194,7 +194,7 @@ func TestForgedUserDataOverTheWire(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := newScriptConn()
-	go relay.AttachAs(conn, "")
+	go relay.AttachAs(conn, "", "")
 	eventually(t, func() bool { return len(relay.Peers()) == 1 })
 	soul := "~" + ali.Pub()
 	conn.recv <- []byte(`{"#":"forge1","put":{"` + soul + `":{"_":{"#":"` + soul + `",">":{"name":1}},"name":"Mallory"}}}`)

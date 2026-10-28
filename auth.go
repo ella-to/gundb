@@ -14,8 +14,11 @@ var ErrForbidden = errors.New("gundb: forbidden")
 
 // AttachAs is Attach for a connection whose user you identified yourself,
 // for transports other than the built-in WebSocket handler. Options.CanRead
-// and Options.CanWrite are checked against user.
-func (db *DB) AttachAs(conn transport.Conn, user string) { db.run(conn, nil, user) }
+// and Options.CanWrite are checked against user; customID is reported in
+// PeerInfo, like the one Options.Authenticate returns.
+func (db *DB) AttachAs(conn transport.Conn, user, customID string) {
+	db.run(conn, nil, user, customID)
+}
 
 // trusted reports whether p's requests skip the rules: peers we dialled
 // ourselves (Options.Peers) are trusted, only peers that connect to us are

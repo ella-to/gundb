@@ -16,6 +16,8 @@ type peer struct {
 	conn   transport.Conn
 	origin *outbound // the configured peer this connection belongs to, if dialled
 	user   string    // who connected, from Options.Authenticate
+	id     string    // PeerInfo.PeerID
+	custom string    // PeerInfo.CustomID, from Options.Authenticate
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -54,9 +56,9 @@ const (
 var slowPeer = 5 * time.Second
 
 // run serves one connection until it closes.
-func (db *DB) run(conn transport.Conn, o *outbound, user string) {
+func (db *DB) run(conn transport.Conn, o *outbound, user, customID string) {
 	ctx, cancel := context.WithCancel(db.ctx)
-	p := &peer{db: db, conn: conn, origin: o, user: user, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	p := &peer{db: db, conn: conn, origin: o, user: user, id: randomID(16), custom: customID, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -72,8 +74,14 @@ func (db *DB) run(conn transport.Conn, o *outbound, user string) {
 	db.signalLocked()
 	db.peersMu.Unlock()
 	db.log.Debug("gundb: peer connected", "peer", conn.RemoteAddr())
+	if db.onConnect != nil {
+		db.onConnect(p.info())
+	}
 
 	go p.writeLoop()
+	if pinger, ok := conn.(transport.Pinger); ok {
+		go p.keepAlive(pinger)
+	}
 	if o == nil {
 		// Like mesh.hi in the reference, the accepting side opens the DAM handshake.
 		db.reply(p, &message{Dam: "?", PID: db.pid})
@@ -95,6 +103,44 @@ func (db *DB) run(conn transport.Conn, o *outbound, user string) {
 	db.unsubscribe(p)
 	db.peerGone(p)
 	db.log.Debug("gundb: peer disconnected", "peer", conn.RemoteAddr())
+	if db.onDisconnect != nil {
+		db.onDisconnect(p.info())
+	}
+}
+
+func (p *peer) info() PeerInfo {
+	info := PeerInfo{PeerID: p.id, CustomID: p.custom, User: p.user, Remote: p.conn.RemoteAddr()}
+	if p.origin != nil {
+		info.URL = p.origin.url
+	}
+	return info
+}
+
+// keepAlive pings the peer every heartbeat and closes the connection
+// if no pong comes back in time. Heartbeat frames alone cannot do
+// this: a write to a vanished peer still succeeds into the OS buffer, and
+// browser GUN clients send no heartbeats to watch for. Every browser and
+// the ws package of Node answer pings on their own.
+func (p *peer) keepAlive(pinger transport.Pinger) {
+	t := time.NewTicker(p.db.beat)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-t.C:
+		}
+		ctx, cancel := context.WithTimeout(p.ctx, p.db.pong)
+		err := pinger.Ping(ctx)
+		cancel()
+		if err != nil {
+			if p.ctx.Err() == nil {
+				p.db.log.Debug("gundb: peer stopped answering", "peer", p.conn.RemoteAddr(), "err", err)
+				p.close()
+			}
+			return
+		}
+	}
 }
 
 func (p *peer) readLoop() {
@@ -119,7 +165,7 @@ func (p *peer) readLoop() {
 // writeLoop sends queued messages, batching whatever has piled up into one
 // JSON array frame the way the reference mesh does, plus heartbeats.
 func (p *peer) writeLoop() {
-	t := time.NewTicker(heartbeatEvery)
+	t := time.NewTicker(p.db.beat)
 	defer t.Stop()
 	for {
 		var frame []byte

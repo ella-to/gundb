@@ -197,8 +197,8 @@ func TestJSClientsWithGoRelay(t *testing.T) {
 func TestJSClientsWithAuthRelay(t *testing.T) {
 	requireNode(t)
 	relay := gundb.New(gundb.Options{
-		Authenticate: func(r *http.Request) (string, error) {
-			return strings.TrimPrefix(r.URL.Query().Get("token"), "tok-"), nil
+		Authenticate: func(r *http.Request) (string, string, error) {
+			return strings.TrimPrefix(r.URL.Query().Get("token"), "tok-"), "", nil
 		},
 		CanWrite: func(user, soul, field string) bool {
 			owner, _, _ := strings.Cut(strings.TrimPrefix(soul, "users/"), "/")

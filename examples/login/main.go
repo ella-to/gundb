@@ -58,14 +58,14 @@ func main() {
 		// Authentication: who is connecting? The token comes in the URL
 		// (browsers cannot set WebSocket headers). No valid token, no
 		// connection: only logged-in users can read or post.
-		Authenticate: func(r *http.Request) (string, error) {
+		Authenticate: func(r *http.Request) (string, string, error) {
 			mu.Lock()
 			user, ok := sessions[r.URL.Query().Get("token")]
 			mu.Unlock()
 			if !ok {
-				return "", errors.New("not logged in")
+				return "", "", errors.New("not logged in")
 			}
-			return user, nil
+			return user, "", nil
 		},
 		// Authorization: what may they do? Messages live at
 		// chat/<user>/<id>, and only <user> may write there.

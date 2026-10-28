@@ -20,12 +20,12 @@ func authRelay(t *testing.T) (*DB, string) {
 	t.Helper()
 	relay := New(Options{
 		Wait: 300 * time.Millisecond,
-		Authenticate: func(r *http.Request) (string, error) {
+		Authenticate: func(r *http.Request) (string, string, error) {
 			user, ok := strings.CutPrefix(r.URL.Query().Get("token"), "tok-")
 			if !ok {
-				return "", errors.New("bad token")
+				return "", "", errors.New("bad token")
 			}
-			return user, nil
+			return user, "", nil
 		},
 		CanWrite: func(user, soul, field string) bool {
 			path := strings.Split(soul+"/"+field, "/")
@@ -143,7 +143,7 @@ func TestCanReadFiltersPushes(t *testing.T) {
 func TestForgedRepliesAreDropped(t *testing.T) {
 	relay, _ := authRelay(t)
 	conn := newScriptConn()
-	go relay.AttachAs(conn, "mallory")
+	go relay.AttachAs(conn, "mallory", "")
 	eventually(t, func() bool { return len(relay.Peers()) == 1 })
 
 	go relay.Get("users").Get("ali").Get("name").Once[string](context.Background())
