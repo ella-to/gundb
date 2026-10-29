@@ -238,3 +238,58 @@ func BenchmarkGet(b *testing.B) {
 		}
 	}
 }
+
+func TestGetFields(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, t.TempDir())
+	if n, err := s.GetFields(ctx, "nobody", []string{"x"}); n != nil || err != nil {
+		t.Fatalf("unknown soul: %+v, %v", n, err)
+	}
+	n := gundb.NewNode("a\x00b")
+	n.Set("name", gundb.String("Alice"), 1)
+	n.Set("p\x00et", gundb.Link{Soul: "pets/rex"}, 2)
+	n.Set("age", gundb.Number(30.5), 3)
+	if err := s.Put(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	want := gundb.NewNode("a\x00b")
+	want.Set("name", gundb.String("Alice"), 1)
+	want.Set("p\x00et", gundb.Link{Soul: "pets/rex"}, 2)
+	got, err := s.GetFields(ctx, "a\x00b", []string{"name", "p\x00et", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameNode(t, got, want)
+	if got, err := s.GetFields(ctx, "a\x00b", []string{"missing"}); got != nil || err != nil {
+		t.Fatalf("no stored field: %+v, %v", got, err)
+	}
+}
+
+// BenchmarkPutFieldLargeNode writes one field of a node with n fields
+// through a DB, which is what adding an item to a long list does.
+func BenchmarkPutFieldLargeNode(b *testing.B) {
+	for _, n := range []int{10, 10000} {
+		b.Run(fmt.Sprintf("fields=%d", n), func(b *testing.B) {
+			ctx := context.Background()
+			s := benchStore(b, 0)
+			db := gundb.New(gundb.Options{Store: s})
+			defer db.Close()
+			fields := make(map[string]any, n)
+			for i := range n {
+				fields[fmt.Sprintf("k%d", i)] = i
+			}
+			if err := db.Get("list").Put(ctx, fields); err != nil {
+				b.Fatal(err)
+			}
+			ref := db.Get("list").Get("k0")
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				if err := ref.Put(ctx, i); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

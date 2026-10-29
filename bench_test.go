@@ -118,3 +118,31 @@ func BenchmarkDupTrack(b *testing.B) {
 		i++
 	}
 }
+
+// BenchmarkPutFieldLargeNode writes one field of a node that already has
+// n fields, which is what adding an item to a long list does.
+func BenchmarkPutFieldLargeNode(b *testing.B) {
+	for _, n := range []int{10, 1000, 10000} {
+		b.Run("fields="+strconv.Itoa(n), func(b *testing.B) {
+			db := New()
+			defer db.Close()
+			ctx := context.Background()
+			fields := make(map[string]any, n)
+			for i := range n {
+				fields["k"+strconv.Itoa(i)] = i
+			}
+			if err := db.Get("list").Put(ctx, fields); err != nil {
+				b.Fatal(err)
+			}
+			ref := db.Get("list").Get("k0")
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				if err := ref.Put(ctx, i); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

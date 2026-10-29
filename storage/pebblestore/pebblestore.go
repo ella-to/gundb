@@ -39,7 +39,7 @@ type Options struct {
 	Pebble *pebble.Options
 }
 
-// Store is a gundb.FieldStore and gundb.SoulStore backed by Pebble. It is
+// Store is a gundb.FieldReader and gundb.SoulStore backed by Pebble. It is
 // safe for concurrent use.
 type Store struct {
 	db    *pebble.DB
@@ -48,8 +48,8 @@ type Store struct {
 }
 
 var (
-	_ gundb.FieldStore = (*Store)(nil)
-	_ gundb.SoulStore  = (*Store)(nil)
+	_ gundb.FieldReader = (*Store)(nil)
+	_ gundb.SoulStore   = (*Store)(nil)
 )
 
 // Version is one past write of a field.
@@ -106,6 +106,39 @@ func (s *Store) Get(_ context.Context, soul string) (*gundb.Node, error) {
 		n.Set(string(it.Key()[len(prefix):]), val, math.Float64frombits(binary.BigEndian.Uint64(v)))
 	}
 	return n, it.Error()
+}
+
+// GetFields implements gundb.FieldReader with one point lookup per field,
+// so a merge into a node with many fields reads only what it writes.
+func (s *Store) GetFields(_ context.Context, soul string, fields []string) (*gundb.Node, error) {
+	prefix := latestPrefix(soul)
+	var n *gundb.Node
+	var key []byte
+	for _, field := range fields {
+		key = append(append(key[:0], prefix...), field...) // L keys end with the raw field
+		v, closer, err := s.db.Get(key)
+		if errors.Is(err, pebble.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("pebblestore: %w", err)
+		}
+		if len(v) < 8 {
+			closer.Close()
+			return nil, fmt.Errorf("pebblestore: corrupt value for %q", soul)
+		}
+		val, err := decodeValue(v[8:])
+		state := math.Float64frombits(binary.BigEndian.Uint64(v))
+		closer.Close()
+		if err != nil {
+			return nil, err
+		}
+		if n == nil {
+			n = gundb.NewNode(soul)
+		}
+		n.Set(field, val, state)
+	}
+	return n, nil
 }
 
 // Put implements gundb.Store: every field of n is written.

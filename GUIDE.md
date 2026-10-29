@@ -2080,7 +2080,7 @@ func check(err error) {
 }
 ```
 
-The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields. A store that implements `gundb.SoulStore` (`ListSouls(ctx, prefix)`) can also answer LEX queries over souls (`db.Souls`, or `{"#": {"*": prefix}}` from GUN.js). The default store, `memstore` and `pebblestore` all do.
+The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields. A `FieldStore` that also implements `gundb.FieldReader` (`GetFields(ctx, soul, fields)`) is asked for only the fields a merge touches, so writing one field of a node with thousands of fields stays as cheap as writing a small one; the default store, `memstore` and `pebblestore` do. A store that implements `gundb.SoulStore` (`ListSouls(ctx, prefix)`) can also answer LEX queries over souls (`db.Souls`, or `{"#": {"*": prefix}}` from GUN.js). The default store, `memstore` and `pebblestore` all do.
 
 ## 14. A CLI for any GUN peer
 

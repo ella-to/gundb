@@ -14,13 +14,16 @@ import (
 	"ella.to/gundb"
 )
 
-// Store is an in-memory gundb.SoulStore.
+// Store is an in-memory gundb.SoulStore and gundb.FieldReader.
 type Store struct {
 	mu    sync.RWMutex
 	nodes map[string]*gundb.Node
 }
 
-var _ gundb.SoulStore = (*Store)(nil)
+var (
+	_ gundb.SoulStore   = (*Store)(nil)
+	_ gundb.FieldReader = (*Store)(nil)
+)
 
 // New returns an empty Store.
 func New() *Store { return &Store{nodes: map[string]*gundb.Node{}} }
@@ -41,6 +44,41 @@ func (s *Store) Put(_ context.Context, n *gundb.Node) error {
 	defer s.mu.Unlock()
 	s.nodes[n.Soul] = n.Clone()
 	return nil
+}
+
+// PutFields implements gundb.FieldStore: only the changed fields are written.
+func (s *Store) PutFields(_ context.Context, soul string, changed *gundb.Node) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.nodes[soul]
+	if !ok {
+		s.nodes[soul] = changed.Clone()
+		return nil
+	}
+	for k, v := range changed.Fields {
+		n.Set(k, v, changed.States[k])
+	}
+	return nil
+}
+
+// GetFields implements gundb.FieldReader.
+func (s *Store) GetFields(_ context.Context, soul string, fields []string) (*gundb.Node, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stored, ok := s.nodes[soul]
+	if !ok {
+		return nil, nil
+	}
+	var n *gundb.Node
+	for _, k := range fields {
+		if v, ok := stored.Fields[k]; ok {
+			if n == nil {
+				n = gundb.NewNode(soul)
+			}
+			n.Set(k, v, stored.States[k])
+		}
+	}
+	return n, nil
 }
 
 // Souls returns the stored souls, sorted.

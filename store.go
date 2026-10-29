@@ -27,6 +27,20 @@ type FieldStore interface {
 	PutFields(ctx context.Context, soul string, changed *Node) error
 }
 
+// FieldReader is an optional extension of FieldStore. When the store
+// implements it, a merge reads only the fields it is about to write,
+// instead of the whole node, so writing one field of a large node (adding
+// an item to a long list) costs the same as writing one field of a small
+// one.
+//
+// GetFields returns a node holding those of fields that are stored, or
+// (nil, nil) if there are none. Like Get, the node is the caller's to
+// modify.
+type FieldReader interface {
+	FieldStore
+	GetFields(ctx context.Context, soul string, fields []string) (*Node, error)
+}
+
 // SoulStore is an optional extension of Store that lists souls. A DB needs
 // it to answer LEX queries over souls, like {"#": {"*": "chat/"}} from GUN.js
 // or DB.Souls; without it such gets are passed on to other peers.

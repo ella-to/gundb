@@ -3,7 +3,9 @@ package gundb
 import (
 	"context"
 	"hash/maphash"
+	"maps"
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
@@ -19,11 +21,18 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 	var wake float64
 
 	machine := db.state.Next()
+	fr, partial := db.store.(FieldReader)
 	for _, soul := range childrenFirst(g) {
 		in := g[soul]
 		mu := db.mergeLock(soul)
 		mu.Lock()
-		cur, err := db.store.Get(ctx, soul)
+		var cur *Node
+		var err error
+		if partial { // only the fields we merge; PutFields writes only those
+			cur, err = fr.GetFields(ctx, soul, slices.Collect(maps.Keys(in.Fields)))
+		} else {
+			cur, err = db.store.Get(ctx, soul)
+		}
 		if err != nil {
 			mu.Unlock()
 			return nil, err
