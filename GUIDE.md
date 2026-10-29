@@ -1190,6 +1190,625 @@ func check(err error) {
 - **Outside users' spaces nothing changes**: anyone can write, unless your relay has [rules](#8-permissions-who-can-read-and-write).
 - **Not supported:** SEA certificates (`SEA.certify`, which GUN.js marks experimental) and signatures from before 2020. Writes that use them are rejected.
 
+### Encrypted group chat with a shared key
+
+A group only its members can read, with the building blocks above. Two rules
+shape the layout:
+
+- **Each member writes to their own space.** Only alice can write `~alice/...`
+  (SEA certificates, which would let others write there, aren't supported), so
+  each member keeps their messages in their own feed, and readers merge the
+  feeds. That costs nothing: every message is signed by its author for free.
+- **The owner signs the member list.** It lives in the owner's space, so nobody
+  else can add themselves to it.
+
+The owner makes a random group key and stores one copy per member, encrypted
+with `sea.Secret` between the owner and that member. Removing someone means a
+new key *version*, given only to the members left.
+
+<!-- example: examples/group/main.go -->
+```go
+// Encrypted group chat with a shared group key. Only members can read it,
+// and removing a member locks them out of what is said next.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"ella.to/gundb"
+	"ella.to/gundb/sea"
+)
+
+// Message is what a member stores in their own feed: ciphertext, and the
+// version of the group key it was encrypted with.
+type Message struct {
+	Version int    `json:"version"`
+	Data    string `json:"data"`
+}
+
+// group is "~owner/groups/<id>" in the graph:
+//
+//	members/<pub>          true for each member (signed by the owner)
+//	version                the current key version
+//	keys/<version>/<pub>   the group key, encrypted for that member
+//
+// and each member writes their messages to "~member/groups/<id>/messages".
+type group struct {
+	db    *gundb.DB
+	owner string // the owner's public key
+	id    string
+}
+
+func main() {
+	ctx := context.Background()
+	// One DB stands in for the network: in a real app each person runs
+	// their own peer, and only their own *gundb.User (their keys).
+	db := gundb.New()
+	defer db.Close()
+
+	alice, bob, carol := newUser(ctx, db, "alice"), newUser(ctx, db, "bob"), newUser(ctx, db, "carol")
+	eve := newUser(ctx, db, "eve") // never a member
+
+	// Alice creates the group with bob and carol.
+	g := &group{db: db, owner: alice.Pub(), id: "team"}
+	check(g.setMembers(ctx, alice, alice, bob, carol))
+
+	check(g.send(ctx, alice, "hi team"))
+	check(g.send(ctx, bob, "hello!"))
+	g.show(ctx, "carol", carol)
+
+	// Everything is public in the graph, but eve has no key to read it.
+	g.show(ctx, "eve", eve)
+
+	// Alice removes carol: a new key version, given only to who is left.
+	check(g.setMembers(ctx, alice, alice, bob))
+	check(g.send(ctx, alice, "carol is gone"))
+	g.show(ctx, "bob", bob)
+	g.show(ctx, "carol", carol) // she still has the old key, not the new one
+}
+
+// setMembers makes members the group (owner included) and hands each of
+// them a new group key, encrypted with a secret only the owner and that
+// member can derive.
+func (g *group) setMembers(ctx context.Context, owner *gundb.User, members ...*gundb.User) error {
+	ref := owner.Get("groups").Get(g.id)
+	version, _ := ref.Get("version").Once[int](ctx) // 0 for a new group
+	version++
+
+	key := make([]byte, 32)
+	rand.Read(key)
+	list := map[string]any{}
+	old, _ := ref.Get("members").Once[map[string]bool](ctx)
+	for pub := range old {
+		list[pub] = nil // removed unless added back below
+	}
+	for _, m := range members {
+		secret, err := sea.Secret(m.Pair().EPub, owner.Pair())
+		if err != nil {
+			return err
+		}
+		enc, err := sea.Encrypt(base64.StdEncoding.EncodeToString(key), secret)
+		if err != nil {
+			return err
+		}
+		if err := ref.Get("keys").Get(strconv.Itoa(version)).Get(m.Pub()).Put(ctx, enc); err != nil {
+			return err
+		}
+		list[m.Pub()] = true
+	}
+	if err := ref.Get("members").Put(ctx, list); err != nil {
+		return err
+	}
+	return ref.Get("version").Put(ctx, version) // last: members find their key first
+}
+
+// key returns the group key of version v for user u, decrypted with the
+// secret u shares with the owner.
+func (g *group) key(ctx context.Context, u *gundb.User, v int) (string, error) {
+	enc, err := g.db.User(g.owner).Get("groups").Get(g.id).Get("keys").Get(strconv.Itoa(v)).Get(u.Pub()).Once[string](ctx)
+	if err != nil {
+		return "", err // no key for u: not a member at version v
+	}
+	ownerEPub, err := g.db.User(g.owner).Get("epub").Once[string](ctx)
+	if err != nil {
+		return "", err
+	}
+	secret, err := sea.Secret(ownerEPub, u.Pair())
+	if err != nil {
+		return "", err
+	}
+	raw, err := sea.Decrypt(enc, secret)
+	if err != nil {
+		return "", err
+	}
+	var key string
+	return key, json.Unmarshal(raw, &key)
+}
+
+// send encrypts text with the current group key and adds it to u's feed.
+func (g *group) send(ctx context.Context, u *gundb.User, text string) error {
+	v, err := g.db.User(g.owner).Get("groups").Get(g.id).Get("version").Once[int](ctx)
+	if err != nil {
+		return err
+	}
+	key, err := g.key(ctx, u, v)
+	if err != nil {
+		return fmt.Errorf("%s is not a member: %w", u.Alias(), err)
+	}
+	enc, err := sea.Encrypt(text, key)
+	if err != nil {
+		return err
+	}
+	// A time-ordered key sorts the feed; the random part keeps keys unique.
+	id := fmt.Sprintf("%020d-%s", time.Now().UnixNano(), rand.Text()[:6])
+	return u.Get("groups").Get(g.id).Get("messages").Get(id).Put(ctx, Message{Version: v, Data: enc})
+}
+
+// show prints the conversation as u sees it: every member's feed, merged in
+// time order, decrypted where u has the key.
+func (g *group) show(ctx context.Context, name string, u *gundb.User) {
+	fmt.Printf("--- %s sees:\n", name)
+	members, _ := g.db.User(g.owner).Get("groups").Get(g.id).Get("members").Once[map[string]bool](ctx)
+	type line struct{ id, from, text string }
+	var lines []line
+	keys := map[int]string{}
+	for _, pub := range slices.Sorted(maps.Keys(members)) {
+		from, _ := g.db.User(pub).Get("alias").Once[string](ctx)
+		feed, _ := g.db.User(pub).Get("groups").Get(g.id).Get("messages").Once[map[string]Message](ctx)
+		for id, m := range feed {
+			text := "[can't read]"
+			if _, ok := keys[m.Version]; !ok {
+				keys[m.Version], _ = g.key(ctx, u, m.Version)
+			}
+			if raw, err := sea.Decrypt(m.Data, keys[m.Version]); err == nil {
+				json.Unmarshal(raw, &text)
+			}
+			lines = append(lines, line{id, from, text})
+		}
+	}
+	slices.SortFunc(lines, func(a, b line) int { return strings.Compare(a.id, b.id) })
+	for _, l := range lines {
+		fmt.Printf("%s: %s\n", l.from, l.text)
+	}
+}
+
+func newUser(ctx context.Context, db *gundb.DB, alias string) *gundb.User {
+	u, err := db.CreateUser(ctx, alias, alias+" password")
+	check(err)
+	return u
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Output:
+
+```
+--- carol sees:
+alice: hi team
+bob: hello!
+--- eve sees:
+alice: [can't read]
+bob: [can't read]
+--- bob sees:
+alice: hi team
+bob: hello!
+alice: carol is gone
+--- carol sees:
+alice: hi team
+bob: hello!
+alice: [can't read]
+```
+
+What a shared key does not give you:
+
+- **Removed members keep the past.** Carol still has key version 1, and the
+  ciphertext is copied to every peer. You can't take back what was already
+  readable.
+- **A leaked key is a leaked history.** Everything encrypted under that version
+  can be read with it. There is no forward secrecy. For that, use sender keys
+  (below).
+- **New members can read the history** of the version they're given. Start a
+  new version when someone joins if they shouldn't.
+
+### Encrypted group chat with sender keys (a ratchet)
+
+Package `sea/senderkey` implements Signal's *sender keys*, the scheme Signal
+and WhatsApp use for groups. Every member has their own **chain**:
+
+- **Every message gets a new key.** The key comes from the chain with HMAC and
+  HKDF. The chain then steps forward, and the old chain key is deleted. Keys
+  only go forward, so a device's current state can't decrypt anything it
+  already read (**forward secrecy**).
+- **Each member shares their chain** with every other member, sealed to that
+  member's **prekey** with `senderkey.Seal`. A prekey is a key pair that stays
+  on the device; its public half is published in the member's space. Sealing
+  uses a one-off key pair and SEA ECDH, so even the member's SEA account keys
+  (their password) can't open it, and once the prekey is deleted, nothing can.
+- **A shared chain starts where the sender is now**, so a new member reads from
+  the moment they joined, never the history.
+- **Removing a member means everyone left starts a new chain**, which the
+  removed member never gets.
+
+Sender keys fit GUN well:
+
+- **No two writers share state.** Each chain belongs to one sender and lives
+  in that sender's space. Messages carry a counter, so they can arrive late,
+  out of order or after time offline (`Receiver` keeps keys it skipped, up to
+  `senderkey.MaxSkip`). There is no need for the single global order that
+  MLS-style protocols require.
+- **Authenticity is already there.** A message read from `~bob` was signed by
+  bob and checked by every peer, so the ratchet doesn't need to sign anything.
+- **The ciphertext is plain SEA.** Each message is `sea.Encrypt(text,
+  messageKey)`, and sealed chains are SEA ECDH plus `sea.Encrypt`, so a GUN.js
+  client can join the group by implementing the chain step with WebCrypto.
+
+<!-- example: examples/senderkeys/main.go -->
+```go
+// Encrypted group chat with sender keys (a ratchet): every message has its
+// own key, new members can't read history, removed members can't read what
+// comes next, and a stolen device can't read what it already read.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	"ella.to/gundb"
+	"ella.to/gundb/sea"
+	"ella.to/gundb/sea/senderkey"
+)
+
+// In the graph (all public, all signed by whoever owns the space):
+//
+//	~owner/groups/<id>/members/<pub>          true for each member
+//	~member/prekey                            the member's current prekey (an epub)
+//	~member/groups/<id>/chain                 the ID of the member's current chain
+//	~member/groups/<id>/keys/<chain>/<pub>    member's chain, sealed for <pub>
+//	~member/groups/<id>/messages/<msgID>      a senderkey.Message
+//
+// On each device, never in the graph: prekeys, chains, and read messages.
+type member struct {
+	*gundb.User
+	name    string
+	db      *gundb.DB
+	prekeys map[string]*sea.Pair           // by epub
+	sender  *senderkey.Sender              // my chain
+	chains  map[string]*senderkey.Receiver // other members' chains, by ID
+	seen    map[string]bool                // message IDs already handled
+}
+
+type group struct {
+	owner string // the owner's public key
+	id    string
+}
+
+func main() {
+	ctx := context.Background()
+	// One DB stands in for the network: in a real app each person runs
+	// their own peer, and each member value is their own device.
+	db := gundb.New()
+	defer db.Close()
+	alice, bob, carol, dave := join(ctx, db, "alice"), join(ctx, db, "bob"), join(ctx, db, "carol"), join(ctx, db, "dave")
+
+	// Alice creates the group. Each member starts a chain and shares it.
+	g := group{owner: alice.Pub(), id: "team"}
+	check(alice.setMembers(ctx, g, alice, bob, carol))
+	for _, m := range []*member{alice, bob, carol} {
+		check(m.newChain(ctx, g))
+	}
+	check(alice.send(ctx, g, "hi team"))
+	check(bob.send(ctx, g, "hello!"))
+	carol.read(ctx, g)
+
+	// Dave joins. The others share their chains as they are now, so dave
+	// reads from here on but not the history: chains only move forward.
+	check(alice.setMembers(ctx, g, alice, bob, carol, dave))
+	check(dave.newChain(ctx, g))
+	for _, m := range []*member{alice, bob, carol} {
+		check(m.share(ctx, g, m.sender, dave.Pub()))
+	}
+	check(alice.send(ctx, g, "welcome dave"))
+	dave.read(ctx, g)
+
+	// Carol leaves. Everyone left starts a new chain that carol never gets.
+	check(alice.setMembers(ctx, g, alice, bob, dave))
+	for _, m := range []*member{alice, bob, dave} {
+		check(m.newChain(ctx, g))
+	}
+	check(bob.send(ctx, g, "carol can't read this"))
+	carol.read(ctx, g)
+	bob.read(ctx, g)
+
+	// read opened every new chain sealed for bob, so he can now replace
+	// his prekey and delete the old one. He still reads what comes next.
+	check(bob.newPrekey(ctx))
+	check(alice.send(ctx, g, "still private"))
+	bob.read(ctx, g)
+
+	// A thief with bob's password and a copy of his device can't read
+	// anything bob already read: his chains have moved past those
+	// messages, and the sealed keys in the graph need the deleted prekey.
+	thief := bob.stolen("thief with bob's device")
+	thief.read(ctx, g)
+
+	// Bob's password alone (his SEA keys, on a new device) opens nothing:
+	// chains are sealed to prekeys, which never leave the device.
+	login, err := db.Login(ctx, "bob", "bob password")
+	check(err)
+	fresh := &member{User: login, name: "bob's password on a new device", db: db, prekeys: map[string]*sea.Pair{}, chains: map[string]*senderkey.Receiver{}, seen: map[string]bool{}}
+	fresh.read(ctx, g)
+}
+
+// join creates a user and publishes their first prekey.
+func join(ctx context.Context, db *gundb.DB, alias string) *member {
+	u, err := db.CreateUser(ctx, alias, alias+" password")
+	check(err)
+	m := &member{User: u, name: alias, db: db, prekeys: map[string]*sea.Pair{}, chains: map[string]*senderkey.Receiver{}, seen: map[string]bool{}}
+	check(m.newPrekey(ctx))
+	return m
+}
+
+// newPrekey publishes a new prekey for others to seal chains to, and
+// deletes the old ones. Do it once the chains sealed to them are open.
+func (m *member) newPrekey(ctx context.Context) error {
+	p, err := sea.NewPair()
+	if err != nil {
+		return err
+	}
+	clear(m.prekeys)
+	m.prekeys[p.EPub] = p
+	return m.Get("prekey").Put(ctx, p.EPub)
+}
+
+// setMembers replaces the member list (only the owner can write it).
+func (m *member) setMembers(ctx context.Context, g group, members ...*member) error {
+	ref := m.Get("groups").Get(g.id).Get("members")
+	list := map[string]any{}
+	old, _ := ref.Once[map[string]bool](ctx)
+	for pub := range old {
+		list[pub] = nil
+	}
+	for _, x := range members {
+		list[x.Pub()] = true
+	}
+	return ref.Put(ctx, list)
+}
+
+func (g group) members(ctx context.Context, db *gundb.DB) []string {
+	list, _ := db.User(g.owner).Get("groups").Get(g.id).Get("members").Once[map[string]bool](ctx)
+	return slices.Sorted(maps.Keys(list))
+}
+
+// newChain starts a new chain and shares it with every other member.
+func (m *member) newChain(ctx context.Context, g group) error {
+	s, err := senderkey.NewSender()
+	if err != nil {
+		return err
+	}
+	m.sender = s
+	if err := m.Get("groups").Get(g.id).Get("chain").Put(ctx, s.Key.Chain); err != nil {
+		return err
+	}
+	var others []string
+	for _, pub := range g.members(ctx, m.db) {
+		if pub != m.Pub() {
+			others = append(others, pub)
+		}
+	}
+	return m.share(ctx, g, s, others...)
+}
+
+// share seals s, as it is now, to the current prekey of each member in to.
+func (m *member) share(ctx context.Context, g group, s *senderkey.Sender, to ...string) error {
+	for _, pub := range to {
+		prekey, err := m.db.User(pub).Get("prekey").Once[string](ctx)
+		if err != nil {
+			return err
+		}
+		sealed, err := senderkey.Seal(s.Share(), prekey)
+		if err != nil {
+			return err
+		}
+		if err := m.Get("groups").Get(g.id).Get("keys").Get(s.Key.Chain).Get(pub).Put(ctx, sealed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// send encrypts text with the next key of m's chain and adds it to m's feed.
+func (m *member) send(ctx context.Context, g group, text string) error {
+	msg, err := m.sender.Encrypt(text)
+	if err != nil {
+		return err
+	}
+	id := fmt.Sprintf("%020d-%s", time.Now().UnixNano(), rand.Text()[:6])
+	m.seen[id] = true
+	return m.Get("groups").Get(g.id).Get("messages").Get(id).Put(ctx, msg)
+}
+
+// read opens the other members' new chains, then prints the messages m
+// hasn't seen yet from their feeds, in time order. Each message can be
+// decrypted only once, so a real app stores the plain text on the device.
+func (m *member) read(ctx context.Context, g group) {
+	type line struct{ id, text string }
+	var lines []line
+	for _, pub := range g.members(ctx, m.db) {
+		if pub == m.Pub() {
+			continue
+		}
+		if chain, err := m.db.User(pub).Get("groups").Get(g.id).Get("chain").Once[string](ctx); err == nil && m.chains[chain] == nil {
+			m.open(ctx, g, pub, chain) // open it now, while we have the prekey
+		}
+		from, _ := m.db.User(pub).Get("alias").Once[string](ctx)
+		feed, _ := m.db.User(pub).Get("groups").Get(g.id).Get("messages").Once[map[string]senderkey.Message](ctx)
+		for _, id := range slices.Sorted(maps.Keys(feed)) {
+			if m.seen[id] {
+				continue
+			}
+			m.seen[id] = true
+			lines = append(lines, line{id, from + ": " + m.decrypt(ctx, g, pub, feed[id])})
+		}
+	}
+	slices.SortFunc(lines, func(a, b line) int { return strings.Compare(a.id, b.id) })
+	fmt.Printf("--- %s reads:\n", m.name)
+	for _, l := range lines {
+		fmt.Println(l.text)
+	}
+}
+
+// open finds from's chain sealed for m and opens it with m's prekey.
+func (m *member) open(ctx context.Context, g group, from, chain string) error {
+	sealed, err := m.db.User(from).Get("groups").Get(g.id).Get("keys").Get(chain).Get(m.Pub()).Once[senderkey.Sealed](ctx)
+	if err != nil {
+		return errors.New("no key for me")
+	}
+	prekey, ok := m.prekeys[sealed.PreKey]
+	if !ok {
+		return errors.New("sealed to a prekey I don't have")
+	}
+	key, err := senderkey.Open(sealed, prekey)
+	if err != nil {
+		return err
+	}
+	m.chains[chain] = senderkey.NewReceiver(key)
+	return nil
+}
+
+func (m *member) decrypt(ctx context.Context, g group, from string, msg senderkey.Message) string {
+	r, ok := m.chains[msg.Chain]
+	if !ok {
+		if err := m.open(ctx, g, from, msg.Chain); err != nil {
+			return "[can't read: " + err.Error() + "]"
+		}
+		r = m.chains[msg.Chain]
+	}
+	raw, err := r.Decrypt(msg)
+	if errors.Is(err, senderkey.ErrOld) {
+		return "[can't read: before my key, or already read]"
+	} else if err != nil {
+		return "[can't read: " + err.Error() + "]"
+	}
+	var text string
+	json.Unmarshal(raw, &text)
+	return text
+}
+
+// stolen returns a copy of m's device as it is saved now: its prekeys and
+// chains (round-tripped through JSON, as a device would store them), with
+// no record of which messages it has read.
+func (m *member) stolen(name string) *member {
+	saved, err := json.Marshal(struct {
+		Prekeys map[string]*sea.Pair
+		Chains  map[string]*senderkey.Receiver
+	}{m.prekeys, m.chains})
+	check(err)
+	t := &member{User: m.User, name: name, db: m.db, seen: map[string]bool{}}
+	check(json.Unmarshal(saved, &struct {
+		Prekeys *map[string]*sea.Pair
+		Chains  *map[string]*senderkey.Receiver
+	}{&t.prekeys, &t.chains}))
+	return t
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Output:
+
+```
+--- carol reads:
+alice: hi team
+bob: hello!
+--- dave reads:
+alice: [can't read: before my key, or already read]
+bob: [can't read: before my key, or already read]
+alice: welcome dave
+--- carol reads:
+alice: welcome dave
+bob: [can't read: no key for me]
+--- bob reads:
+alice: hi team
+alice: welcome dave
+--- bob reads:
+alice: still private
+--- thief with bob's device reads:
+alice: [can't read: before my key, or already read]
+alice: [can't read: before my key, or already read]
+alice: [can't read: before my key, or already read]
+--- bob's password on a new device reads:
+alice: [can't read: sealed to a prekey I don't have]
+alice: [can't read: sealed to a prekey I don't have]
+alice: [can't read: sealed to a prekey I don't have]
+```
+
+The API:
+
+| Call | What it does |
+| ---- | ------------ |
+| `senderkey.NewSender()` | start your chain |
+| `sender.Encrypt(data)` | encrypt with the next message key, then step the chain |
+| `sender.Share()` | your chain as it is now, to give to a member |
+| `senderkey.Seal(key, prekeyEPub)` / `Open(sealed, prekey)` | send a chain to one member's prekey, and open it there |
+| `senderkey.NewReceiver(key)` / `receiver.Decrypt(msg)` | read another member's chain |
+
+Things to know:
+
+- **Keep the state on the device, never in the graph.** That means `Sender`,
+  each `Receiver` and the prekeys. They marshal to JSON for local storage:
+  a file, or IndexedDB in the browser. Putting them in the graph, even
+  encrypted to yourself, gives up forward secrecy.
+- **A message opens once.** Its key is deleted after `Decrypt`, so store the
+  plain text locally if you need it again (a second `Decrypt` returns
+  `senderkey.ErrOld`).
+- **Open new chains as soon as they appear**, as `read` does, then rotate your
+  prekey with `newPrekey`. A chain sealed to a prekey you've already deleted
+  can't be opened. Rotate prekeys regularly: until a prekey is deleted, whoever
+  steals it can open the chains sealed to it.
+- **A stolen device reads what comes next**, until the members start new
+  chains. Sender keys don't heal on their own. Start new chains on a schedule
+  and whenever a device may be compromised, as you do when someone leaves.
+- **Every device is a member.** State can't be synced between devices without
+  giving up forward secrecy, so give each device its own user (or at least its
+  own prekey and chain) in the member list. A new device doesn't see history,
+  as the last part of the example shows.
+- **The graph shows who talks when.** Member lists, feed sizes and timing are
+  public. Only the content is hidden.
+- **Watch feeds with `Map().On` in a real client.** The examples read with
+  `Once` to keep the output simple. Over the network, `Once` on a node you
+  already read returns your local copy, which can be a moment behind the
+  relay. `Map().On` delivers each message as it arrives.
+- **Check who you're talking to.** Member lists hold public keys, and aliases
+  aren't unique. Compare keys out of band (a safety number or QR code) before
+  you trust a member.
+
 ## 10. Browser + Go chat
 
 A Go bot and browsers running GUN.js share one chat room. Open http://localhost:8765 in two tabs. The page is [`examples/chat/index.html`](examples/chat/index.html).

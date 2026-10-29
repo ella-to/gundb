@@ -38,7 +38,8 @@ program in [`examples/`](examples/).
   and acks are routed back to whoever asked.
 - **SEA users.** `CreateUser` / `Login` like `gun.user()`, signed user
   spaces that every peer verifies, and package `sea` for signing and
-  encryption, byte-compatible with GUN.js.
+  encryption, byte-compatible with GUN.js. Package `sea/senderkey` adds
+  encrypted group chat with Signal-style sender keys.
 - **Permissions.** A relay can authenticate each connection and decide
   per user what it may read and write (`Authenticate`, `CanRead`,
   `CanWrite`), for Go and GUN.js clients alike.
@@ -62,6 +63,7 @@ program in [`examples/`](examples/).
 | `transport/`       | the `Conn` / `Dialer` / `Listener` interfaces         |
 | `transport/ws/`    | WebSocket adapter (default)                           |
 | `sea/`             | SEA crypto: key pairs, sign, verify, encrypt, ECDH    |
+| `sea/senderkey`    | group encryption with sender keys (a ratchet)         |
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `storage/idbstore` | IndexedDB store for browsers (js/wasm only)           |

@@ -21,7 +21,9 @@ func Restringify(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := dec.Token(); err == nil {
+	// Like JSON.parse, only whitespace may follow the value: "1Ab" is not
+	// JSON, even though it starts with the number 1.
+	if len(bytes.Trim(data[dec.InputOffset():], " \t\n\r")) > 0 {
 		return nil, errors.New("js: trailing data after JSON value")
 	}
 	var b bytes.Buffer

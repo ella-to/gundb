@@ -56,3 +56,23 @@ func TestFieldRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestStringsThatStartLikeNumbers checks that text which isn't JSON comes
+// back as the same string, as SEA.decrypt and SEA.verify return it.
+func TestStringsThatStartLikeNumbers(t *testing.T) {
+	pair, err := NewPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []string{"1st place", "1Ab+cd/ef==", "2024-01-01"} {
+		want := `"` + s + `"`
+		enc, _ := Encrypt(s, "key")
+		if got, err := Decrypt(enc, "key"); err != nil || string(got) != want {
+			t.Errorf("Decrypt: got %s %v, want %s", got, err, want)
+		}
+		signed, _ := Sign(s, pair)
+		if got, err := Verify(signed, pair.Pub); err != nil || string(got) != want {
+			t.Errorf("Verify: got %s %v, want %s", got, err, want)
+		}
+	}
+}

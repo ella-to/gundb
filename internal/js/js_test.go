@@ -54,3 +54,18 @@ func TestCompareIsUTF16Order(t *testing.T) {
 		}
 	}
 }
+
+// TestRestringifyRejectsWhatJSONParseRejects covers text that starts like
+// JSON but isn't: SEA must hand such strings back as strings.
+func TestRestringifyRejectsWhatJSONParseRejects(t *testing.T) {
+	for _, s := range []string{"1Ab+cd=", "12/xy", "1e5xyz", "1 2", "truex", "null!", `"a"b`, `{"a":1}x`, "[1]]"} {
+		if out, err := Restringify([]byte(s)); err == nil {
+			t.Errorf("Restringify(%q) = %s, want an error", s, out)
+		}
+	}
+	for s, want := range map[string]string{" 1 ": "1", "\n{\"a\": 1}\t": `{"a":1}`, `"x"`: `"x"`, "1e5": "100000"} {
+		if out, err := Restringify([]byte(s)); err != nil || string(out) != want {
+			t.Errorf("Restringify(%q) = %s, %v; want %s", s, out, err, want)
+		}
+	}
+}
