@@ -23,6 +23,8 @@ go get ella.to/gundb   # needs Go 1.27+
 | `.map().on(cb)`                          | `.Map().On(func(key string, v T) {...})`            |
 | `.put(null)`                             | `.Put(ctx, nil)`                                    |
 | `.get('a').put(gun.get('b'))`            | `.Get("a").Put(ctx, db.Get("b"))`                   |
+| `.val(cb)` (old name of `.once`)         | `v, err := .Once[T](ctx)`                           |
+| `.key('k')` (removed from GUN.js)        | `db.Get("k").Put(ctx, data)`, then link to `db.Get("k")` |
 | `get: {'#': {'*': 'chat/'}}` (radisk)    | `souls, err := db.Souls(ctx, gundb.Lex{Prefix: "chat/"})` |
 
 Rules worth knowing:
@@ -182,6 +184,98 @@ func check(err error) {
 }
 ```
 
+### Circular links
+
+Two nodes can link to each other, like users who are each other's friend.
+You can't build that as a Go pointer cycle and `Put` it: `encoding/json`
+rejects cycles. Put each node under its own key, then link them with refs.
+
+<!-- example: examples/circular/main.go -->
+```go
+// Circular links: two users who are each other's friend, and choosing
+// your own key for a node.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"ella.to/gundb"
+)
+
+type User struct {
+	Name   string `json:"name"`
+	Friend *User  `json:"friend,omitempty"`
+}
+
+func main() {
+	ctx := context.Background()
+	db := gundb.New()
+	defer db.Close()
+
+	// A Go pointer cycle can't be Put: encoding/json refuses it.
+	alice := &User{Name: "Alice"}
+	alice.Friend = &User{Name: "Bob", Friend: alice}
+	fmt.Println(db.Get("alice").Put(ctx, alice) != nil) // true
+
+	// Instead, Put each user under its own key, then link them with refs.
+	// The key you pass to db.Get is the node's soul.
+	check(db.Get("alice").Put(ctx, User{Name: "Alice"}))
+	check(db.Get("bob").Put(ctx, User{Name: "Bob"}))
+	check(db.Get("alice").Get("friend").Put(ctx, db.Get("bob")))
+	check(db.Get("bob").Get("friend").Put(ctx, db.Get("alice")))
+
+	// Paths follow links as far as you like.
+	name, err := db.Get("alice").Get("friend").Get("friend").Get("friend").Get("name").Once[string](ctx)
+	check(err)
+	fmt.Println(name) // Bob
+
+	// Once stops where the cycle closes: the link back to alice comes back
+	// as {"#": "alice"}, which decodes into an empty User.
+	a, err := db.Get("alice").Once[User](ctx)
+	check(err)
+	fmt.Printf("%s -> %s -> %q\n", a.Name, a.Friend.Name, a.Friend.Friend.Name) // Alice -> Bob -> ""
+
+	raw, err := db.Get("alice").Once[map[string]any](ctx)
+	check(err)
+	fmt.Println(raw["friend"].(map[string]any)["friend"]) // map[#:alice]
+
+	// Writing through a link changes the linked node, from either side.
+	check(db.Get("bob").Get("friend").Get("name").Put(ctx, "Alice A."))
+	name, err = db.Get("alice").Get("name").Once[string](ctx)
+	check(err)
+	fmt.Println(name) // Alice A.
+
+	// Your own key for a list item: Put the node under the key you want,
+	// then add a ref to it with Set. The item's key in the list is its soul.
+	carol, err := db.Get("people").Set(ctx, db.Get("my-own-key"))
+	check(err)
+	check(db.Get("my-own-key").Put(ctx, User{Name: "Carol"}))
+	fmt.Println(carol.Key()) // my-own-key
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+Things to know:
+
+- `Once` follows links into nested structs but stops at a node it is already
+  inside. The link that closes the cycle comes back as `{"#": soul}`, so
+  `a.Friend.Friend` above is an empty `User`. To keep going, read by path
+  (`.Get("friend").Get("friend")...`) or start a new `Once` from the other node.
+- Don't `Put` a struct you read back from a cycle. Its empty back-link would
+  write the zero values (here `name: ""`) over the real node.
+- There is no `.val()` or `.key()`. In GUN.js `.val()` was renamed
+  `.once()`, which is `Once[T]` here. GUN.js removed `.key()`. Here
+  `Ref.Key()` only *returns* the last key of a path. To choose a node's key
+  yourself, put it at `db.Get("your-key")`, and link to it from wherever you
+  need it (with `Put(ctx, db.Get("your-key"))` or `Set(ctx, db.Get("your-key"))`).
+
 ## 4. Lists
 
 `Set` adds to an unordered list, `Map().On` watches every item, `Put(ctx, nil)` deletes.
@@ -245,6 +339,123 @@ func check(err error) {
 	}
 }
 ```
+
+### A list of links: friends
+
+A list can hold links to nodes that live elsewhere, like a user's friends.
+`Set(ctx, db.Get("bob"))` adds a link (not a copy), keyed by Bob's soul, so
+updating Bob shows up in every list that links to him, and removing him from
+one list leaves his node alone.
+
+<!-- example: examples/friends/main.go -->
+```go
+// A list of links: each user has a set of friends that point at other
+// user nodes. Add, update, remove and watch them.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"maps"
+	"slices"
+	"time"
+
+	"ella.to/gundb"
+)
+
+type User struct {
+	Name string `json:"name"`
+	City string `json:"city"`
+}
+
+func main() {
+	ctx := context.Background()
+	db := gundb.New()
+	defer db.Close()
+
+	// Every user is a node under its own key.
+	for key, u := range map[string]User{
+		"alice": {Name: "Alice", City: "Paris"},
+		"bob":   {Name: "Bob", City: "Berlin"},
+		"carol": {Name: "Carol", City: "Rome"},
+	} {
+		check(db.Get(key).Put(ctx, u))
+	}
+	friends := db.Get("alice").Get("friends")
+
+	// Watch the list. The key is the friend's soul; a removed friend
+	// arrives as nil.
+	off := friends.Map().On(func(key string, u *User) {
+		if u == nil {
+			fmt.Println("removed", key)
+			return
+		}
+		fmt.Printf("friend %s: %s from %s\n", key, u.Name, u.City)
+	})
+	defer off()
+
+	// Add: Set a ref to an existing user. This stores a link, not a copy.
+	_, err := friends.Set(ctx, db.Get("bob"))
+	check(err)
+	_, err = friends.Set(ctx, db.Get("carol"))
+	check(err)
+	time.Sleep(50 * time.Millisecond)
+
+	// Friendship both ways is just another link back.
+	_, err = db.Get("bob").Get("friends").Set(ctx, db.Get("alice"))
+	check(err)
+
+	// Update: change the user node. Every list that links to it sees it.
+	check(db.Get("bob").Get("city").Put(ctx, "Madrid"))
+	time.Sleep(50 * time.Millisecond)
+
+	// Remove: delete the link by its key. Bob's node itself is untouched.
+	check(friends.Get("bob").Put(ctx, nil))
+	time.Sleep(50 * time.Millisecond)
+
+	// Read the whole list once. Removed friends are left out.
+	all, err := friends.Once[map[string]User](ctx)
+	check(err)
+	fmt.Println(slices.Sorted(maps.Keys(all))) // [carol]
+
+	bob, err := db.Get("bob").Once[User](ctx)
+	check(err)
+	fmt.Println(bob.Name, "still exists, in", bob.City) // Bob still exists, in Madrid
+
+	// Add the same friend again: the link comes back.
+	_, err = friends.Set(ctx, db.Get("bob"))
+	check(err)
+	time.Sleep(50 * time.Millisecond)
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+| To...                     | Do                                                   |
+| ------------------------- | ---------------------------------------------------- |
+| add a friend              | `friends.Set(ctx, db.Get("bob"))`                    |
+| update a friend           | `db.Get("bob").Get("city").Put(ctx, "Madrid")` (or through the list: `friends.Get("bob").Get("city").Put(...)`) |
+| remove a friend           | `friends.Get("bob").Put(ctx, nil)`                   |
+| read all friends          | `friends.Once[map[string]User](ctx)`                 |
+| watch the list            | `friends.Map().On(func(key string, u *User) {...})`  |
+
+Things to know:
+
+- Setting the same ref twice doesn't duplicate it: the key is the soul, so
+  a list never holds a friend twice. Removing and adding again brings the
+  link back.
+- To read the friends as part of the user, give the struct a map field:
+  ``Friends map[string]User `json:"friends,omitempty"` ``. Don't `Put` that
+  struct back after reading it, though: it would write each friend's fields
+  too (see [Circular links](#circular-links)). Change lists with `Set` and
+  `Put(nil)` instead.
+- A removed item stays in the node as a tombstone (`null`), like in GUN.js,
+  so every peer learns about the removal. `Once` and `Map().On` skip it.
 
 ## 5. Sync between peers
 
