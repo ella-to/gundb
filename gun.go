@@ -217,6 +217,8 @@ func New(opts ...Options) *DB {
 // like gun.get(key) in JS.
 func (db *DB) Get(key string) *Ref { return &Ref{db: db, path: []string{key}} }
 
+func (db *DB) Path(path ...string) *Ref { return &Ref{db: db, path: path} }
+
 // PID returns this peer's ID.
 func (db *DB) PID() string { return db.pid }
 
