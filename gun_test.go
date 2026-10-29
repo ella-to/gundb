@@ -219,6 +219,38 @@ func TestOn(t *testing.T) {
 	}
 }
 
+// TestOnStartsWithValueAtSubscribe checks that the first callback of On and
+// Map().On is the value as it was when they were called, and that a change
+// made right after still fires its own callback. The initial read used to
+// run on the subscription's goroutine, racing with that change: sometimes
+// the two were merged into a single callback.
+func TestOnStartsWithValueAtSubscribe(t *testing.T) {
+	ctx := t.Context()
+	for i := range 200 {
+		db := newDB(t)
+		db.Get("user1").Put(ctx, Member{Name: "John"})
+		db.Get("device1").Put(ctx, map[string]any{"name": "Device 1"})
+
+		var c collector[map[string]any]
+		off := db.Get("device1").On(c.add)
+		var items collector[string]
+		offMap := db.Get("device1").Get("users").Map().On(func(key string, _ Member) { items.add(key) })
+		db.Get("device1").Get("users").Set(ctx, db.Get("user1"))
+
+		eventually(t, func() bool { u, _ := c.last(); return u["users"] != nil })
+		eventually(t, func() bool { _, ok := items.last(); return ok })
+		off()
+		offMap()
+
+		c.mu.Lock()
+		if len(c.got) != 2 || c.got[0]["users"] != nil {
+			t.Fatalf("run %d: want the value before Set, then after; got %v", i, c.got)
+		}
+		c.mu.Unlock()
+		db.Close()
+	}
+}
+
 type Todo struct {
 	Title string `json:"title"`
 	Done  bool   `json:"done"`

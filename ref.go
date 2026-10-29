@@ -134,32 +134,36 @@ func (r *Ref) Once[T any](ctx context.Context) (T, error) {
 // is closed. Changes inside linked nodes count as changes too. A deleted
 // value is delivered as T's zero value (nil for a pointer T).
 //
-// fn runs on a goroutine owned by this subscription, one call at a time.
+// The first call carries the value as it was when On was called (On reads
+// it before returning; it does not wait for peers). fn runs on a goroutine
+// owned by this subscription, one call at a time. Changes that arrive while
+// fn is busy may be merged: fn always gets the latest value, but not every
+// intermediate one.
 //
 //	off := db.Get("alice").On(func(u User) { fmt.Println(u.Name) })
 //	defer off()
 func (r *Ref) On[T any](fn func(T)) (off func()) {
 	var last []byte
-	return r.db.watch(func(rd *reader) {
+	return r.db.watch(func(rd *reader) func() {
 		v, err := rd.at(r.path)
 		if err != nil || v == nil {
-			return
+			return nil
 		}
 		t, ok, err := rd.tree(v, map[string]bool{})
 		if err != nil || !ok || (t == nil && last == nil) {
-			return
+			return nil
 		}
 		b, err := json.Marshal(t)
 		if err != nil || bytes.Equal(b, last) {
-			return
+			return nil
 		}
 		last = b
 		var val T
 		if err := json.Unmarshal(b, &val); err != nil {
 			r.db.log.Warn("gundb: On: cannot decode", "ref", r.String(), "err", err)
-			return
+			return nil
 		}
-		fn(val)
+		return func() { fn(val) }
 	})
 }
 
@@ -181,7 +185,8 @@ func (r *Ref) MarshalJSON() ([]byte, error) {
 type MapRef struct{ ref *Ref }
 
 // On calls fn(key, value) for every item now, and again for each item that
-// is added, changed or deleted, until off is called. A deleted item is
+// is added, changed or deleted, until off is called. Like Ref.On, the first
+// calls carry the items as they were when On was called. A deleted item is
 // delivered as T's zero value (nil for a pointer T). For a Set, key is the
 // item's soul: db.Get(key) refers to it.
 //
@@ -189,16 +194,21 @@ type MapRef struct{ ref *Ref }
 func (m *MapRef) On[T any](fn func(key string, v T)) (off func()) {
 	last := map[string][]byte{}
 	r := m.ref
-	return r.db.watch(func(rd *reader) {
+	return r.db.watch(func(rd *reader) func() {
 		v, err := rd.at(r.path)
 		l, isNode := v.(Link)
 		if err != nil || !isNode {
-			return
+			return nil
 		}
 		n, err := rd.node(l.Soul)
 		if err != nil || n == nil {
-			return
+			return nil
 		}
+		type item struct {
+			key string
+			val T
+		}
+		var items []item
 		for _, k := range slices.Sorted(maps.Keys(n.Fields)) {
 			t, ok, err := rd.tree(n.Fields[k], map[string]bool{l.Soul: true})
 			if err != nil || !ok {
@@ -219,7 +229,15 @@ func (m *MapRef) On[T any](fn func(key string, v T)) (off func()) {
 				r.db.log.Warn("gundb: Map().On: cannot decode", "ref", r.String(), "key", k, "err", err)
 				continue
 			}
-			fn(k, val)
+			items = append(items, item{k, val})
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		return func() {
+			for _, it := range items {
+				fn(it.key, it.val)
+			}
 		}
 	})
 }

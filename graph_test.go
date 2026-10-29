@@ -39,3 +39,20 @@ func TestNodeRejectsInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestChildrenFirst(t *testing.T) {
+	g := graph{}
+	g.node("a").Set("b", Link{Soul: "b"}, 1)
+	g.node("b").Set("c", Link{Soul: "c"}, 1)
+	g.node("b").Set("a", Link{Soul: "a"}, 1) // a cycle must not loop
+	g.node("c").Set("x", Link{Soul: "elsewhere"}, 1)
+	for range 50 { // map order varies between runs
+		pos := map[string]int{}
+		for i, soul := range childrenFirst(g) {
+			pos[soul] = i
+		}
+		if len(pos) != 3 || pos["c"] > pos["b"] {
+			t.Fatalf("got order %v", pos)
+		}
+	}
+}

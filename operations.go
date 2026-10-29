@@ -19,7 +19,8 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 	var wake float64
 
 	machine := db.state.Next()
-	for soul, in := range g {
+	for _, soul := range childrenFirst(g) {
+		in := g[soul]
 		mu := db.mergeLock(soul)
 		mu.Lock()
 		cur, err := db.store.Get(ctx, soul)
@@ -72,6 +73,31 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 	}
 	db.notify(changed)
 	return changed, nil
+}
+
+// childrenFirst orders the souls of g so that a node comes after the nodes
+// in g it links to. A reader that sees a new link then also finds the node
+// behind it, instead of a dangling link while the write is half applied.
+func childrenFirst(g graph) []string {
+	order := make([]string, 0, len(g))
+	done := make(map[string]bool, len(g))
+	var visit func(soul string)
+	visit = func(soul string) {
+		if done[soul] {
+			return
+		}
+		done[soul] = true // set first, so cycles end here
+		for _, v := range g[soul].Fields {
+			if l, ok := v.(Link); ok && g[l.Soul] != nil {
+				visit(l.Soul)
+			}
+		}
+		order = append(order, soul)
+	}
+	for soul := range g {
+		visit(soul)
+	}
+	return order
 }
 
 // mergeLock returns the lock that serialises merges into soul.
@@ -278,7 +304,7 @@ func (db *DB) offer(soul string, peers []*peer) {
 // watcher re-runs a computation whenever any node it read changes.
 type watcher struct {
 	db      *DB
-	compute func(*reader)
+	compute func(*reader) (emit func())
 	poke    chan struct{}
 	stop    chan struct{}
 	once    sync.Once
@@ -286,10 +312,13 @@ type watcher struct {
 }
 
 // watch runs compute now and again after every change to a node it read.
-func (db *DB) watch(compute func(*reader)) (off func()) {
+// compute only reads; the emit func it returns runs the user's callbacks on
+// the watcher's goroutine. The first read happens before watch returns, so
+// it sees exactly the data present when the subscription was made.
+func (db *DB) watch(compute func(*reader) (emit func())) (off func()) {
 	w := &watcher{db: db, compute: compute, poke: make(chan struct{}, 1), stop: make(chan struct{}), souls: map[string]bool{}}
-	w.wake()
-	go w.loop()
+	emit := w.run()
+	go w.loop(emit)
 	return func() { w.once.Do(func() { close(w.stop) }) }
 }
 
@@ -300,9 +329,30 @@ func (w *watcher) wake() {
 	}
 }
 
-func (w *watcher) loop() {
+// run reads once and starts watching the souls it read.
+func (w *watcher) run() (emit func()) {
+	r := &reader{db: w.db, ctx: w.db.ctx, seen: map[string]bool{}}
+	emit = w.compute(r)
+	if added := w.db.rewatch(w, r.seen); len(added) > 0 {
+		for _, soul := range added {
+			go w.db.sync(w.db.ctx, soul)
+		}
+		w.wake() // a change may have landed between reading and registering
+	}
+	return emit
+}
+
+func (w *watcher) loop(emit func()) {
 	defer w.db.rewatch(w, nil)
 	for {
+		if emit != nil {
+			select {
+			case <-w.stop:
+				return
+			default:
+			}
+			emit()
+		}
 		select {
 		case <-w.stop:
 			return
@@ -310,14 +360,7 @@ func (w *watcher) loop() {
 			return
 		case <-w.poke:
 		}
-		r := &reader{db: w.db, ctx: w.db.ctx, seen: map[string]bool{}}
-		w.compute(r)
-		if added := w.db.rewatch(w, r.seen); len(added) > 0 {
-			for _, soul := range added {
-				go w.db.sync(w.db.ctx, soul)
-			}
-			w.wake() // a change may have landed between reading and registering
-		}
+		emit = w.run()
 	}
 }
 

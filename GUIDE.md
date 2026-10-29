@@ -33,7 +33,7 @@ Rules worth knowing:
 - `Put` merges field by field (it never replaces a whole node). Conflicts resolve with GUN's HAM, so every peer ends up with the same value.
 - Arrays are not supported (same as GUN): use `Set`.
 - `Once` returns `gundb.ErrNotFound` when there is nothing there.
-- `On` callbacks run on their own goroutine; a deleted value arrives as the zero value (`nil` for pointer types).
+- `On` first delivers the value as it is when you call it, then every change after. Callbacks run on their own goroutine, and changes that land faster than your callback runs may arrive merged into one call (you always get the latest value). A deleted value arrives as the zero value (`nil` for pointer types).
 
 ## 1. Store and read data
 
@@ -1649,7 +1649,7 @@ The rest of [`examples/browser`](examples/browser) is plumbing every Go wasm app
 
 ### Things to know
 
-- **Never block inside a `js.Func`.** IndexedDB, like WebSocket, answers through browser callbacks, so `Put`, `Once` and the store wait for the browser. Called directly from an event handler, they wait for a callback that can't run until the handler returns, and the page deadlocks. Start a goroutine (`go notes.Set(...)`), as the submit handler above does. `On` callbacks already run on their own goroutine.
+- **Never block inside a `js.Func`.** IndexedDB, like WebSocket, answers through browser callbacks, so `Put`, `Once`, `On` (which reads the current value before it returns) and the store wait for the browser. Called directly from an event handler, they wait for a callback that can't run until the handler returns, and the page deadlocks. Start a goroutine (`go notes.Set(...)`), as the submit handler above does. `On` callbacks themselves already run on their own goroutine.
 - **One database per origin and name.** `idbstore.Open(ctx, name)` opens the IndexedDB database `name`. Every tab of your site that opens the same name shares the data. Each node is one record (soul → its GUN wire JSON) in the object store `nodes`, readable in the browser's developer tools under Application → IndexedDB.
 - **Browsers may evict storage.** Under storage pressure a browser can clear a site's data unless it was granted persistent storage. Ask for it with `navigator.storage.persist()` if the data matters. Some private-browsing modes have no IndexedDB; `Open` returns an error there.
 - **Only the client side works in a browser.** `ServeHTTP`, `ws.Listen` and `pebblestore` need a real server. `idbstore` builds only for `js/wasm`.
