@@ -318,6 +318,10 @@ type watcher struct {
 	stop    chan struct{}
 	once    sync.Once
 	souls   map[string]bool
+
+	dirtyMu sync.Mutex
+	dirty   map[string]bool // souls changed since the last run
+	all     bool            // the next run recomputes everything (the first one)
 }
 
 // watch runs compute now and again after every change to a node it read.
@@ -325,7 +329,7 @@ type watcher struct {
 // the watcher's goroutine. The first read happens before watch returns, so
 // it sees exactly the data present when the subscription was made.
 func (db *DB) watch(compute func(*reader) (emit func())) (off func()) {
-	w := &watcher{db: db, compute: compute, poke: make(chan struct{}, 1), stop: make(chan struct{}), souls: map[string]bool{}}
+	w := &watcher{db: db, compute: compute, poke: make(chan struct{}, 1), stop: make(chan struct{}), souls: map[string]bool{}, all: true}
 	emit := w.run()
 	go w.loop(emit)
 	return func() { w.once.Do(func() { close(w.stop) }) }
@@ -338,15 +342,54 @@ func (w *watcher) wake() {
 	}
 }
 
-// run reads once and starts watching the souls it read.
+// mark records that souls changed and wakes the watcher.
+func (w *watcher) mark(souls ...string) {
+	w.dirtyMu.Lock()
+	if !w.all {
+		if w.dirty == nil {
+			w.dirty = make(map[string]bool, len(souls))
+		}
+		for _, soul := range souls {
+			w.dirty[soul] = true
+		}
+	}
+	w.dirtyMu.Unlock()
+	w.wake()
+}
+
+// take returns the souls changed since the last run and starts a new set.
+// nil means everything, as on the first run.
+func (w *watcher) take() map[string]bool {
+	w.dirtyMu.Lock()
+	defer w.dirtyMu.Unlock()
+	if w.all {
+		w.all, w.dirty = false, nil
+		return nil
+	}
+	d := w.dirty
+	w.dirty = nil
+	if d == nil {
+		d = map[string]bool{}
+	}
+	return d
+}
+
+// run reads once and starts watching the souls it read. A compute that
+// tracks its souls itself (r.delta) only reports the ones that changed.
 func (w *watcher) run() (emit func()) {
-	r := &reader{db: w.db, ctx: w.db.ctx, seen: map[string]bool{}}
+	r := &reader{db: w.db, ctx: w.db.ctx, seen: map[string]bool{}, changed: w.take()}
 	emit = w.compute(r)
-	if added := w.db.rewatch(w, r.seen); len(added) > 0 {
+	var added []string
+	if r.delta != nil {
+		added = w.db.watchDelta(w, r.delta)
+	} else {
+		added = w.db.rewatch(w, r.seen)
+	}
+	if len(added) > 0 {
 		for _, soul := range added {
 			go w.db.sync(w.db.ctx, soul)
 		}
-		w.wake() // a change may have landed between reading and registering
+		w.mark(added...) // a change may have landed between reading and registering
 	}
 	return emit
 }
@@ -399,6 +442,32 @@ func (db *DB) rewatch(w *watcher, souls map[string]bool) []string {
 	return added
 }
 
+// watchDelta starts (true) or stops (false) watching each soul in delta
+// for w, and returns the souls that are new.
+func (db *DB) watchDelta(w *watcher, delta map[string]bool) []string {
+	db.watchMu.Lock()
+	defer db.watchMu.Unlock()
+	var added []string
+	for soul, watch := range delta {
+		switch {
+		case watch && !w.souls[soul]:
+			if db.watchers[soul] == nil {
+				db.watchers[soul] = map[*watcher]struct{}{}
+			}
+			db.watchers[soul][w] = struct{}{}
+			w.souls[soul] = true
+			added = append(added, soul)
+		case !watch && w.souls[soul]:
+			delete(w.souls, soul)
+			delete(db.watchers[soul], w)
+			if len(db.watchers[soul]) == 0 {
+				delete(db.watchers, soul)
+			}
+		}
+	}
+	return added
+}
+
 func (db *DB) notify(changed graph) {
 	if len(changed) == 0 {
 		return
@@ -407,7 +476,7 @@ func (db *DB) notify(changed graph) {
 	defer db.watchMu.Unlock()
 	for soul := range changed {
 		for w := range db.watchers[soul] {
-			w.wake()
+			w.mark(soul)
 		}
 	}
 }

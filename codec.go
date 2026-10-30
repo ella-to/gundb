@@ -22,6 +22,12 @@ type reader struct {
 	ctx  context.Context
 	net  bool
 	seen map[string]bool // souls read; set by watchers
+
+	// For watchers: the souls changed since the last run (nil on the first
+	// run: everything), and, for a compute that tracks its own souls, which
+	// souls to start (true) or stop (false) watching.
+	changed map[string]bool
+	delta   map[string]bool
 }
 
 func (r *reader) node(soul string) (*Node, error) {

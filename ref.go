@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 )
@@ -192,44 +191,21 @@ type MapRef struct{ ref *Ref }
 //
 //	off := db.Get("todos").Map().On(func(id string, t *Todo) { ... })
 func (m *MapRef) On[T any](fn func(key string, v T)) (off func()) {
-	last := map[string][]byte{}
 	r := m.ref
+	w := newMapWatch(r.path)
 	return r.db.watch(func(rd *reader) func() {
-		v, err := rd.at(r.path)
-		l, isNode := v.(Link)
-		if err != nil || !isNode {
-			return nil
-		}
-		n, err := rd.node(l.Soul)
-		if err != nil || n == nil {
-			return nil
-		}
 		type item struct {
 			key string
 			val T
 		}
 		var items []item
-		for _, k := range slices.Sorted(maps.Keys(n.Fields)) {
-			t, ok, err := rd.tree(n.Fields[k], map[string]bool{l.Soul: true})
-			if err != nil || !ok {
-				continue // linked item not here yet; we are watching for it
-			}
-			prev, seen := last[k]
-			if t == nil && !seen { // deleted before we ever saw it
-				last[k] = []byte("null")
-				continue
-			}
-			b, err := json.Marshal(t)
-			if err != nil || bytes.Equal(b, prev) {
-				continue
-			}
-			last[k] = b
+		for _, c := range w.update(rd) {
 			var val T
-			if err := json.Unmarshal(b, &val); err != nil {
-				r.db.log.Warn("gundb: Map().On: cannot decode", "ref", r.String(), "key", k, "err", err)
+			if err := json.Unmarshal(c.data, &val); err != nil {
+				r.db.log.Warn("gundb: Map().On: cannot decode", "ref", r.String(), "key", c.key, "err", err)
 				continue
 			}
-			items = append(items, item{k, val})
+			items = append(items, item{c.key, val})
 		}
 		if len(items) == 0 {
 			return nil

@@ -146,3 +146,67 @@ func BenchmarkPutFieldLargeNode(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMapOnUpdate changes one item of a list of n items while
+// Map().On watches the list, and waits for the callback that reports it.
+func BenchmarkMapOnUpdate(b *testing.B) {
+	for _, n := range []int{100, 1000, 10000} {
+		b.Run("items="+strconv.Itoa(n), func(b *testing.B) {
+			db := New()
+			defer db.Close()
+			ctx := context.Background()
+			list := db.Get("list")
+			items := make([]*Ref, n)
+			for i := range n {
+				var err error
+				if items[i], err = list.Set(ctx, Todo{Title: "old " + strconv.Itoa(i)}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			changed := make(chan string, 1)
+			off := list.Map().On(func(_ string, t Todo) {
+				if strings.HasPrefix(t.Title, "new ") {
+					changed <- t.Title
+				}
+			})
+			defer off()
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				title := "new " + strconv.Itoa(i)
+				if err := items[i%n].Get("title").Put(ctx, title); err != nil {
+					b.Fatal(err)
+				}
+				for got := <-changed; got != title; got = <-changed {
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkOnPut changes one field of a node while On watches it, and
+// waits for the callback.
+func BenchmarkOnPut(b *testing.B) {
+	db := New()
+	defer db.Close()
+	ctx := context.Background()
+	alice := db.Get("alice")
+	if err := alice.Put(ctx, Member{Name: "Alice", Boss: &Member{Name: "Bob"}}); err != nil {
+		b.Fatal(err)
+	}
+	ages := make(chan int, 1)
+	off := alice.On(func(m Member) { ages <- m.Age })
+	defer off()
+	<-ages
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		if err := alice.Get("age").Put(ctx, i); err != nil {
+			b.Fatal(err)
+		}
+		for got := <-ages; got != i; got = <-ages {
+		}
+	}
+}
