@@ -128,7 +128,7 @@ func (n *Node) appendJSON(b []byte, sorted bool) ([]byte, error) {
 			b = append(b, ',')
 		}
 		b = append(js.AppendQuote(b, k), ':')
-		b = append(b, js.Number(s)...)
+		b = js.AppendNumber(b, s)
 	}
 	b = append(b, "}}"...)
 	for _, k := range keys {
@@ -156,7 +156,7 @@ func appendValue(b []byte, v Value) ([]byte, error) {
 		if math.IsNaN(f) || math.IsInf(f, 0) {
 			return nil, fmt.Errorf("gundb: %v is not a valid GUN number", f)
 		}
-		return append(b, js.Number(f)...), nil
+		return js.AppendNumber(b, f), nil
 	case String:
 		return js.AppendQuote(b, string(x)), nil
 	case Link:

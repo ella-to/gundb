@@ -3,6 +3,8 @@ package js
 import (
 	"cmp"
 	"encoding/json"
+	"math"
+	"math/rand/v2"
 	"slices"
 	"testing"
 	"unicode/utf16"
@@ -66,6 +68,23 @@ func TestRestringifyRejectsWhatJSONParseRejects(t *testing.T) {
 	for s, want := range map[string]string{" 1 ": "1", "\n{\"a\": 1}\t": `{"a":1}`, `"x"`: `"x"`, "1e5": "100000"} {
 		if out, err := Restringify([]byte(s)); err != nil || string(out) != want {
 			t.Errorf("Restringify(%q) = %s, %v; want %s", s, out, err, want)
+		}
+	}
+}
+
+func TestAppendNumberMatchesNumber(t *testing.T) {
+	values := []float64{0, math.Copysign(0, -1), 1, -1, 0.1, 1.5, 1e-6, 9.99e-7, 1e-7, 1e20, 1e21, 9.999e20,
+		1700000000000, 1700000000000.5, 1700000000000.001001, math.MaxFloat64, math.SmallestNonzeroFloat64, -1.5e22, 123456789.123456789}
+	r := rand.New(rand.NewPCG(1, 2))
+	for range 100000 {
+		values = append(values, math.Float64frombits(r.Uint64()), r.Float64()*1e15, float64(r.Int64N(1<<53)))
+	}
+	for _, f := range values {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			continue
+		}
+		if got, want := string(AppendNumber([]byte("x"), f)), "x"+Number(f); got != want {
+			t.Fatalf("AppendNumber(%v) = %s, want %s", f, got, want)
 		}
 	}
 }

@@ -30,6 +30,14 @@ func Number(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
+// AppendNumber appends Number(f) to dst.
+func AppendNumber(dst []byte, f float64) []byte {
+	if abs := math.Abs(f); f == 0 || abs < 1e-6 || abs >= 1e21 {
+		return append(dst, Number(f)...) // zero, or exponent form: rare
+	}
+	return strconv.AppendFloat(dst, f, 'f', -1, 64)
+}
+
 // Quote quotes s exactly like JSON.stringify: only ", \ and control
 // characters are escaped. (encoding/json additionally escapes <, >, &,
 // U+2028 and U+2029, which would break HAM's lexical tie-break.)
