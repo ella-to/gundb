@@ -13,8 +13,10 @@ import (
 // apply merges g into the store with HAM, wakes subscribers of what changed
 // and returns the accepted writes. Writes stamped in the future are held and
 // retried when their time comes, like the reference does.
-func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
-	if err := checkSEA(g); err != nil {
+//
+// skip lists fields that need no SEA check (see checked); nil checks all.
+func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
+	if err := checkSEA(g, skip); err != nil {
 		return nil, err
 	}
 	changed, later := graph{}, graph{}
@@ -76,7 +78,7 @@ func (db *DB) apply(ctx context.Context, g graph) (graph, error) {
 		wait := time.Duration(min(wake-machine, math.MaxInt32)+1) * time.Millisecond
 		time.AfterFunc(wait, func() {
 			if db.ctx.Err() == nil {
-				db.apply(db.ctx, later)
+				db.apply(db.ctx, later, allChecked) // checked when it arrived
 			}
 		})
 	}
@@ -115,12 +117,13 @@ func (db *DB) mergeLock(soul string) *sync.Mutex {
 }
 
 // write applies a local write and sends it to peers. With ack it waits for
-// the first peer to acknowledge it.
-func (db *DB) write(ctx context.Context, g graph, ack bool) error {
+// the first peer to acknowledge it. signed lists the fields we signed
+// ourselves, which need no SEA check (nil if none).
+func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) error {
 	if db.ctx.Err() != nil {
 		return ErrClosed
 	}
-	if _, err := db.apply(ctx, g); err != nil {
+	if _, err := db.apply(ctx, g, signed); err != nil {
 		return err
 	}
 	id := randomID(9)

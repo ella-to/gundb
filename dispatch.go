@@ -79,7 +79,7 @@ func (db *DB) handleAck(p *peer, m *message) {
 	if len(m.Put) > 0 {
 		// Data answering a get counts as a write by whoever sent it, and is
 		// dropped, not relayed, if SEA rejects it.
-		if err := errors.Join(db.allowWrite(p, m.Put), checkSEA(m.Put)); err != nil {
+		if err := errors.Join(db.allowWrite(p, m.Put), checkSEA(m.Put, nil)); err != nil {
 			db.log.Debug("gundb: dropped reply", "peer", p.conn.RemoteAddr(), "err", err)
 			m.Put = nil
 		}
@@ -87,7 +87,7 @@ func (db *DB) handleAck(p *peer, m *message) {
 	if len(m.Put) > 0 {
 		if err := m.Put.check(); err != nil {
 			db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
-		} else if _, err := db.apply(db.ctx, m.Put); err != nil {
+		} else if _, err := db.apply(db.ctx, m.Put, allChecked); err != nil {
 			db.log.Warn("gundb: store failed", "err", err)
 		}
 	}
@@ -112,7 +112,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
-	changed, err := db.apply(db.ctx, m.Put)
+	changed, err := db.apply(db.ctx, m.Put, nil)
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return

@@ -64,12 +64,14 @@ func (r *Ref) put(ctx context.Context, v any, ack bool) error {
 	if err := rd.build(g, r.path[0], obj, r.db.state.Next()); err != nil {
 		return err
 	}
+	var signed checked
 	if r.user != nil {
-		if err := r.user.sign(g); err != nil {
+		var err error
+		if signed, err = r.user.sign(g); err != nil {
 			return err
 		}
 	}
-	return r.db.write(ctx, g, ack)
+	return r.db.write(ctx, g, ack, signed)
 }
 
 // Set adds v to the unordered list stored at this ref, like gun.set in JS,

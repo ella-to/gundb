@@ -123,7 +123,7 @@ func TestCanReadFiltersPushes(t *testing.T) {
 	g := graph{}
 	g.node("public").Set("v", String("news"), 1)
 	g.node("secrets/ali").Set("pin", String("1234"), 1)
-	if err := relay.write(ctx, g, false); err != nil {
+	if err := relay.write(ctx, g, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	select {

@@ -78,10 +78,11 @@ func (db *DB) CreateUser(ctx context.Context, alias, password string) (*User, er
 	acct.Set("epub", String(pair.EPub), state)
 	acct.Set("auth", String(auth), state)
 	g.node("~@"+alias).Set(soul, Link{Soul: soul}, state)
-	if err := u.sign(g); err != nil {
+	signed, err := u.sign(g)
+	if err != nil {
 		return nil, err
 	}
-	if err := db.write(ctx, g, true); err != nil && !errors.Is(err, ErrNoPeers) {
+	if err := db.write(ctx, g, true, signed); err != nil && !errors.Is(err, ErrNoPeers) {
 		return nil, err
 	}
 	return u, nil
@@ -169,25 +170,29 @@ func (u *User) Root() *Ref { return &Ref{db: u.db, path: []string{"~" + u.pair.P
 func (u *User) Get(key string) *Ref { return u.Root().Get(key) }
 
 // sign replaces every value in g that belongs to the user's space with a
-// SEA signature over it. Nodes outside the user's space are left alone, so
-// they go through the normal checks.
-func (u *User) sign(g graph) error {
+// SEA signature over it, and returns which fields it signed: they need no
+// check when the write is applied. Nodes outside the user's space are left
+// alone, so they go through the normal checks.
+func (u *User) sign(g graph) (checked, error) {
+	done := map[string]map[string]bool{}
 	for soul, n := range g {
 		if strings.HasPrefix(soul, "~@") || sea.PubOf(soul) != u.pair.Pub {
 			continue
 		}
+		done[soul] = make(map[string]bool, len(n.Fields))
 		for field, v := range n.Fields {
 			if field == "pub" && soul == "~"+u.pair.Pub {
-				continue // the account's key is stored as is
+				continue // the account's key is stored as is, and checked
 			}
 			signed, err := sea.SignField(soul, field, json.RawMessage(lexical(v)), n.States[field], u.pair)
 			if err != nil {
-				return fmt.Errorf("gundb: sign %s.%s: %w", soul, field, err)
+				return nil, fmt.Errorf("gundb: sign %s.%s: %w", soul, field, err)
 			}
 			n.Fields[field] = String(signed)
+			done[soul][field] = true
 		}
 	}
-	return nil
+	return func(soul, field string) bool { return done[soul][field] }, nil
 }
 
 // randomSalt returns a 64-character random string, like String.random(64).

@@ -40,10 +40,10 @@ func TestApplyConverges(t *testing.T) {
 	a, b := New(), New()
 	defer a.Close()
 	defer b.Close()
-	a.apply(t.Context(), w1)
-	a.apply(t.Context(), w2)
-	b.apply(t.Context(), w2)
-	b.apply(t.Context(), w1)
+	a.apply(t.Context(), w1, nil)
+	a.apply(t.Context(), w2, nil)
+	b.apply(t.Context(), w2, nil)
+	b.apply(t.Context(), w1, nil)
 	va, _ := a.Get("x").Get("v").Once[string](t.Context())
 	vb, _ := b.Get("x").Get("v").Once[string](t.Context())
 	if va != "two" || vb != "two" {
@@ -55,7 +55,7 @@ func TestFutureWriteIsAppliedLater(t *testing.T) {
 	db := New()
 	defer db.Close()
 	soon := float64(db.state.nowMs() + 150)
-	db.apply(t.Context(), graph{"x": {Soul: "x", Fields: map[string]Value{"v": Bool(true)}, States: map[string]float64{"v": soon}}})
+	db.apply(t.Context(), graph{"x": {Soul: "x", Fields: map[string]Value{"v": Bool(true)}, States: map[string]float64{"v": soon}}}, nil)
 	if _, err := db.Get("x").Get("v").Once[bool](t.Context()); err != ErrNotFound {
 		t.Fatal("future write applied too early")
 	}

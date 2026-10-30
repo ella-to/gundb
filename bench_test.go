@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"ella.to/gundb/sea"
 )
 
 // putFrame is a typical write from a JS peer: one node, a few fields.
@@ -207,6 +209,81 @@ func BenchmarkOnPut(b *testing.B) {
 			b.Fatal(err)
 		}
 		for got := <-ages; got != i; got = <-ages {
+		}
+	}
+}
+
+// Profile10 is a struct with ten fields, for the SEA benchmarks.
+type Profile10 struct {
+	A, B, C, D, E, F, G, H, I, J string
+}
+
+func benchProfile() Profile10 {
+	return Profile10{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"}
+}
+
+func benchUser(b *testing.B, db *DB) *User {
+	pair, err := sea.NewPair()
+	if err != nil {
+		b.Fatal(err)
+	}
+	return db.LoginPair(pair)
+}
+
+// BenchmarkUserPut is a signed write of ten fields into a user's space.
+func BenchmarkUserPut(b *testing.B) {
+	db := New()
+	defer db.Close()
+	ctx := context.Background()
+	u := benchUser(b, db)
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := u.Get("profile").Put(ctx, benchProfile()); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkUserOnce reads ten signed fields back.
+func BenchmarkUserOnce(b *testing.B) {
+	db := New()
+	defer db.Close()
+	ctx := context.Background()
+	u := benchUser(b, db)
+	if err := u.Get("profile").Put(ctx, benchProfile()); err != nil {
+		b.Fatal(err)
+	}
+	ref := db.User(u.Pub()).Get("profile")
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ref.Once[Profile10](ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCheckSEA verifies a signed graph of ten fields, as a relay does
+// for every signed put it receives.
+func BenchmarkCheckSEA(b *testing.B) {
+	db := New()
+	defer db.Close()
+	u := benchUser(b, db)
+	t, err := toTree(benchProfile())
+	if err != nil {
+		b.Fatal(err)
+	}
+	g := graph{}
+	rd := &reader{db: db, ctx: context.Background()}
+	if err := rd.build(g, "~"+u.Pub()+"/profile", t.(map[string]any), db.state.Next()); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := u.sign(g); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := checkSEA(g, nil); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

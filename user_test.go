@@ -3,6 +3,7 @@ package gundb
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -106,7 +107,7 @@ func TestForgedUserDataIsRejected(t *testing.T) {
 	g.node("~"+ali.Pub()).Set("name", String("Mallory"), db.state.Next())
 	signed, _ := sea.SignField("~"+ali.Pub(), "name", json.RawMessage(`"Mallory"`), g["~"+ali.Pub()].States["name"], bob.Pair())
 	g["~"+ali.Pub()].Fields["name"] = String(signed)
-	if _, err := db.apply(ctx, g); !errors.Is(err, ErrUnverified) {
+	if _, err := db.apply(ctx, g, nil); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("write signed by another user: %v", err)
 	}
 
@@ -114,13 +115,13 @@ func TestForgedUserDataIsRejected(t *testing.T) {
 	n, _ := db.store.Get(ctx, "~"+ali.Pub())
 	g = graph{}
 	g.node("~"+ali.Pub()).Set("nick", n.Fields["name"], n.States["name"])
-	if _, err := db.apply(ctx, g); !errors.Is(err, ErrUnverified) {
+	if _, err := db.apply(ctx, g, nil); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("replayed signature: %v", err)
 	}
 	// The account's pub must be its own key.
 	g = graph{}
 	g.node("~"+ali.Pub()).Set("pub", String(bob.Pub()), db.state.Next())
-	if _, err := db.apply(ctx, g); !errors.Is(err, ErrUnverified) {
+	if _, err := db.apply(ctx, g, nil); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("swapped pub: %v", err)
 	}
 	if name, _ := space.Get("name").Once[string](ctx); name != "Ali" {
@@ -146,7 +147,7 @@ func TestAliasRules(t *testing.T) {
 	} {
 		g := graph{}
 		g.node(c.soul).Set(c.field, c.v, state)
-		_, err := db.apply(ctx, g)
+		_, err := db.apply(ctx, g, nil)
 		if (err == nil) != c.ok {
 			t.Errorf("%s: err = %v", c.name, err)
 		}
@@ -214,6 +215,78 @@ func TestForgedUserDataOverTheWire(t *testing.T) {
 			}
 		case <-deadline:
 			t.Fatal("no answer to the forged put")
+		}
+	}
+}
+
+// TestSignedWritesSkipOnlyWhatWasSigned checks that a user's own write skips
+// verifying the fields it just signed, and nothing else.
+func TestSignedWritesSkipOnlyWhatWasSigned(t *testing.T) {
+	ctx := t.Context()
+	db := newDB(t)
+	ali, err := db.CreateUser(ctx, "ali", "password ali")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := db.CreateUser(ctx, "bob", "password bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The account's own pub is never signed, so it is still checked.
+	if err := ali.Root().Put(ctx, map[string]any{"pub": bob.Pub()}); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("swapped pub through ali's ref: %v", err)
+	}
+
+	// Through a link into bob's space, ali's write isn't signed by bob and
+	// must be rejected, even though it goes through ali's ref.
+	if err := bob.Get("profile").Put(ctx, map[string]any{"name": "Bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ali.Get("friend").Put(ctx, db.User(bob.Pub()).Get("profile")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ali.Get("friend").Get("name").Put(ctx, "Mallory"); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("write into bob's space through ali's ref: %v", err)
+	}
+	if name, _ := db.User(bob.Pub()).Get("profile").Get("name").Once[string](ctx); name != "Bob" {
+		t.Fatalf("bob's name is %q", name)
+	}
+
+	// And a field ali signed is skipped: a skip set that says so lets a
+	// value through that would otherwise fail.
+	g := graph{}
+	g.node("~"+ali.Pub()).Set("name", String("not signed"), db.state.Next())
+	if err := checkSEA(g, nil); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("unsigned field: %v", err)
+	}
+	if err := checkSEA(g, func(soul, field string) bool { return field == "name" }); err != nil {
+		t.Fatalf("skipped field was checked: %v", err)
+	}
+}
+
+// TestCheckSEAInParallel checks that one bad signature among many is caught
+// when signatures are verified in parallel.
+func TestCheckSEAInParallel(t *testing.T) {
+	db := newDB(t)
+	pair, _ := sea.NewPair()
+	ali := db.LoginPair(pair)
+	soul := "~" + ali.Pub()
+	for bad := range 20 {
+		g := graph{}
+		for i := range 20 {
+			g.node(soul).Set(fmt.Sprint("f", i), String(fmt.Sprint("v", i)), 1)
+		}
+		if _, err := ali.sign(g); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkSEA(g, nil); err != nil {
+			t.Fatalf("valid graph: %v", err)
+		}
+		other := fmt.Sprint("f", (bad+1)%20) // a real signature, on the wrong field
+		g[soul].Fields[fmt.Sprint("f", bad)] = g[soul].Fields[other]
+		if err := checkSEA(g, nil); !errors.Is(err, ErrUnverified) {
+			t.Fatalf("bad field f%d: %v", bad, err)
 		}
 	}
 }
