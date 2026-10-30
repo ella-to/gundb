@@ -293,3 +293,53 @@ func BenchmarkPutFieldLargeNode(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSetSynced adds an item to a list through a DB on a store that
+// syncs every write (the default): Set writes two nodes.
+func BenchmarkSetSynced(b *testing.B) {
+	s, err := Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer s.Close()
+	db := gundb.New(gundb.Options{Store: s})
+	defer db.Close()
+	ctx := context.Background()
+	list := db.Get("list")
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := list.Set(ctx, map[string]any{"title": "item"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestPutBatch(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, t.TempDir())
+	a, b := gundb.NewNode("a"), gundb.NewNode("b")
+	a.Set("x", gundb.Number(1), 1)
+	b.Set("y", gundb.Link{Soul: "a"}, 2)
+	if err := s.PutBatch(ctx, []*gundb.Node{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []*gundb.Node{a, b} {
+		got, err := s.Get(ctx, want.Soul)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sameNode(t, got, want)
+		for field := range want.Fields {
+			n := 0
+			for _, err := range s.History(ctx, want.Soul, field) {
+				if err != nil {
+					t.Fatal(err)
+				}
+				n++
+			}
+			if n != 1 {
+				t.Fatalf("%s.%s: %d versions in history", want.Soul, field, n)
+			}
+		}
+	}
+}

@@ -41,6 +41,19 @@ type FieldReader interface {
 	GetFields(ctx context.Context, soul string, fields []string) (*Node, error)
 }
 
+// BatchStore is an optional extension of FieldStore. When one write
+// touches several nodes (a Set, a nested struct, an account), the runtime
+// calls PutBatch once with the changed fields of every node, instead of
+// PutFields per node, so the store can commit them together: one disk sync
+// instead of one per node, and no reader sees half of the write.
+//
+// Each node in changed holds only the fields that won HAM; none may be
+// retained.
+type BatchStore interface {
+	FieldStore
+	PutBatch(ctx context.Context, changed []*Node) error
+}
+
 // SoulStore is an optional extension of Store that lists souls. A DB needs
 // it to answer LEX queries over souls, like {"#": {"*": "chat/"}} from GUN.js
 // or DB.Souls; without it such gets are passed on to other peers.

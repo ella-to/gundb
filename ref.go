@@ -48,6 +48,15 @@ func (r *Ref) Put(ctx context.Context, v any) error { return r.put(ctx, v, false
 func (r *Ref) PutAck(ctx context.Context, v any) error { return r.put(ctx, v, true) }
 
 func (r *Ref) put(ctx context.Context, v any, ack bool) error {
+	g := graph{}
+	if err := r.addTo(ctx, g, v, r.db.state.Next()); err != nil {
+		return err
+	}
+	return r.write(ctx, g, ack)
+}
+
+// addTo adds to g the nodes that putting v here writes.
+func (r *Ref) addTo(ctx context.Context, g graph, v any, state float64) error {
 	t, err := toTree(v)
 	if err != nil {
 		return err
@@ -59,11 +68,12 @@ func (r *Ref) put(ctx context.Context, v any, ack bool) error {
 	if _, isLink := linkOf(obj); !ok || isLink {
 		return errRootPut(r.path[0])
 	}
-	g := graph{}
 	rd := &reader{db: r.db, ctx: ctx, net: true}
-	if err := rd.build(g, r.path[0], obj, r.db.state.Next()); err != nil {
-		return err
-	}
+	return rd.build(g, r.path[0], obj, state)
+}
+
+// write signs g if r belongs to a user, and writes it.
+func (r *Ref) write(ctx context.Context, g graph, ack bool) error {
 	var signed checked
 	if r.user != nil {
 		var err error
@@ -88,6 +98,9 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 		item := r.Get(uuid())
 		return item, item.Put(ctx, t)
 	}
+	// The item and the link to it are one write.
+	g := graph{}
+	state := r.db.state.Next()
 	soul, isLink := linkOf(m)
 	if !isLink {
 		if soul = metaSoul(m); soul == "" {
@@ -96,11 +109,14 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 				soul = "~" + r.user.Pub() + "/" + soul
 			}
 		}
-		if err := r.root(soul).Put(ctx, m); err != nil {
+		if err := r.root(soul).addTo(ctx, g, m, state); err != nil {
 			return nil, err
 		}
 	}
-	return r.root(soul), r.Get(soul).Put(ctx, Link{Soul: soul})
+	if err := r.Get(soul).addTo(ctx, g, Link{Soul: soul}, state); err != nil {
+		return nil, err
+	}
+	return r.root(soul), r.write(ctx, g, false)
 }
 
 // Once reads the current value into T. Data not yet known locally is

@@ -39,7 +39,8 @@ type Options struct {
 	Pebble *pebble.Options
 }
 
-// Store is a gundb.FieldReader and gundb.SoulStore backed by Pebble. It is
+// Store is a gundb.FieldReader, gundb.BatchStore and gundb.SoulStore
+// backed by Pebble. It is
 // safe for concurrent use.
 type Store struct {
 	db    *pebble.DB
@@ -49,6 +50,7 @@ type Store struct {
 
 var (
 	_ gundb.FieldReader = (*Store)(nil)
+	_ gundb.BatchStore  = (*Store)(nil)
 	_ gundb.SoulStore   = (*Store)(nil)
 )
 
@@ -149,9 +151,30 @@ func (s *Store) PutFields(_ context.Context, soul string, changed *gundb.Node) e
 	return s.write(soul, changed)
 }
 
+// PutBatch implements gundb.BatchStore: the changed fields of several
+// nodes are committed in one batch, with one sync.
+func (s *Store) PutBatch(_ context.Context, changed []*gundb.Node) error {
+	b := s.db.NewBatch()
+	defer b.Close()
+	for _, n := range changed {
+		if err := add(b, n.Soul, n); err != nil {
+			return err
+		}
+	}
+	return commit(b, s.sync)
+}
+
 func (s *Store) write(soul string, n *gundb.Node) error {
 	b := s.db.NewBatch()
 	defer b.Close()
+	if err := add(b, soul, n); err != nil {
+		return err
+	}
+	return commit(b, s.sync)
+}
+
+// add puts the fields of n, the latest version and history, in b.
+func add(b *pebble.Batch, soul string, n *gundb.Node) error {
 	lp, hp := latestPrefix(soul), historyPrefix(soul)
 	var buf []byte
 	for field, v := range n.Fields {
@@ -165,7 +188,11 @@ func (s *Store) write(soul string, n *gundb.Node) error {
 		b.Set(append(lp[:len(lp):len(lp)], field...), buf, nil)
 		b.Set(historyKey(hp, field, state), enc, nil)
 	}
-	if err := b.Commit(s.sync); err != nil {
+	return nil
+}
+
+func commit(b *pebble.Batch, sync *pebble.WriteOptions) error {
+	if err := b.Commit(sync); err != nil {
 		return fmt.Errorf("pebblestore: %w", err)
 	}
 	return nil

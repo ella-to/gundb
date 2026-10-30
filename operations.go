@@ -21,28 +21,12 @@ func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
 	}
 	changed, later := graph{}, graph{}
 	var wake float64
-
 	machine := db.state.Next()
-	fr, partial := db.store.(FieldReader)
-	for _, soul := range childrenFirst(g) {
-		in := g[soul]
-		mu := db.mergeLock(soul)
-		mu.Lock()
-		var cur *Node
-		var err error
-		if partial { // only the fields we merge; PutFields writes only those
-			cur, err = fr.GetFields(ctx, soul, slices.Collect(maps.Keys(in.Fields)))
-		} else {
-			cur, err = db.store.Get(ctx, soul)
-		}
+	merge := func(soul string, in *Node) (dirty bool, err error) {
+		cur, err := db.current(ctx, soul, in)
 		if err != nil {
-			mu.Unlock()
-			return nil, err
+			return false, err
 		}
-		if cur == nil {
-			cur = NewNode(soul)
-		}
-		dirty := false
 		for k, v := range in.Fields {
 			state := in.States[k]
 			curState, ok := cur.States[k]
@@ -59,19 +43,49 @@ func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
 				wake = max(wake, state)
 			}
 		}
-		if dirty {
-			var err error
-			if fs, ok := db.store.(FieldStore); ok {
-				err = fs.PutFields(ctx, soul, changed[soul])
-			} else {
-				err = db.store.Put(ctx, cur)
-			}
+		if dirty && !isFieldStore(db.store) {
+			return true, db.store.Put(ctx, cur)
+		}
+		return dirty, nil
+	}
+
+	if bs, ok := db.store.(BatchStore); ok && len(g) > 1 {
+		// Merge every node, holding all their locks, and commit them at once.
+		unlock := db.lockMerges(g)
+		var nodes []*Node
+		for soul, in := range g {
+			dirty, err := merge(soul, in)
 			if err != nil {
-				mu.Unlock()
+				unlock()
+				return nil, err
+			}
+			if dirty {
+				nodes = append(nodes, changed[soul])
+			}
+		}
+		var err error
+		if len(nodes) > 0 {
+			err = bs.PutBatch(ctx, nodes)
+		}
+		unlock()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		for _, soul := range childrenFirst(g) {
+			mu := db.mergeLock(soul)
+			mu.Lock()
+			dirty, err := merge(soul, g[soul])
+			if err == nil && dirty {
+				if fs, ok := db.store.(FieldStore); ok {
+					err = fs.PutFields(ctx, soul, changed[soul])
+				}
+			}
+			mu.Unlock()
+			if err != nil {
 				return nil, err
 			}
 		}
-		mu.Unlock()
 	}
 
 	if len(later) > 0 {
@@ -111,9 +125,51 @@ func childrenFirst(g graph) []string {
 	return order
 }
 
+// current returns the stored node a merge of in compares against: only the
+// fields in touches, if the store can read just those (FieldReader).
+func (db *DB) current(ctx context.Context, soul string, in *Node) (*Node, error) {
+	var cur *Node
+	var err error
+	if fr, ok := db.store.(FieldReader); ok { // PutFields writes only these back
+		cur, err = fr.GetFields(ctx, soul, slices.Collect(maps.Keys(in.Fields)))
+	} else {
+		cur, err = db.store.Get(ctx, soul)
+	}
+	if cur == nil && err == nil {
+		cur = NewNode(soul)
+	}
+	return cur, err
+}
+
+func isFieldStore(s Store) bool {
+	_, ok := s.(FieldStore)
+	return ok
+}
+
 // mergeLock returns the lock that serialises merges into soul.
-func (db *DB) mergeLock(soul string) *sync.Mutex {
-	return &db.mergeMu[maphash.String(db.mergeSeed, soul)%uint64(len(db.mergeMu))]
+func (db *DB) mergeLock(soul string) *sync.Mutex { return &db.mergeMu[db.mergeIndex(soul)] }
+
+func (db *DB) mergeIndex(soul string) uint64 {
+	return maphash.String(db.mergeSeed, soul) % uint64(len(db.mergeMu))
+}
+
+// lockMerges takes the merge locks of every soul in g, in one order for
+// every caller so two writes can't deadlock, and returns their unlock.
+func (db *DB) lockMerges(g graph) (unlock func()) {
+	idx := make([]uint64, 0, len(g))
+	for soul := range g {
+		idx = append(idx, db.mergeIndex(soul))
+	}
+	slices.Sort(idx)
+	idx = slices.Compact(idx) // two souls can share a lock
+	for _, i := range idx {
+		db.mergeMu[i].Lock()
+	}
+	return func() {
+		for _, i := range slices.Backward(idx) {
+			db.mergeMu[i].Unlock()
+		}
+	}
 }
 
 // write applies a local write and sends it to peers. With ack it waits for

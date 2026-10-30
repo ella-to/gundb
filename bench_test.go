@@ -363,3 +363,17 @@ func BenchmarkFanout(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkSet adds an item to a list: the item's node and the link to it.
+func BenchmarkSet(b *testing.B) {
+	db := New()
+	defer db.Close()
+	ctx := context.Background()
+	list := db.Get("list")
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := list.Set(ctx, Todo{Title: "milk"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
