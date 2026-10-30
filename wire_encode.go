@@ -16,7 +16,15 @@ import (
 // produce for it, but written straight into b with JS string escaping (no
 // HTML escapes) and without re-parsing what each field's MarshalJSON wrote.
 // Every message we send or relay goes through here.
-func (m *message) appendWire(b []byte) ([]byte, error) {
+//
+// Souls and fields are written in map order, not sorted: nothing on the
+// wire depends on their order (GUN.js doesn't sort either), and sorting
+// was a large part of encoding a big node.
+func (m *message) appendWire(b []byte) ([]byte, error) { return m.appendJSON(b, false) }
+
+// appendJSON is appendWire, with souls and fields sorted if sorted is set,
+// which makes the output exactly what encoding/json writes.
+func (m *message) appendJSON(b []byte, sorted bool) ([]byte, error) {
 	b = append(b, '{')
 	str := func(k, v string) {
 		if v != "" {
@@ -35,7 +43,7 @@ func (m *message) appendWire(b []byte) ([]byte, error) {
 	if len(m.Put) > 0 {
 		b = appendKey(b, "put")
 		var err error
-		if b, err = m.Put.appendJSON(b); err != nil {
+		if b, err = m.Put.appendJSON(b, sorted); err != nil {
 			return nil, err
 		}
 	}
@@ -75,10 +83,11 @@ func appendRaw(b []byte, raw json.RawMessage) []byte {
 	return buf.Bytes()
 }
 
-// appendJSON appends g as {soul: node, ...} with souls sorted.
-func (g graph) appendJSON(b []byte) ([]byte, error) {
+// appendJSON appends g as {soul: node, ...}, with souls sorted if sorted
+// is set.
+func (g graph) appendJSON(b []byte, sorted bool) ([]byte, error) {
 	b = append(b, '{')
-	for i, soul := range slices.Sorted(maps.Keys(g)) {
+	for i, soul := range keysOf(g, sorted) {
 		if i > 0 {
 			b = append(b, ',')
 		}
@@ -88,16 +97,25 @@ func (g graph) appendJSON(b []byte) ([]byte, error) {
 			continue
 		}
 		var err error
-		if b, err = g[soul].appendJSON(b); err != nil {
+		if b, err = g[soul].appendJSON(b, sorted); err != nil {
 			return nil, err
 		}
 	}
 	return append(b, '}'), nil
 }
 
-// appendJSON appends the GUN wire form of n with sorted keys.
-func (n *Node) appendJSON(b []byte) ([]byte, error) {
-	keys := slices.Sorted(maps.Keys(n.Fields))
+// keysOf returns the keys of m, sorted if sorted is set.
+func keysOf[V any](m map[string]V, sorted bool) []string {
+	if sorted {
+		return slices.Sorted(maps.Keys(m))
+	}
+	return slices.AppendSeq(make([]string, 0, len(m)), maps.Keys(m))
+}
+
+// appendJSON appends the GUN wire form of n, with fields sorted if sorted
+// is set.
+func (n *Node) appendJSON(b []byte, sorted bool) ([]byte, error) {
+	keys := keysOf(n.Fields, sorted)
 	b = append(b, `{"_":{"#":`...)
 	b = js.AppendQuote(b, n.Soul)
 	b = append(b, `,">":{`...)

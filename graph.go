@@ -40,7 +40,7 @@ func (n *Node) Clone() *Node {
 }
 
 // MarshalJSON writes the GUN wire form with sorted keys.
-func (n *Node) MarshalJSON() ([]byte, error) { return n.appendJSON(nil) }
+func (n *Node) MarshalJSON() ([]byte, error) { return n.appendJSON(nil, true) }
 
 // UnmarshalJSON parses the GUN wire form. Like the reference it rejects
 // nodes without a soul, fields without a state, and invalid values.

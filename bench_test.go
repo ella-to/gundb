@@ -377,3 +377,19 @@ func BenchmarkSet(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkEncodeLargeNode encodes a put of one node with 10,000 fields,
+// like the answer to a get for a long list.
+func BenchmarkEncodeLargeNode(b *testing.B) {
+	n := NewNode("list")
+	for i := range 10000 {
+		n.Set("item-"+strconv.Itoa(i), Link{Soul: "item-" + strconv.Itoa(i)}, 1700000000000+float64(i))
+	}
+	m := &message{ID: "1", Put: graph{"list": n}}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := m.appendWire(nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -58,14 +58,36 @@ func TestAppendWireMatchesEncodingJSON(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := m.appendWire(nil)
+		got, err := m.appendJSON(nil, true)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !bytes.Equal(got, want) {
 			t.Errorf("\n got %s\nwant %s", got, want)
 		}
+		// On the wire, only the order of souls and fields may differ.
+		wire, err := m.appendWire(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if again := reencode(t, wire); !bytes.Equal(again, want) {
+			t.Errorf("wire form decodes differently:\n got %s\nwant %s", again, want)
+		}
 	}
+}
+
+// reencode decodes one wire message and encodes it sorted.
+func reencode(t *testing.T, wire []byte) []byte {
+	t.Helper()
+	ms, err := readFrame(wire)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("%s: %v", wire, err)
+	}
+	b, err := ms[0].appendJSON(nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestAppendWireRejectsBadNodes(t *testing.T) {
