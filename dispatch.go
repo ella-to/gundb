@@ -191,7 +191,9 @@ func (db *DB) handleSoulLex(p *peer, m *message) {
 		return
 	}
 	slices.SortFunc(souls, jsCompare)
-	var chunks []graph
+	// Each chunk is sent once the next match shows more are coming, so only
+	// one chunk of nodes is held at a time.
+	var chunk graph
 	for _, soul := range souls {
 		if !l.matchSoul(soul) || !db.allowRead(p, soul) {
 			continue
@@ -205,22 +207,20 @@ func (db *DB) handleSoulLex(p *peer, m *message) {
 			continue
 		}
 		p.want(soul)
-		if len(chunks) == 0 || len(chunks[len(chunks)-1]) == lexChunk {
-			chunks = append(chunks, graph{})
+		if len(chunk) == lexChunk {
+			db.reply(p, &message{Ack: m.ID, Put: chunk, More: json.RawMessage("1")})
+			chunk = nil
 		}
-		chunks[len(chunks)-1][soul] = n
+		if chunk == nil {
+			chunk = graph{}
+		}
+		chunk[soul] = n
 	}
-	if len(chunks) == 0 {
+	if chunk == nil {
 		db.relayGet(p, m)
 		return
 	}
-	for i, g := range chunks {
-		r := &message{Ack: m.ID, Put: g}
-		if i < len(chunks)-1 {
-			r.More = json.RawMessage("1")
-		}
-		db.reply(p, r)
-	}
+	db.reply(p, &message{Ack: m.ID, Put: chunk})
 }
 
 func deref(s *string) string {
