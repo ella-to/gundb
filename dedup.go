@@ -1,6 +1,7 @@
 package gundb
 
 import (
+	"hash/maphash"
 	"sync"
 	"time"
 )
@@ -16,17 +17,24 @@ import (
 // stalls every message behind a sweep. Everything in a dropped generation
 // is older than ttl, and lookups still check each entry's age, so IDs
 // expire exactly as before; they just free their memory up to ttl later.
+//
+// Entries are kept small, for relays that hold millions: the ID is hashed
+// to 64 bits (GUN's IDs are 9 random characters, about 53 bits, so a hash
+// collision is far less likely than two IDs being equal), and its time is
+// nanoseconds since the table's first use, from the monotonic clock.
 type dup struct {
-	ttl time.Duration
-	now func() time.Time
+	ttl  time.Duration
+	now  func() time.Time
+	seed maphash.Seed
 
 	mu        sync.Mutex
-	cur, prev map[string]dupEntry
+	cur, prev map[uint64]dupEntry
 	rotated   time.Time
+	base      time.Time // entry times count from here
 }
 
 type dupEntry struct {
-	at  time.Time
+	at  int64 // nanoseconds since base
 	via *peer // nil for messages we created
 }
 
@@ -34,7 +42,16 @@ func newDup(ttl time.Duration) *dup {
 	if ttl <= 0 {
 		ttl = 9 * time.Second // gun default: opt.age = 9s
 	}
-	return &dup{ttl: ttl, now: time.Now, cur: map[string]dupEntry{}, prev: map[string]dupEntry{}}
+	return &dup{ttl: ttl, now: time.Now, seed: maphash.MakeSeed(), cur: map[uint64]dupEntry{}, prev: map[uint64]dupEntry{}}
+}
+
+// clock returns the current time as an entry time. Callers hold mu.
+func (d *dup) clock() (time.Time, int64) {
+	now := d.now()
+	if d.base.IsZero() {
+		d.base = now
+	}
+	return now, int64(now.Sub(d.base))
 }
 
 // track records id and reports whether it was already known. Tracking a
@@ -42,19 +59,20 @@ func newDup(ttl time.Duration) *dup {
 func (d *dup) track(id string, via *peer) (seen bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	now := d.now()
+	now, at := d.clock()
 	if now.Sub(d.rotated) >= d.ttl {
 		// Every entry in prev was added before the last rotation, at least
 		// ttl ago, so all of it has expired.
-		d.prev, d.cur, d.rotated = d.cur, map[string]dupEntry{}, now
+		d.prev, d.cur, d.rotated = d.cur, map[uint64]dupEntry{}, now
 	}
-	if e, ok := d.lookup(id, now); ok {
-		e.at = now
-		d.cur[id] = e
-		delete(d.prev, id)
+	k := maphash.String(d.seed, id)
+	if e, ok := d.lookup(k, at); ok {
+		e.at = at
+		d.cur[k] = e
+		delete(d.prev, k)
 		return true
 	}
-	d.cur[id] = dupEntry{at: now, via: via}
+	d.cur[k] = dupEntry{at: at, via: via}
 	return false
 }
 
@@ -62,17 +80,18 @@ func (d *dup) track(id string, via *peer) (seen bool) {
 func (d *dup) via(id string) *peer {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	e, _ := d.lookup(id, d.now())
+	_, at := d.clock()
+	e, _ := d.lookup(maphash.String(d.seed, id), at)
 	return e.via
 }
 
 // lookup finds an unexpired entry. Callers hold mu.
-func (d *dup) lookup(id string, now time.Time) (dupEntry, bool) {
-	e, ok := d.cur[id]
+func (d *dup) lookup(k uint64, at int64) (dupEntry, bool) {
+	e, ok := d.cur[k]
 	if !ok {
-		e, ok = d.prev[id]
+		e, ok = d.prev[k]
 	}
-	if !ok || now.Sub(e.at) > d.ttl {
+	if !ok || at-e.at > int64(d.ttl) {
 		return dupEntry{}, false
 	}
 	return e, true
@@ -82,14 +101,15 @@ func (d *dup) lookup(id string, now time.Time) (dupEntry, bool) {
 func (d *dup) size() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	now, n := d.now(), 0
+	_, at := d.clock()
+	n := 0
 	for _, e := range d.cur {
-		if now.Sub(e.at) <= d.ttl {
+		if at-e.at <= int64(d.ttl) {
 			n++
 		}
 	}
-	for id, e := range d.prev {
-		if _, dup := d.cur[id]; !dup && now.Sub(e.at) <= d.ttl {
+	for k, e := range d.prev {
+		if _, dup := d.cur[k]; !dup && at-e.at <= int64(d.ttl) {
 			n++
 		}
 	}
