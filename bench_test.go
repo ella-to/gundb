@@ -320,3 +320,46 @@ func BenchmarkGetFieldLargeNode(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkFanout is a relay receiving a put for a node that 1,000 peers
+// subscribe to, and queueing it for each of them. With "hide", CanRead
+// hides one of the put's two nodes from every peer.
+func BenchmarkFanout(b *testing.B) {
+	for _, rules := range []string{"none", "allow", "hide"} {
+		b.Run("canRead="+rules, func(b *testing.B) {
+			var o Options
+			switch rules {
+			case "allow":
+				o.CanRead = func(string, string) bool { return true }
+			case "hide":
+				o.CanRead = func(_, soul string) bool { return soul != "secret" }
+			}
+			db := New(o)
+			defer db.Close()
+			newPeer := func() *peer {
+				ctx, cancel := context.WithCancel(db.ctx)
+				b.Cleanup(cancel)
+				p := &peer{db: db, conn: &discardConn{*newFakeConn(false)}, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+				go p.writeLoop()
+				return p
+			}
+			for range 1000 {
+				newPeer().want("users/alice")
+			}
+			writer := newPeer()
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				state := strconv.Itoa(1700000000000 + i)
+				frame := `{"#":"m` + strconv.Itoa(i) + `","put":{"users/alice":{"_":{"#":"users/alice",">":{"n":` + state + `}},"n":` + strconv.Itoa(i) +
+					`},"secret":{"_":{"#":"secret",">":{"n":` + state + `}},"n":1}}}`
+				msgs, err := readFrame([]byte(frame))
+				if err != nil {
+					b.Fatal(err)
+				}
+				db.handle(writer, &msgs[0])
+			}
+		})
+	}
+}

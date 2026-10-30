@@ -49,30 +49,52 @@ func (db *DB) allowRead(p *peer, soul string) bool {
 // sendTo sends m, already encoded as raw, to q without the nodes q may not
 // read. An ack is still sent if nothing is left of its data, so whoever
 // waits for it is not left hanging.
-func (db *DB) sendTo(q *peer, m *message, raw []byte) {
+//
+// When one message goes to many peers, pass the same non-nil memo for all
+// of them: what a user may read is then worked out, and encoded, once per
+// user rather than once per connection.
+func (db *DB) sendTo(q *peer, m *message, raw []byte, memo map[string]readable) {
 	if db.canRead == nil || q.trusted() || len(m.Put) == 0 {
 		q.send(raw)
 		return
 	}
+	r, ok := memo[q.user]
+	if !ok {
+		r = db.readableBy(q.user, m, raw)
+		if memo != nil {
+			memo[q.user] = r
+		}
+	}
+	if !r.none {
+		q.send(r.raw)
+	}
+}
+
+// readable is a message as one user may see it.
+type readable struct {
+	raw  []byte
+	none bool // nothing to send
+}
+
+func (db *DB) readableBy(user string, m *message, raw []byte) readable {
 	keep := graph{}
 	for soul, n := range m.Put {
-		if db.canRead(q.user, soul) {
+		if db.canRead(user, soul) {
 			keep[soul] = n
 		}
 	}
 	switch {
 	case len(keep) == len(m.Put):
-		q.send(raw)
+		return readable{raw: raw}
 	case len(keep) == 0 && m.Ack == "":
-		// a put with nothing q may see
-	default:
-		cp := *m
-		cp.Put, cp.Hash = keep, nil
-		if len(keep) == 0 {
-			cp.Put = nil
-		}
-		q.send(db.encode(&cp))
+		return readable{none: true} // a put with nothing the user may see
 	}
+	cp := *m
+	cp.Put, cp.Hash = keep, nil
+	if len(keep) == 0 {
+		cp.Put = nil
+	}
+	return readable{raw: db.encode(&cp)}
 }
 
 // remoteError turns an error text received from a peer back into an error

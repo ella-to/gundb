@@ -93,13 +93,13 @@ func (db *DB) handleAck(p *peer, m *message) {
 	}
 	if r := db.answer(p, m); r != nil {
 		if r.to != nil && len(m.Put) > 0 { // data for a get we are relaying
-			db.sendTo(r.to, m, db.encode(m))
+			db.sendTo(r.to, m, db.encode(m), nil)
 		}
 		return
 	}
 	if to := db.dup.via(m.Ack); to != nil && to != p {
 		db.dup.track(m.Ack, nil) // keep the route alive for chunked replies
-		db.sendTo(to, m, db.encode(m))
+		db.sendTo(to, m, db.encode(m), nil)
 	}
 }
 
@@ -122,9 +122,10 @@ func (db *DB) handlePut(p *peer, m *message) {
 		return
 	}
 	raw := db.encode(m)
+	memo := map[string]readable{}
 	for _, q := range db.recipients(changed) {
 		if q != p && !m.sentTo(q.getPID()) {
-			db.sendTo(q, m, raw)
+			db.sendTo(q, m, raw, memo)
 		}
 	}
 }

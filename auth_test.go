@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -199,3 +201,61 @@ func (c *scriptConn) Close() error {
 }
 
 func (c *scriptConn) RemoteAddr() string { return "script" }
+
+// TestCanReadPerUserInFanout checks that a put going to many connections
+// is filtered for each user: connections of one user share a view, and
+// another user's view is not mixed in.
+func TestCanReadPerUserInFanout(t *testing.T) {
+	db := New(Options{CanRead: func(user, soul string) bool { return soul != "secret" || user == "admin" }})
+	t.Cleanup(func() { db.Close() })
+	connect := func(user string) *fakeConn {
+		conn := newFakeConn(false)
+		ctx, cancel := context.WithCancel(db.ctx)
+		t.Cleanup(cancel)
+		p := &peer{db: db, conn: conn, user: user, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+		go p.writeLoop()
+		p.want("news")
+		p.want("secret")
+		return conn
+	}
+	admin, bob1, bob2 := connect("admin"), connect("bob"), connect("bob")
+	writer := connect("writer")
+
+	msgs, err := readFrame([]byte(`{"#":"m1","put":{` +
+		`"news":{"_":{"#":"news",">":{"t":1}},"t":"hello"},` +
+		`"secret":{"_":{"#":"secret",">":{"k":1}},"k":"s3cret"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(db.ctx)
+	defer cancel()
+	db.handle(&peer{db: db, conn: writer, user: "writer", ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}, &msgs[0])
+
+	souls := func(conn *fakeConn) []string {
+		t.Helper()
+		for {
+			select {
+			case frame := <-conn.frames:
+				got, err := readFrame(frame)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, m := range got {
+					if m.ID == "m1" {
+						return slices.Sorted(maps.Keys(m.Put))
+					}
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("no put arrived")
+			}
+		}
+	}
+	if got := souls(admin); !slices.Equal(got, []string{"news", "secret"}) {
+		t.Fatalf("admin got %v", got)
+	}
+	for i, bob := range []*fakeConn{bob1, bob2} {
+		if got := souls(bob); !slices.Equal(got, []string{"news"}) {
+			t.Fatalf("bob's connection %d got %v", i+1, got)
+		}
+	}
+}

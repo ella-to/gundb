@@ -318,22 +318,54 @@ func (db *DB) unsubscribe(p *peer) {
 // that asked for one of them, plus our upstream peers. The cost depends on
 // the number of subscribers, not on the number of connected peers.
 func (db *DB) recipients(g graph) []*peer {
-	set := map[*peer]struct{}{}
-	db.subsMu.Lock()
-	for soul := range g {
-		for p := range db.subs[soul] {
-			set[p] = struct{}{}
-		}
-	}
-	db.subsMu.Unlock()
+	var upstream []*peer
 	db.peersMu.Lock()
 	for _, o := range db.outbound {
 		if o.live != nil {
-			set[o.live] = struct{}{}
+			upstream = append(upstream, o.live)
 		}
 	}
 	db.peersMu.Unlock()
+
+	db.subsMu.Lock()
+	defer db.subsMu.Unlock()
+	var subs []map[*peer]struct{}
+	n := 0
+	for soul := range g {
+		if s := db.subs[soul]; len(s) > 0 {
+			subs = append(subs, s)
+			n += len(s)
+		}
+	}
+	if len(subs) <= 1 { // the usual case: no set needed to drop duplicates
+		out := make([]*peer, 0, n+len(upstream))
+		for _, s := range subs {
+			for p := range s {
+				out = append(out, p)
+			}
+		}
+		for _, p := range upstream {
+			if len(subs) == 0 || !has(subs[0], p) {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	set := make(map[*peer]struct{}, n+len(upstream))
+	for _, s := range subs {
+		for p := range s {
+			set[p] = struct{}{}
+		}
+	}
+	for _, p := range upstream {
+		set[p] = struct{}{}
+	}
 	return slices.Collect(maps.Keys(set))
+}
+
+func has(s map[*peer]struct{}, p *peer) bool {
+	_, ok := s[p]
+	return ok
 }
 
 func (db *DB) livePeers() []*peer {
@@ -353,7 +385,8 @@ func (db *DB) sendOwn(m *message, raw []byte) {
 		}
 	}
 	db.peersMu.Unlock()
+	memo := map[string]readable{}
 	for _, p := range peers {
-		db.sendTo(p, m, raw)
+		db.sendTo(p, m, raw, memo)
 	}
 }

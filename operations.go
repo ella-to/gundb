@@ -322,8 +322,9 @@ func (db *DB) offer(soul string, peers []*peer) {
 	m := &message{ID: randomID(9), Put: graph{soul: n}}
 	db.dup.track(m.ID, nil)
 	raw := db.encode(m)
+	memo := map[string]readable{}
 	for _, p := range peers {
-		db.sendTo(p, m, raw)
+		db.sendTo(p, m, raw, memo)
 	}
 }
 
