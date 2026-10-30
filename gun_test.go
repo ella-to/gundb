@@ -307,6 +307,93 @@ func TestSetAndMap(t *testing.T) {
 	}
 }
 
+func TestNodeAndLinks(t *testing.T) {
+	ctx := t.Context()
+	db := newDB(t)
+	todos := db.Get("todos")
+	milk, err := todos.Set(ctx, Todo{Title: "milk"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eggs, err := todos.Set(ctx, Todo{Title: "eggs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	todos.Get("owner").Put(ctx, "alice")
+	todos.Get(milk.Key()).Put(ctx, nil)
+
+	n, err := todos.Node(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Soul != "todos" || n.Fields["owner"] != String("alice") ||
+		n.Fields[milk.Key()] != (Null{}) || n.Fields[eggs.Key()] != (Link{Soul: eggs.Key()}) {
+		t.Fatalf("%+v", n)
+	}
+	if _, ok := n.States["owner"]; !ok {
+		t.Fatalf("no state for owner: %+v", n.States)
+	}
+
+	links, err := todos.Links(ctx)
+	if err != nil || !maps.Equal(links, map[string]string{eggs.Key(): eggs.Key()}) {
+		t.Fatalf("%v %v", links, err)
+	}
+
+	// A path through a link reads the linked node.
+	db.Get("alice").Put(ctx, Member{Name: "Alice", Boss: &Member{Name: "Bob"}})
+	boss, err := db.Get("alice").Get("boss").Node(ctx)
+	if err != nil || boss.Soul != "alice/boss" || boss.Fields["name"] != String("Bob") {
+		t.Fatalf("%+v %v", boss, err)
+	}
+	if links, err := db.Get("alice").Links(ctx); err != nil || !maps.Equal(links, map[string]string{"boss": "alice/boss"}) {
+		t.Fatalf("%v %v", links, err)
+	}
+
+	if _, err := db.Get("nobody").Node(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+	if _, err := todos.Get(milk.Key()).Node(ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted item: want ErrNotFound, got %v", err)
+	}
+	if _, err := todos.Get("owner").Links(ctx); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("value: want a not-a-node error, got %v", err)
+	}
+}
+
+// Links on a peer's set fetches the set node only, not its items.
+func TestLinksDoesNotLoadItems(t *testing.T) {
+	ctx := t.Context()
+	relay, client := newDB(t), newDB(t)
+	var souls []string
+	for i := range 100 {
+		item, err := relay.Get("list").Set(ctx, Todo{Title: fmt.Sprint("t", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		souls = append(souls, item.Key())
+	}
+	link(t, relay, client)
+
+	links, err := client.Get("list").Links(ctx)
+	if err != nil || len(links) != 100 {
+		t.Fatalf("%d links, %v", len(links), err)
+	}
+	for _, soul := range souls {
+		if links[soul] != soul {
+			t.Fatalf("missing %s", soul)
+		}
+		if n, _ := client.store.Get(ctx, soul); n != nil {
+			t.Fatalf("item %s was loaded", soul)
+		}
+	}
+
+	// The items are still there to read one by one.
+	todo, err := client.Get(souls[7]).Once[Todo](ctx)
+	if err != nil || todo.Title != "t7" {
+		t.Fatalf("%+v %v", todo, err)
+	}
+}
+
 func TestSyncBetweenPeers(t *testing.T) {
 	ctx := t.Context()
 	a, b := newDB(t), newDB(t)

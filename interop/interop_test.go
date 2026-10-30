@@ -90,6 +90,31 @@ func TestGoClientWithJSServer(t *testing.T) {
 		defer db.Get("list").Map().On(func(_ string, it Item) { titles <- it.Title })()
 		waitFor(t, titles, "js 1")
 	})
+
+	t.Run("links of a JS set", func(t *testing.T) {
+		runJS(t, peer, "set", "jslist", `{"title":"a"}`)
+		runJS(t, peer, "set", "jslist", `{"title":"b"}`)
+		other := gundb.New(gundb.Options{Peers: []string{peer}}) // knows nothing yet
+		defer other.Close()
+		links, err := other.Get("jslist").Links(ctx)
+		if err != nil || len(links) != 2 {
+			t.Fatalf("%v %v", links, err)
+		}
+		var titles []string
+		for key, soul := range links {
+			if key != soul {
+				t.Fatalf("set key %q links to %q", key, soul)
+			}
+			it, err := other.Get(soul).Once[Item](ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			titles = append(titles, it.Title)
+		}
+		if slices.Sort(titles); !slices.Equal(titles, []string{"a", "b"}) {
+			t.Fatalf("%q", titles)
+		}
+	})
 }
 
 // LEX queries over souls, answered by radisk on a stock JS relay and by a

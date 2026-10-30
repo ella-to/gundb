@@ -150,6 +150,58 @@ func (r *Ref) Once[T any](ctx context.Context) (T, error) {
 	return t, nil
 }
 
+// Node reads the node here as it is stored, without following its links,
+// like gun.once in JS: a linked node comes back as a Link holding its soul,
+// and only this node is requested from peers. Deleted fields are kept, as
+// Null, and SEA-signed values are returned unwrapped. It returns ErrNotFound
+// if there is no node here, and an error if the value here is not a node.
+//
+//	n, err := db.Get("todos").Node(ctx)
+//	for key, v := range n.Fields { ... }
+func (r *Ref) Node(ctx context.Context) (*Node, error) {
+	rd := &reader{db: r.db, ctx: ctx, net: true}
+	v, err := rd.at(r.path)
+	if err != nil {
+		return nil, err
+	}
+	switch v := v.(type) {
+	case nil, Null:
+		return nil, ErrNotFound
+	case Link:
+		n, err := rd.node(v.Soul)
+		if err != nil {
+			return nil, err
+		}
+		if n == nil {
+			return nil, ErrNotFound
+		}
+		return n, nil
+	default:
+		return nil, fmt.Errorf("gundb: %s is a value, not a node", r)
+	}
+}
+
+// Links returns the links of the node here, key -> soul, without loading
+// the linked nodes. For a Set the keys are the items' souls, so listing a
+// large set costs one node read, not one per item. Fields that are not
+// links, or were deleted, are left out. Errors are those of Node.
+//
+//	links, err := db.Get("todos").Links(ctx)
+//	for soul := range links { todo, err := db.Get(soul).Once[Todo](ctx) }
+func (r *Ref) Links(ctx context.Context) (map[string]string, error) {
+	n, err := r.Node(ctx)
+	if err != nil {
+		return nil, err
+	}
+	links := map[string]string{}
+	for k, v := range n.Fields {
+		if l, ok := v.(Link); ok {
+			links[k] = l.Soul
+		}
+	}
+	return links, nil
+}
+
 // On calls fn with the value now and again every time it changes, whether
 // the change is local or comes from a peer, until off is called or the DB
 // is closed. Changes inside linked nodes count as changes too. A deleted

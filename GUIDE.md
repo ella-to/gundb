@@ -18,6 +18,7 @@ go get ella.to/gundb   # needs Go 1.27+
 | `.put({name: 'x'})`                      | `.Put(ctx, User{Name: "x"})`                        |
 | `.put(data, ack => ...)`                 | `err := .PutAck(ctx, data)`                         |
 | `.once(cb)`                              | `v, err := .Once[T](ctx)`                           |
+| `.once(cb)`, links left as `{'#': soul}` | `n, err := .Node(ctx)` / `links, err := .Links(ctx)` |
 | `.on(cb)` / `.off()`                     | `off := .On(func(v T) {...})` / `off()`             |
 | `.set(item)`                             | `itemRef, err := .Set(ctx, item)`                   |
 | `.map().on(cb)`                          | `.Map().On(func(key string, v T) {...})`            |
