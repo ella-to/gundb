@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
+
+	"ella.to/gundb/internal/js"
 )
 
 // maxDepth bounds how many links a read follows.
@@ -61,19 +65,22 @@ func (r *reader) at(path []string) (Value, error) {
 	return v, nil
 }
 
-// tree turns v into plain data ready for json.Marshal, loading linked nodes
-// as nested objects. ok is false if v links to a node that doesn't exist.
-func (r *reader) tree(v Value, path map[string]bool) (any, bool, error) {
+// treeJSON appends v as JSON, ready to decode into a user's type. Linked
+// nodes are loaded and written as nested objects, fields sorted, deleted
+// fields left out. A link that closes a cycle, or whose node isn't here,
+// is written as {"#": soul}. ok is false if v itself links to a node that
+// doesn't exist.
+func (r *reader) treeJSON(b []byte, v Value, path map[string]bool) ([]byte, bool, error) {
 	if l, ok := v.(Link); ok {
-		return r.object(l.Soul, path)
+		return r.objectJSON(b, l.Soul, path)
 	}
-	return plain(v), true, nil
+	return appendPlain(b, v), true, nil
 }
 
-func (r *reader) object(soul string, path map[string]bool) (any, bool, error) {
+func (r *reader) objectJSON(b []byte, soul string, path map[string]bool) ([]byte, bool, error) {
 	n, err := r.node(soul)
 	if err != nil || n == nil {
-		return nil, false, err
+		return b, false, err
 	}
 	if r.net { // fetch all children in parallel before walking them
 		var wg sync.WaitGroup
@@ -86,28 +93,49 @@ func (r *reader) object(soul string, path map[string]bool) (any, bool, error) {
 	}
 	path[soul] = true
 	defer delete(path, soul)
-	out := make(map[string]any, len(n.Fields))
-	for k, v := range n.Fields {
-		switch x := v.(type) {
-		case Null: // deleted
-		case Link:
-			if path[x.Soul] || len(path) >= maxDepth {
-				out[k] = plain(x) // cycle: leave the link as {"#": soul}
-				continue
-			}
-			child, ok, err := r.object(x.Soul, path)
-			if err != nil {
+	b = append(b, '{')
+	first := true
+	for _, k := range slices.Sorted(maps.Keys(n.Fields)) {
+		v := n.Fields[k]
+		if _, deleted := v.(Null); deleted {
+			continue
+		}
+		if !first {
+			b = append(b, ',')
+		}
+		first = false
+		b = append(js.AppendQuote(b, k), ':')
+		if l, ok := v.(Link); ok && !path[l.Soul] && len(path) < maxDepth {
+			var found bool
+			if b, found, err = r.objectJSON(b, l.Soul, path); err != nil {
 				return nil, false, err
 			}
-			if !ok {
-				child = plain(x)
+			if found {
+				continue
 			}
-			out[k] = child
-		default:
-			out[k] = plain(v)
+			// The node isn't here (b is unchanged): write the link itself.
 		}
+		b = appendPlain(b, v)
 	}
-	return out, true, nil
+	return append(b, '}'), true, nil
+}
+
+// appendPlain appends the JSON of one value; a link as {"#": soul}.
+func appendPlain(b []byte, v Value) []byte {
+	switch x := v.(type) {
+	case Bool:
+		if x {
+			return append(b, "true"...)
+		}
+		return append(b, "false"...)
+	case Number:
+		return js.AppendNumber(b, float64(x))
+	case String:
+		return js.AppendQuote(b, string(x))
+	case Link:
+		return append(js.AppendQuote(append(b, `{"#":`...), x.Soul), '}')
+	}
+	return append(b, "null"...)
 }
 
 // soulOf returns the soul a node ref resolves to locally, or the soul a Put
@@ -222,16 +250,4 @@ func metaSoul(m map[string]any) string {
 	meta, _ := m["_"].(map[string]any)
 	s, _ := meta["#"].(string)
 	return s
-}
-
-func decode[T any](v any) (T, error) {
-	var t T
-	b, err := json.Marshal(v)
-	if err != nil {
-		return t, fmt.Errorf("gundb: %w", err)
-	}
-	if err := json.Unmarshal(b, &t); err != nil {
-		return t, fmt.Errorf("gundb: decode into %T: %w", t, err)
-	}
-	return t, nil
 }

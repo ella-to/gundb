@@ -83,22 +83,6 @@ func lexical(v Value) string {
 	return ""
 }
 
-// plain converts a Value into the Go value encoding/json produces for it, so
-// node contents can be re-marshalled into user types. Links become {"#": soul}.
-func plain(v Value) any {
-	switch x := v.(type) {
-	case Bool:
-		return bool(x)
-	case Number:
-		return float64(x)
-	case String:
-		return string(x)
-	case Link:
-		return map[string]any{"#": x.Soul}
-	}
-	return nil
-}
-
 // decodeValue parses one JSON value into the matching Value variant. Objects
 // are only valid when they are a link: exactly one key "#" holding a string.
 func decodeValue(raw json.RawMessage) (Value, error) {

@@ -136,14 +136,18 @@ func (r *Ref) Once[T any](ctx context.Context) (T, error) {
 	if _, deleted := v.(Null); v == nil || deleted {
 		return zero, ErrNotFound
 	}
-	t, ok, err := rd.tree(v, map[string]bool{})
+	b, ok, err := rd.treeJSON(nil, v, map[string]bool{})
 	if err != nil {
 		return zero, err
 	}
 	if !ok {
 		return zero, ErrNotFound
 	}
-	return decode[T](t)
+	var t T
+	if err := json.Unmarshal(b, &t); err != nil {
+		return zero, fmt.Errorf("gundb: decode into %T: %w", t, err)
+	}
+	return t, nil
 }
 
 // On calls fn with the value now and again every time it changes, whether
@@ -166,12 +170,8 @@ func (r *Ref) On[T any](fn func(T)) (off func()) {
 		if err != nil || v == nil {
 			return nil
 		}
-		t, ok, err := rd.tree(v, map[string]bool{})
-		if err != nil || !ok || (t == nil && last == nil) {
-			return nil
-		}
-		b, err := json.Marshal(t)
-		if err != nil || bytes.Equal(b, last) {
+		b, ok, err := rd.treeJSON(nil, v, map[string]bool{})
+		if err != nil || !ok || (string(b) == "null" && last == nil) || bytes.Equal(b, last) {
 			return nil
 		}
 		last = b

@@ -2,7 +2,6 @@ package gundb
 
 import (
 	"bytes"
-	"encoding/json"
 	"maps"
 	"slices"
 )
@@ -118,20 +117,19 @@ func (w *mapWatch) update(rd *reader) []mapChange {
 	var out []mapChange
 	for _, k := range slices.Sorted(maps.Keys(dirty)) {
 		it := w.items[k]
-		var t any
+		var b []byte
 		var ok bool
 		var err error
-		w.setItem(k, it, readSouls(rd, func() { t, ok, err = rd.tree(it.val, map[string]bool{w.list: true}) }))
+		w.setItem(k, it, readSouls(rd, func() { b, ok, err = rd.treeJSON(nil, it.val, map[string]bool{w.list: true}) }))
 		if err != nil || !ok {
 			continue // linked item not here yet; we are watching for it
 		}
 		prev, seen := w.last[k]
-		if t == nil && !seen { // deleted before we ever saw it
-			w.last[k] = []byte("null")
+		if string(b) == "null" && !seen { // deleted before we ever saw it
+			w.last[k] = b
 			continue
 		}
-		b, err := json.Marshal(t)
-		if err != nil || bytes.Equal(b, prev) {
+		if bytes.Equal(b, prev) {
 			continue
 		}
 		w.last[k] = b
