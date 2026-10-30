@@ -126,6 +126,12 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 	if _, err := db.apply(ctx, g, signed); err != nil {
 		return err
 	}
+	if db.alone() { // nobody to send it to, now or later
+		if ack {
+			return ErrNoPeers
+		}
+		return nil
+	}
 	id := randomID(9)
 	db.dup.track(id, nil)
 	var r *request
@@ -149,6 +155,14 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 	case <-db.ctx.Done():
 		return ErrClosed
 	}
+}
+
+// alone reports whether there is no peer at all: none connected, and none
+// configured to dial (whose writes would be queued for later).
+func (db *DB) alone() bool {
+	db.peersMu.Lock()
+	defer db.peersMu.Unlock()
+	return len(db.peers) == 0 && len(db.outbound) == 0
 }
 
 // request tracks the replies to one get or put we sent.
