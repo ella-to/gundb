@@ -120,3 +120,38 @@ func TestSlowPeerIsDisconnected(t *testing.T) {
 		t.Fatal("a peer that stopped reading was not disconnected")
 	}
 }
+
+// TestSendTimeoutDropsPeer checks that a frame that can't be sent within
+// sendTimeout disconnects the peer, and that sends within it don't.
+func TestSendTimeoutDropsPeer(t *testing.T) {
+	old := sendTimeout
+	sendTimeout = 50 * time.Millisecond
+	defer func() { sendTimeout = old }()
+	db := newDB(t)
+	start := func(conn transport.Conn) *peer {
+		ctx, cancel := context.WithCancel(db.ctx)
+		t.Cleanup(cancel)
+		p := &peer{db: db, conn: conn, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+		go p.writeLoop()
+		return p
+	}
+
+	fast := newFakeConn(false)
+	p := start(fast)
+	for i := range 5 { // many sends, each well within the timeout
+		p.send([]byte(`{"#":"` + strconv.Itoa(i) + `"}`))
+		<-fast.frames
+		time.Sleep(20 * time.Millisecond)
+	}
+	if p.ctx.Err() != nil {
+		t.Fatal("a peer that sends in time was dropped")
+	}
+
+	stuck := start(newFakeConn(true)) // Send blocks until its context ends
+	stuck.send([]byte(`{"#":"x"}`))
+	select {
+	case <-stuck.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a peer stuck in Send was not dropped")
+	}
+}

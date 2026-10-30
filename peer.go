@@ -52,6 +52,10 @@ const (
 	maxBatch = 100
 )
 
+// sendTimeout is how long sending one frame may take before the peer is
+// dropped.
+var sendTimeout = 30 * time.Second
+
 // slowPeer is how long a peer's queue may stay full before it is dropped.
 var slowPeer = 5 * time.Second
 
@@ -167,6 +171,13 @@ func (p *peer) readLoop() {
 func (p *peer) writeLoop() {
 	t := time.NewTicker(p.db.beat)
 	defer t.Stop()
+	// One context for every send, cancelled by a timer if a send takes too
+	// long: no context and timer to allocate per frame.
+	ctx, cancel := context.WithCancel(p.ctx)
+	defer cancel()
+	deadline := time.AfterFunc(sendTimeout, cancel)
+	deadline.Stop()
+	defer deadline.Stop()
 	for {
 		var frame []byte
 		select {
@@ -182,16 +193,25 @@ func (p *peer) writeLoop() {
 			case 1:
 				frame = batch[0]
 			default:
-				frame = append([]byte{'['}, batch[0]...)
-				for _, raw := range batch[1:] {
-					frame = append(append(frame, ','), raw...)
+				size := len(batch) + 1 // brackets and commas
+				for _, raw := range batch {
+					size += len(raw)
+				}
+				frame = append(make([]byte, 0, size), '[')
+				for i, raw := range batch {
+					if i > 0 {
+						frame = append(frame, ',')
+					}
+					frame = append(frame, raw...)
 				}
 				frame = append(frame, ']')
 			}
 		}
-		ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+		deadline.Reset(sendTimeout)
 		err := p.conn.Send(ctx, frame)
-		cancel()
+		if !deadline.Stop() { // the timer fired: the send took too long
+			err = context.DeadlineExceeded
+		}
 		if err != nil {
 			p.close()
 			return
