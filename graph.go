@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"strconv"
 )
 
 // Node is one vertex of the graph: a soul (its globally unique ID) plus
@@ -60,10 +61,7 @@ func (n *Node) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	if tok, err := dec.ReadToken(); err != nil || tok.Kind() != '{' {
 		return fmt.Errorf("gundb: node: not an object")
 	}
-	var meta struct {
-		Soul   string             `json:"#"`
-		States map[string]float64 `json:">"`
-	}
+	var meta nodeMeta
 	hasMeta := false
 	fields := map[string]Value{}
 	for dec.PeekKind() != '}' {
@@ -73,12 +71,12 @@ func (n *Node) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		}
 		k := name.String()
 		if k == "_" {
-			raw, err := dec.ReadValue()
+			meta = nodeMeta{} // a repeated "_" replaces the first
+			ok, err := meta.read(dec)
 			if err != nil {
 				return fmt.Errorf("gundb: node: %w", err)
 			}
-			meta.Soul, meta.States = "", nil // a repeated "_" replaces the first
-			hasMeta = json.Unmarshal(raw, &meta) == nil
+			hasMeta = ok
 			continue
 		}
 		v, err := readValue(dec)
@@ -104,8 +102,152 @@ func (n *Node) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return nil
 }
 
-// readValue reads one field value. Scalars are taken from their token;
-// objects (links) and anything else go through decodeValue.
+// nodeMeta is a node's "_": {"#": soul, ">": {field: state}}.
+type nodeMeta struct {
+	Soul   string
+	States map[string]float64
+}
+
+// read reads "_" from its tokens. It accepts what json.Unmarshal into
+// {Soul string `json:"#"`; States map[string]float64 `json:">"`} accepts,
+// with the same results: ok is false where that would fail on a type, and
+// err is set only for JSON that is not well formed.
+func (m *nodeMeta) read(dec *jsontext.Decoder) (ok bool, err error) {
+	if dec.PeekKind() != '{' {
+		_, err := dec.ReadValue()
+		return false, err // not an object: no metadata
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return false, err
+	}
+	ok = true
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return false, err
+		}
+		switch name.String() {
+		case "#":
+			switch dec.PeekKind() {
+			case '"':
+				tok, err := dec.ReadToken()
+				if err != nil {
+					return false, err
+				}
+				m.Soul = tok.String()
+				continue
+			case 'n': // null leaves it as it was
+			default:
+				ok = false
+			}
+		case ">":
+			switch dec.PeekKind() {
+			case '{':
+				statesOK, err := m.readStates(dec)
+				if err != nil {
+					return false, err
+				}
+				ok = ok && statesOK
+				continue
+			case 'n':
+				m.States = nil
+			default:
+				ok = false
+			}
+		}
+		if _, err := dec.ReadValue(); err != nil {
+			return false, err
+		}
+	}
+	_, err = dec.ReadToken()
+	return ok, err
+}
+
+// readStates reads {field: state} into m.States, merging like json does
+// when ">" repeats. ok is false if a state is not a number.
+func (m *nodeMeta) readStates(dec *jsontext.Decoder) (ok bool, err error) {
+	if _, err := dec.ReadToken(); err != nil {
+		return false, err
+	}
+	if m.States == nil {
+		m.States = map[string]float64{}
+	}
+	ok = true
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return false, err
+		}
+		k := name.String()
+		switch dec.PeekKind() {
+		case '0':
+			tok, err := dec.ReadToken()
+			if err != nil {
+				return false, err
+			}
+			if f, err := strconv.ParseFloat(tok.String(), 64); err == nil {
+				m.States[k] = f
+			} else {
+				ok = false // out of range, as json reports it
+			}
+		case 'n':
+			if _, err := dec.ReadToken(); err != nil {
+				return false, err
+			}
+			m.States[k] = 0 // json stores the zero value for null
+		default:
+			ok = false
+			if _, err := dec.ReadValue(); err != nil {
+				return false, err
+			}
+		}
+	}
+	_, err = dec.ReadToken()
+	return ok, err
+}
+
+// readLink reads an object value, which must be a link: {"#": "soul"},
+// with the same rules as decodeValue.
+func readLink(dec *jsontext.Decoder) (Value, error) {
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	var soul string
+	isSoul, other := false, false
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		key := name.String() // a token is only valid until the next read
+		if key == "#" && dec.PeekKind() == '"' {
+			tok, err := dec.ReadToken()
+			if err != nil {
+				return nil, err
+			}
+			soul, isSoul = tok.String(), true // a repeated "#": the last one counts
+			continue
+		}
+		if key == "#" {
+			soul, isSoul = "", false // the last "#" is not a string
+		} else {
+			other = true
+		}
+		if _, err := dec.ReadValue(); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	if other || !isSoul || soul == "" {
+		return nil, errors.New("gundb: object value is not a link")
+	}
+	return Link{Soul: soul}, nil
+}
+
+// readValue reads one field value. Scalars are taken from their token,
+// links from theirs; anything else goes through decodeValue.
 func readValue(dec *jsontext.Decoder) (Value, error) {
 	switch dec.PeekKind() {
 	case 'n', 't', 'f', '"', '0':
@@ -126,6 +268,8 @@ func readValue(dec *jsontext.Decoder) (Value, error) {
 			return nil, fmt.Errorf("gundb: invalid number: %w", err)
 		}
 		return Number(f), nil
+	case '{':
+		return readLink(dec)
 	}
 	raw, err := dec.ReadValue()
 	if err != nil {
