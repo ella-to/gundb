@@ -444,6 +444,7 @@ func check(err error) {
 | remove a friend           | `friends.Get("bob").Put(ctx, nil)`                   |
 | read all friends          | `friends.Once[map[string]User](ctx)`                 |
 | watch the list            | `friends.Map().On(func(key string, u *User) {...})`  |
+| list friends, unloaded    | `friends.Links(ctx)` (see [Large lists](#large-lists-read-the-links-load-what-you-need)) |
 
 Things to know:
 
@@ -457,6 +458,130 @@ Things to know:
   `Put(nil)` instead.
 - A removed item stays in the node as a tombstone (`null`), like in GUN.js,
   so every peer learns about the removal. `Once` and `Map().On` skip it.
+
+### Large lists: read the links, load what you need
+
+`Once` and `Map().On` on a list load every item. Each item is its own node, so
+reading a list of 1,000 asks peers for 1,001 nodes, sends all of them over the
+network and keeps all of them in the local store, even if you only show 10.
+The cost grows with the size of the list, not with what you use.
+
+`Links` reads only the list node and returns its links, key -> soul. That one
+read is enough to:
+
+- **count** the items (`len(links)`),
+- **page** through them, loading only the page you show,
+- **check membership** (`_, ok := links[soul]`),
+- **fetch only what's new**: compare against the souls you already have and
+  load the rest.
+
+The example shows the newest 10 messages of a feed of 1,000, both ways:
+
+<!-- example: examples/feed/main.go -->
+```go
+// A large list: show the newest 10 of 1,000 messages without loading them all.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"maps"
+	"net"
+	"net/http"
+	"slices"
+	"time"
+
+	"ella.to/gundb"
+)
+
+type Message struct {
+	Text string `json:"text"`
+}
+
+func main() {
+	ctx := context.Background()
+
+	// A relay that already holds a long feed.
+	relay := gundb.New()
+	defer relay.Close()
+	for i := range 1000 {
+		_, err := relay.Get("feed").Set(ctx, Message{Text: fmt.Sprint("message ", i+1)})
+		check(err)
+	}
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	check(err)
+	go http.Serve(l, relay)
+	peer := "ws://" + l.Addr().String() + "/gun"
+
+	// The slow way: Once loads every message, just to show 10 of them.
+	a := gundb.New(gundb.Options{Peers: []string{peer}})
+	defer a.Close()
+	start := time.Now()
+	all, err := a.Get("feed").Once[map[string]Message](ctx)
+	check(err)
+	fmt.Printf("Once:  loaded %d messages in %v\n", len(all), time.Since(start).Round(time.Millisecond))
+
+	// The fast way: Links reads only the list node, key -> soul.
+	b := gundb.New(gundb.Options{Peers: []string{peer}})
+	defer b.Close()
+	start = time.Now()
+	links, err := b.Get("feed").Links(ctx)
+	check(err)
+
+	// Set souls start with the time they were made, so sorting them sorts
+	// the messages oldest to newest. Take the last 10 and load only those.
+	souls := slices.Sorted(maps.Values(links))
+	newest := souls[max(0, len(souls)-10):]
+	var page []Message
+	for _, soul := range slices.Backward(newest) {
+		m, err := b.Get(soul).Once[Message](ctx)
+		check(err)
+		page = append(page, m)
+	}
+	fmt.Printf("Links: %d messages in the feed, newest %d loaded in %v\n", len(links), len(page), time.Since(start).Round(time.Millisecond))
+	for _, m := range page {
+		fmt.Println(" ", m.Text)
+	}
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+```
+Once:  loaded 1000 messages in 22ms
+Links: 1000 messages in the feed, newest 10 loaded in 4ms
+  message 1000
+  message 999
+  ...
+```
+
+Both clients sit next to the relay on the same machine. Over a real network
+the gap is wider: the `Once` client pays for every message's bytes and every
+peer round trip, the `Links` client for one node plus 10 messages.
+
+Things to know:
+
+- **Order.** Souls made by `Set`, in Go and in GUN.js, start with the time
+  they were made, so sorting them sorts the items oldest to newest. A Go
+  peer keeps that order even for items it makes in the same millisecond;
+  GUN.js only roughly. Across peers the time comes from each writer's
+  clock, so a device with a wrong clock sorts wrong. If exact order
+  matters, choose the keys yourself, for example
+  `feed.Get(key).Put(ctx, db.Get(soul))` with a sortable key, and sort the
+  keys `Links` returns instead of the souls.
+- **One read, not live.** `Links` reads once. To follow a list as it
+  changes, use `Map().On`, which does load every item.
+- **Small lists don't need it.** If you show every item anyway, `Once` is
+  simpler and costs the same.
+- `Node` is the lower-level read under `Links`: the node exactly as stored,
+  with plain values, links as `Link{Soul}`, deleted fields as `Null` and
+  every field's state. Use it for nodes that mix values and links, or to
+  see what was deleted.
 
 ## 5. Sync between peers
 
