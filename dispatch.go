@@ -144,7 +144,13 @@ func (db *DB) handleGet(p *peer, m *message) {
 		return
 	}
 	p.want(q.Soul)
-	n, err := db.store.Get(db.ctx, q.Soul)
+	var n *Node
+	var err error
+	if fr, ok := db.store.(FieldReader); ok && q.Key != "" && q.KeyLex == nil {
+		n, err = fr.GetFields(db.ctx, q.Soul, []string{q.Key}) // one field: read only it
+	} else {
+		n, err = db.store.Get(db.ctx, q.Soul)
+	}
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return

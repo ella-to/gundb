@@ -287,3 +287,36 @@ func BenchmarkCheckSEA(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkGetFieldLargeNode is a relay answering a get for one field of a
+// node with n fields.
+func BenchmarkGetFieldLargeNode(b *testing.B) {
+	for _, n := range []int{10, 10000} {
+		b.Run("fields="+strconv.Itoa(n), func(b *testing.B) {
+			db := New()
+			defer db.Close()
+			fields := make(map[string]any, n)
+			for i := range n {
+				fields["k"+strconv.Itoa(i)] = i
+			}
+			if err := db.Get("list").Put(context.Background(), fields); err != nil {
+				b.Fatal(err)
+			}
+			conn := &discardConn{*newFakeConn(false)}
+			ctx, cancel := context.WithCancel(db.ctx)
+			defer cancel()
+			p := &peer{db: db, conn: conn, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+			go p.writeLoop()
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				msgs, err := readFrame([]byte(`{"#":"g` + strconv.Itoa(i) + `","get":{"#":"list",".":"k7"}}`))
+				if err != nil {
+					b.Fatal(err)
+				}
+				db.handle(p, &msgs[0])
+			}
+		})
+	}
+}

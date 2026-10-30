@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -507,5 +509,56 @@ func TestClose(t *testing.T) {
 	eventually(t, func() bool { return len(b.Peers()) == 0 })
 	if err := a.Get("x").Put(t.Context(), map[string]any{"v": 1}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("want ErrClosed, got %v", err)
+	}
+}
+
+// TestGetOneField checks the answers to gets for one field of a node.
+func TestGetOneField(t *testing.T) {
+	db := newDB(t)
+	if err := db.Get("n").Put(t.Context(), map[string]any{"a": 1, "b": 2, "c": 3}); err != nil {
+		t.Fatal(err)
+	}
+	conn := newFakeConn(false)
+	ctx, cancel := context.WithCancel(db.ctx)
+	defer cancel()
+	p := &peer{db: db, conn: conn, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+	go p.writeLoop()
+	ask := func(id, get string) message {
+		t.Helper()
+		msgs, err := readFrame([]byte(`{"#":"` + id + `","get":` + get + `}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.handle(p, &msgs[0])
+		select {
+		case frame := <-conn.frames:
+			reply, err := readFrame(frame)
+			if err != nil || len(reply) != 1 || reply[0].Ack != id {
+				t.Fatalf("reply to %s: %s (%v)", id, frame, err)
+			}
+			return reply[0]
+		case <-time.After(3 * time.Second):
+			t.Fatalf("no reply to %s", id)
+		}
+		panic("unreachable")
+	}
+	fields := func(m message, soul string) []string {
+		if m.Put[soul] == nil {
+			return nil
+		}
+		return slices.Sorted(maps.Keys(m.Put[soul].Fields))
+	}
+
+	if got := fields(ask("g1", `{"#":"n",".":"b"}`), "n"); !slices.Equal(got, []string{"b"}) {
+		t.Fatalf("one field: got %v", got)
+	}
+	if m := ask("g2", `{"#":"n",".":"missing"}`); m.Put != nil {
+		t.Fatalf("missing field: got %v", m.Put)
+	}
+	if m := ask("g3", `{"#":"nobody",".":"a"}`); m.Put != nil {
+		t.Fatalf("missing soul: got %v", m.Put)
+	}
+	if got := fields(ask("g4", `{"#":"n",".":{">":"b"}}`), "n"); !slices.Equal(got, []string{"b", "c"}) {
+		t.Fatalf("lex on fields: got %v", got)
 	}
 }
