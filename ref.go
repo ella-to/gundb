@@ -89,6 +89,17 @@ func (r *Ref) write(ctx context.Context, g graph, ack bool) error {
 // keyed by its soul; a *Ref is added as a link; anything else is stored
 // under a random key. Read the list with Map().On or Once[map[string]T].
 func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
+	// The item and the link to it are one write.
+	g := graph{}
+	item, err := r.setTo(ctx, g, v, r.db.state.Next())
+	if err != nil {
+		return nil, err
+	}
+	return item, r.write(ctx, g, false)
+}
+
+// setTo adds to g the nodes that Set(v) writes, and returns the new item.
+func (r *Ref) setTo(ctx context.Context, g graph, v any, state float64) (*Ref, error) {
 	t, err := toTree(v)
 	if err != nil {
 		return nil, err
@@ -96,11 +107,8 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 	m, isObj := t.(map[string]any)
 	if !isObj {
 		item := r.Get(uuid())
-		return item, item.Put(ctx, t)
+		return item, item.addTo(ctx, g, t, state)
 	}
-	// The item and the link to it are one write.
-	g := graph{}
-	state := r.db.state.Next()
 	soul, isLink := linkOf(m)
 	if !isLink {
 		if soul = metaSoul(m); soul == "" {
@@ -116,7 +124,7 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 	if err := r.Get(soul).addTo(ctx, g, Link{Soul: soul}, state); err != nil {
 		return nil, err
 	}
-	return r.root(soul), r.write(ctx, g, false)
+	return r.root(soul), nil
 }
 
 // Once reads the current value into T. Data not yet known locally is
