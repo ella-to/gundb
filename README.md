@@ -56,6 +56,31 @@ program in [`examples/`](examples/).
   The transport is `transport.Conn`, with WebSocket built in
   (`transport/ws`).
 
+## Command line
+
+`cmd/gundb` is a relay server and a client for any GUN peer, Go or JS:
+
+```sh
+go install ella.to/gundb/cmd/gundb@latest
+
+gundb server                                   # relay on http://localhost:8765/gun, in memory
+gundb server --store pebble --data ./data --peers http://other:8765/gun
+
+gundb put users/1/name 'Ali'                   # write, and wait for the server
+gundb get users/1                              # read, as JSON
+gundb set todos '{"title":"buy milk"}'         # add to a list
+gundb sub todos --map                          # print every change, Ctrl-C to stop
+gundb get users -H "Authorization=Bearer 1234" # headers for your auth middleware
+
+gundb user create -u ali -p secret123          # SEA user with its own key pair
+gundb put '~/notes/1' 'secret' --enc -u ali -p secret123
+gundb get '~/notes' --dec -u ali -p secret123
+```
+
+`--addr` (or `GUNDB_ADDR`) picks the server, and `--timeout` bounds each
+command (default 2s; 0 waits forever). Run `gundb <command> --help` for
+the rest.
+
 ## Layout
 
 | Path               | What                                                  |
@@ -68,6 +93,7 @@ program in [`examples/`](examples/).
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `storage/idbstore` | IndexedDB store for browsers (js/wasm only)           |
+| `cmd/gundb`        | the `gundb` command: relay server and client          |
 | `examples/`        | runnable programs used by the guide                   |
 | `loadtest/`        | load generator: throughput, latency, cost per user    |
 | `interop/`         | tests against the JavaScript GUN                      |

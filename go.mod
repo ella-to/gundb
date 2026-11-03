@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/coder/websocket v1.8.14
+	github.com/urfave/cli/v3 v3.14.0
 )
 
 require (
