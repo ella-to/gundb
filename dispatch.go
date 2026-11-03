@@ -122,7 +122,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 		return
 	}
 	raw := db.encode(m)
-	memo := map[string]readable{}
+	memo := &fanout{}
 	for _, q := range db.recipients(changed) {
 		if q != p && !m.sentTo(q.getPID()) {
 			db.sendTo(q, m, raw, memo)
@@ -140,8 +140,10 @@ func (db *DB) handleGet(p *peer, m *message) {
 		db.reply(p, &message{Ack: m.ID})
 		return
 	}
-	if !db.allowRead(p, q.Soul) {
-		db.reply(p, &message{Ack: m.ID, Err: errJSON(fmt.Errorf("%w: %q may not read %s", ErrForbidden, p.user, q.Soul))})
+	// A get for one field is refused up front; any other get is answered
+	// with the fields p may read, so a node with none is not found.
+	if q.Key != "" && q.KeyLex == nil && !db.allowRead(p, q.Soul, q.Key) {
+		db.reply(p, &message{Ack: m.ID, Err: errJSON(fmt.Errorf("%w: may not read %s.%s", ErrForbidden, q.Soul, q.Key))})
 		return
 	}
 	p.want(q.Soul)
@@ -163,6 +165,7 @@ func (db *DB) handleGet(p *peer, m *message) {
 				delete(n.States, k)
 			}
 		}
+		db.readableNode(p, n)
 		if len(n.Fields) > 0 {
 			db.reply(p, &message{Ack: m.ID, Put: graph{q.Soul: n}})
 			return
@@ -195,13 +198,16 @@ func (db *DB) handleSoulLex(p *peer, m *message) {
 	// one chunk of nodes is held at a time.
 	var chunk graph
 	for _, soul := range souls {
-		if !l.matchSoul(soul) || !db.allowRead(p, soul) {
+		if !l.matchSoul(soul) {
 			continue
 		}
 		n, err := db.store.Get(db.ctx, soul)
 		if err != nil {
 			db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 			return
+		}
+		if n != nil {
+			db.readableNode(p, n)
 		}
 		if n == nil || len(n.Fields) == 0 {
 			continue

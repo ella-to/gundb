@@ -16,33 +16,76 @@ import (
 	"ella.to/gundb/transport"
 )
 
-// authRelay is a relay where users/<name>/... is writable by <name> only,
-// secrets/<name> is readable by <name> only, and tokens are "tok-<name>".
-func authRelay(t *testing.T) (*DB, string) {
-	t.Helper()
-	relay := New(Options{
-		Wait: 300 * time.Millisecond,
-		Authenticate: func(r *http.Request) (string, string, error) {
-			user, ok := strings.CutPrefix(r.URL.Query().Get("token"), "tok-")
-			if !ok {
-				return "", "", errors.New("bad token")
-			}
-			return user, "", nil
-		},
-		CanWrite: func(user, soul, field string) bool {
+// session is what the tests' HTTP middleware stores in the request
+// context, the way an app stores its own session type.
+type session struct{ user, device string }
+
+type sessionKey struct{}
+
+func withSession(ctx context.Context, s *session) context.Context {
+	return context.WithValue(ctx, sessionKey{}, s)
+}
+
+// userOf returns the user of the connection behind ctx, "" if anonymous.
+func userOf(ctx context.Context) string {
+	if s, _ := ctx.Value(sessionKey{}).(*session); s != nil {
+		return s.user
+	}
+	return ""
+}
+
+// requireToken is HTTP middleware: tokens are "tok-<name>", anything else
+// is refused with 401, and the session goes into the request's context.
+func requireToken(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := strings.CutPrefix(r.URL.Query().Get("token"), "tok-")
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		s := &session{user: user, device: r.URL.Query().Get("device")}
+		next.ServeHTTP(w, r.WithContext(withSession(r.Context(), s)))
+	})
+}
+
+// authRules are the rules of authRelay:
+//   - users/<name>/... and secrets/<name>/... are writable by <name> only;
+//   - secrets/<name> is readable by <name> only;
+//   - members is a private list: each user sees, and writes, only their
+//     own entry, members.<name>, and the node it links to, members/<name>.
+func authRules() Options {
+	return Options{
+		CanWrite: func(ctx context.Context, soul, field string) bool {
 			path := strings.Split(soul+"/"+field, "/")
-			if path[0] == "users" || path[0] == "secrets" {
-				return path[1] == user
+			switch path[0] {
+			case "users", "secrets", "members":
+				return path[1] == userOf(ctx)
 			}
 			return true
 		},
-		CanRead: func(user, soul string) bool {
+		CanRead: func(ctx context.Context, soul, field string) bool {
+			user := userOf(ctx)
+			if soul == "members" {
+				return field == user
+			}
 			path := strings.Split(soul, "/")
-			return path[0] != "secrets" || len(path) < 2 || path[1] == user
+			switch path[0] {
+			case "secrets", "members":
+				return len(path) < 2 || path[1] == user
+			}
+			return true
 		},
-	})
+	}
+}
+
+// authRelay serves a DB with authRules behind requireToken.
+func authRelay(t *testing.T) (*DB, string) {
+	t.Helper()
+	o := authRules()
+	o.Wait = 300 * time.Millisecond
+	relay := New(o)
 	t.Cleanup(func() { relay.Close() })
-	srv := httptest.NewServer(relay)
+	srv := httptest.NewServer(requireToken(relay))
 	t.Cleanup(srv.Close)
 	return relay, srv.URL + "/gun"
 }
@@ -57,7 +100,7 @@ func client(t *testing.T, relay *DB, url, token string) *DB {
 	return db
 }
 
-func TestAuthenticateRefusesBadTokens(t *testing.T) {
+func TestMiddlewareRefusesBadTokens(t *testing.T) {
 	relay, url := authRelay(t)
 	db := New(Options{Peers: []string{url + "?token=nope"}})
 	defer db.Close()
@@ -145,7 +188,7 @@ func TestCanReadFiltersPushes(t *testing.T) {
 func TestForgedRepliesAreDropped(t *testing.T) {
 	relay, _ := authRelay(t)
 	conn := newScriptConn()
-	go relay.AttachAs(conn, "mallory", "")
+	go relay.Attach(withSession(t.Context(), &session{user: "mallory"}), conn)
 	eventually(t, func() bool { return len(relay.Peers()) == 1 })
 
 	go relay.Get("users").Get("ali").Get("name").Once[string](context.Background())
@@ -203,16 +246,16 @@ func (c *scriptConn) Close() error {
 func (c *scriptConn) RemoteAddr() string { return "script" }
 
 // TestCanReadPerUserInFanout checks that a put going to many connections
-// is filtered for each user: connections of one user share a view, and
-// another user's view is not mixed in.
+// is filtered for each of them: connections that see the same fields share
+// a view, and another view is not mixed in.
 func TestCanReadPerUserInFanout(t *testing.T) {
-	db := New(Options{CanRead: func(user, soul string) bool { return soul != "secret" || user == "admin" }})
+	db := New(Options{CanRead: func(ctx context.Context, soul, _ string) bool { return soul != "secret" || userOf(ctx) == "admin" }})
 	t.Cleanup(func() { db.Close() })
 	connect := func(user string) *fakeConn {
 		conn := newFakeConn(false)
 		ctx, cancel := context.WithCancel(db.ctx)
 		t.Cleanup(cancel)
-		p := &peer{db: db, conn: conn, user: user, ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
+		p := &peer{db: db, conn: conn, rules: withSession(ctx, &session{user: user}), ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}
 		go p.writeLoop()
 		p.want("news")
 		p.want("secret")
@@ -229,7 +272,7 @@ func TestCanReadPerUserInFanout(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(db.ctx)
 	defer cancel()
-	db.handle(&peer{db: db, conn: writer, user: "writer", ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}, &msgs[0])
+	db.handle(&peer{db: db, conn: writer, rules: withSession(ctx, &session{user: "writer"}), ctx: ctx, cancel: cancel, outWake: make(chan struct{}, 1), wants: map[string]bool{}}, &msgs[0])
 
 	souls := func(conn *fakeConn) []string {
 		t.Helper()
@@ -257,5 +300,108 @@ func TestCanReadPerUserInFanout(t *testing.T) {
 		if got := souls(bob); !slices.Equal(got, []string{"news"}) {
 			t.Fatalf("bob's connection %d got %v", i+1, got)
 		}
+	}
+}
+
+// A private list: each user reads their own entry of members, by path or
+// by soul, while listing members, or its souls, shows nobody else.
+func TestCanReadFieldsKeepAListPrivate(t *testing.T) {
+	ctx := t.Context()
+	relay, url := authRelay(t)
+	ali, bob := client(t, relay, url, "tok-ali"), client(t, relay, url, "tok-bob")
+	if err := ali.Get("members").Get("ali").Get("name").PutAck(ctx, "Ali"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.Get("members").Get("bob").Get("name").PutAck(ctx, "Bob"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.Get("members").Get("ali").Get("name").PutAck(ctx, "Mallory"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("bob writing ali's entry: %v", err)
+	}
+
+	fresh := client(t, relay, url, "tok-ali") // nothing cached
+	if name, err := fresh.Get("members").Get("ali").Get("name").Once[string](ctx); err != nil || name != "Ali" {
+		t.Fatalf("ali reading her own entry: %q, %v", name, err)
+	}
+	if name, err := fresh.Get("members/ali").Get("name").Once[string](ctx); err != nil || name != "Ali" {
+		t.Fatalf("ali reading her node by soul: %q, %v", name, err)
+	}
+	if name, err := fresh.Get("members").Get("bob").Get("name").Once[string](ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ali reading bob's entry: %q, %v", name, err)
+	}
+	if name, err := fresh.Get("members/bob").Get("name").Once[string](ctx); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("ali reading bob's node by soul: %q, %v", name, err)
+	}
+	list, err := fresh.Get("members").Once[map[string]any](ctx)
+	if err != nil || !slices.Equal(slices.Sorted(maps.Keys(list)), []string{"ali"}) {
+		t.Fatalf("ali listing members: %v, %v", list, err)
+	}
+	souls, err := fresh.Souls(ctx, Lex{Prefix: "members"})
+	if err != nil || !slices.Equal(souls, []string{"members", "members/ali"}) {
+		t.Fatalf("ali listing souls: %q, %v", souls, err)
+	}
+}
+
+// Live updates to a private list carry only the fields each reader may see.
+func TestCanReadFieldsFilterPushes(t *testing.T) {
+	ctx := t.Context()
+	relay, url := authRelay(t)
+	ali, bob := client(t, relay, url, "tok-ali"), client(t, relay, url, "tok-bob")
+	got := make(chan []string, 10)
+	off := ali.Get("members").On(func(list map[string]any) { got <- slices.Sorted(maps.Keys(list)) })
+	defer off()
+	if err := ali.Get("members").Get("ali").Get("name").PutAck(ctx, "Ali"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.Get("members").Get("bob").Get("name").PutAck(ctx, "Bob"); err != nil {
+		t.Fatal(err)
+	}
+	// bob's entry is the newer write; once ali has seen hers, give his a
+	// moment to (not) arrive.
+	eventually(t, func() bool {
+		select {
+		case keys := <-got:
+			return slices.Equal(keys, []string{"ali"})
+		default:
+			return false
+		}
+	})
+	time.Sleep(200 * time.Millisecond)
+	if n, _ := ali.store.Get(ctx, "members"); n == nil || n.Fields["bob"] != nil {
+		t.Fatalf("ali holds %+v", n)
+	}
+	if n, _ := ali.store.Get(ctx, "members/bob"); n != nil {
+		t.Fatalf("ali received bob's node: %+v", n)
+	}
+}
+
+// The rules see the connection's own context, and cancelling that context
+// drops the connection: a way to log a user out of a live connection.
+func TestRulesSeeTheConnectionContext(t *testing.T) {
+	var mu sync.Mutex
+	var wrote []string
+	relay := New(Options{CanWrite: func(ctx context.Context, soul, field string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		wrote = append(wrote, userOf(ctx)+":"+soul+"."+field)
+		return true
+	}})
+	t.Cleanup(func() { relay.Close() })
+	conn := newScriptConn()
+	ctx, logout := context.WithCancel(withSession(t.Context(), &session{user: "ali"}))
+	done := make(chan struct{})
+	go func() { relay.Attach(ctx, conn); close(done) }()
+	eventually(t, func() bool { return len(relay.Peers()) == 1 })
+
+	conn.recv <- []byte(`{"#":"w1","put":{"n":{"_":{"#":"n",">":{"v":1}},"v":1}}}`)
+	eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(wrote) == 1 })
+	if wrote[0] != "ali:n.v" {
+		t.Fatalf("CanWrite saw %q", wrote)
+	}
+	logout()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelling the context did not drop the connection")
 	}
 }

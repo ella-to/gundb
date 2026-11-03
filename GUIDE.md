@@ -851,13 +851,20 @@ func main() {
 
 ## 8. Permissions: who can read and write
 
-A relay decides what each connected user may do. Three `Options` set it up:
+A relay decides what each connected user may do. Who is connecting is ordinary HTTP: a relay is an `http.Handler`, so put your usual authentication middleware in front of it. The middleware refuses a request it doesn't like (401), and stores the session in the request's context for the rest:
+
+```go
+http.Handle("/gun", authenticate(relay)) // authenticate: func(http.Handler) http.Handler
+```
+
+That context, `r.Context()` of the WebSocket upgrade, becomes the connection's context. It is what two `Options` get:
 
 | Option | Called | Decides |
 | ------ | ------ | ------- |
-| `Authenticate(r *http.Request) (user, customID, error)` | once per connection, on the WebSocket upgrade | who is connecting: read a token, cookie or header; `""` is anonymous, an error refuses the connection (401). `customID` is your own label for the connection (e.g. a device ID), reported in `PeerInfo` |
-| `CanWrite(user, soul, field) bool` | for every field of every incoming put | whether `user` may write it; one denied field rejects the whole put, and the writer's `PutAck` returns `gundb.ErrForbidden` |
-| `CanRead(user, soul) bool` | for every get, and for every node the relay sends out | whether `user` may see the node; denied nodes are never sent, so `Once` returns `gundb.ErrNotFound` and `On` never fires |
+| `CanWrite(ctx, soul, field) bool` | for every field of every incoming put | whether the connection may write it; one denied field rejects the whole put, and the writer's `PutAck` returns `gundb.ErrForbidden` |
+| `CanRead(ctx, soul, field) bool` | for every field of every node the relay sends out | whether the connection may see it; denied fields are never sent, and a node with none left is not found: `Once` returns `gundb.ErrNotFound` and `On` never fires |
+
+In `CanRead`, `ctx` is always the reader's: when Ali's write goes out to Bob, Bob's rules decide what he gets.
 
 Rules see souls and fields, not chain paths, so it helps to know how a path is stored. This write
 
@@ -874,7 +881,7 @@ touches these nodes:
 | `users/ali/messages` | `m1` | link to `users/ali/messages/m1` |
 | `users/ali/messages/m1` | `text` | `"hi"` |
 
-So a write rule that checks `soul + "/" + field` sees the path `users/ali/...` at every level, including the `users` → `ali` link, which stops Bob from pointing Ali's name at a node of his own. The example gives every user write access to their own `users/<name>/...`, read access to everything except `users/<name>/private`, and lets anonymous users read only.
+So a rule that checks `soul + "/" + field` sees the path `users/ali/...` at every level. For writes, that includes the `users` → `ali` link, which stops Bob from pointing Ali's name at a node of his own; for reads, it hides the link to a private node as well as the node. The example gives every user write access to their own `users/<name>/...`, read access to everything except `users/<name>/private`, and lets anonymous users read only.
 
 <!-- example: examples/auth/main.go -->
 ```go
@@ -902,6 +909,33 @@ type Message struct {
 // tokens stands in for your real login: sessions, JWTs, API keys...
 var tokens = map[string]string{"tok-ali": "ali", "tok-bob": "bob"}
 
+// userKey is the context key the middleware stores the user under.
+type userKey struct{}
+
+// userOf returns the user behind a connection's context, "" if anonymous.
+func userOf(ctx context.Context) string {
+	user, _ := ctx.Value(userKey{}).(string)
+	return user
+}
+
+// authenticate is plain HTTP middleware: who is connecting? Browsers
+// cannot set WebSocket headers, so the token comes in the URL. No token:
+// an anonymous, read-only user. A bad token: no connection at all.
+func authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if token := r.URL.Query().Get("token"); token != "" {
+			user, ok := tokens[token]
+			if !ok {
+				http.Error(w, "unknown token", http.StatusUnauthorized)
+				return
+			}
+			ctx = context.WithValue(ctx, userKey{}, user)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // owner returns who a path belongs to: "users/ali/messages/m1" -> "ali".
 func owner(path string) string {
 	rest, ok := strings.CutPrefix(path, "users/")
@@ -915,31 +949,25 @@ func owner(path string) string {
 func main() {
 	ctx := context.Background()
 
+	// The rules get the connection's context: r.Context() of the WebSocket
+	// request, with the user authenticate stored in it.
 	relay := gundb.New(gundb.Options{
-		// Who is connecting? Browsers cannot set WebSocket headers, so the
-		// token comes in the URL. No token: an anonymous, read-only user.
-		Authenticate: func(r *http.Request) (string, string, error) {
-			token := r.URL.Query().Get("token")
-			if token == "" {
-				return "", "", nil
-			}
-			if user, ok := tokens[token]; ok {
-				return user, "", nil
-			}
-			return "", "", errors.New("unknown token")
-		},
 		// Write: users/<name>/... belongs to <name>. The check is on
 		// soul + "/" + field, so the link users -> ali is protected too.
-		CanWrite: func(user, soul, field string) bool {
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user := userOf(ctx)
 			if o := owner(soul + "/" + field); o != "" {
 				return o == user
 			}
 			return user != "" // anything else: any logged-in user
 		},
-		// Read: everything, except users/<name>/private.
-		CanRead: func(user, soul string) bool {
-			if o := owner(soul); o != "" && strings.HasPrefix(soul, "users/"+o+"/private") {
-				return o == user
+		// Read: everything, except users/<name>/private. Checking
+		// soul + "/" + field hides the link users/ali -> private as well as
+		// the node it points to.
+		CanRead: func(ctx context.Context, soul, field string) bool {
+			path := soul + "/" + field
+			if o := owner(path); o != "" && strings.HasPrefix(path, "users/"+o+"/private") {
+				return o == userOf(ctx)
 			}
 			return true
 		},
@@ -947,7 +975,7 @@ func main() {
 	defer relay.Close()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	check(err)
-	go http.Serve(l, relay)
+	go http.Serve(l, authenticate(relay))
 	url := "ws://" + l.Addr().String() + "/gun"
 
 	ali := gundb.New(gundb.Options{Peers: []string{url + "?token=tok-ali"}})
@@ -987,7 +1015,7 @@ func check(err error) {
 
 The token travels with the WebSocket upgrade request.
 
-- **Browsers** cannot set headers on a WebSocket, so put the token in the URL, `Gun(['https://example.com/gun?token=' + token])`, or rely on a cookie: same-site cookies are sent with the upgrade, so `Authenticate` can read `r.Cookie("session")`.
+- **Browsers** cannot set headers on a WebSocket, so put the token in the URL, `Gun(['https://example.com/gun?token=' + token])`, or rely on a cookie: same-site cookies are sent with the upgrade, so your middleware can read `r.Cookie("session")`.
 - **Go clients** can use the URL the same way, or send a header through the dialer:
 
 ```go
@@ -999,14 +1027,14 @@ db := gundb.New(gundb.Options{
 })
 ```
 
-- **Other transports**: identify the user yourself and hand the connection over with `db.AttachAs(conn, user, customID)`.
+- **Other transports**: identify the user yourself, store them in a context, and hand the connection over with `db.Attach(ctx, conn)`. That ctx is the connection's context, like `r.Context()` above.
 
 ### Example: a chat with user names and passwords
 
 The whole flow end to end. The client sends a user name and password to a normal HTTP endpoint and gets a token back. It connects to the relay with that token, and from then on the relay knows who it is.
 
 1. **Log in.** `POST /login` checks the password and returns a random token, remembered in `sessions`.
-2. **Connect.** The client dials `/gun?token=<token>`. `Authenticate` looks the token up; an unknown token refuses the connection, so only logged-in users get in at all.
+2. **Connect.** The client dials `/gun?token=<token>`. The `requireLogin` middleware looks the token up and stores the user in the request's context; an unknown token refuses the connection, so only logged-in users get in at all.
 3. **Post.** `CanWrite` lets each user write only under `chat/<their name>/...`, so nobody can post as someone else. Reading is open to every logged-in user.
 
 <!-- example: examples/login/main.go -->
@@ -1064,25 +1092,34 @@ func login(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, token)
 }
 
+// userKey is the context key requireLogin stores the user under.
+type userKey struct{}
+
+// requireLogin is HTTP middleware for authentication: who is connecting?
+// The token comes in the URL (browsers cannot set WebSocket headers). No
+// valid token, no connection: only logged-in users can read or post.
+func requireLogin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		user, ok := sessions[r.URL.Query().Get("token")]
+		mu.Unlock()
+		if !ok {
+			http.Error(w, "not logged in", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
+	})
+}
+
 func main() {
 	ctx := context.Background()
 
 	relay := gundb.New(gundb.Options{
-		// Authentication: who is connecting? The token comes in the URL
-		// (browsers cannot set WebSocket headers). No valid token, no
-		// connection: only logged-in users can read or post.
-		Authenticate: func(r *http.Request) (string, string, error) {
-			mu.Lock()
-			user, ok := sessions[r.URL.Query().Get("token")]
-			mu.Unlock()
-			if !ok {
-				return "", "", errors.New("not logged in")
-			}
-			return user, "", nil
-		},
 		// Authorization: what may they do? Messages live at
-		// chat/<user>/<id>, and only <user> may write there.
-		CanWrite: func(user, soul, field string) bool {
+		// chat/<user>/<id>, and only <user> may write there. The user is
+		// the one requireLogin stored in the connection's context.
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user, _ := ctx.Value(userKey{}).(string)
 			path := strings.Split(soul+"/"+field, "/") // chat, ali, m1, text
 			return path[0] == "chat" && path[1] == user
 		},
@@ -1091,7 +1128,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /login", login)
-	mux.Handle("/gun", relay)
+	mux.Handle("/gun", requireLogin(relay))
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	check(err)
 	go http.Serve(l, mux)
@@ -1156,46 +1193,52 @@ const gun = Gun([location.origin + '/gun?token=' + encodeURIComponent(token)]);
 gun.get('chat').get(user).get(Date.now().toString()).put({ text: 'hello' });
 ```
 
-To log out, delete the token from `sessions`. The open connection stays authenticated until it closes, because `Authenticate` runs once per connection. In a real app, also give tokens an expiry, or use a signed cookie or JWT instead of the in-memory map.
+To log out, delete the token from `sessions`. That stops new connections; an open one keeps the user its middleware stored. To end those too, either:
+
+- **cancel the connection's context.** A connection lasts until its context is done, so middleware that derives a cancellable context per session (`context.WithCancel(r.Context())`) and keeps the cancel function with the session can drop every connection of that session at logout; or
+- **store a pointer to the session** in the context, not a copy, and have the rules check it (`s.Revoked()`): the connection stays open but may no longer read or write.
+
+In a real app, also give tokens an expiry, or use a signed cookie or JWT instead of the in-memory map.
 
 ### Things to know
 
 - **The relay enforces the rules.** They apply to peers that connect to it. The relay's own code (`relay.Get(...).Put`) and the peers it dials itself (`Options.Peers`) are trusted. If you run several relays, give each one the same rules.
 - **Use keyed `Put` for protected data, not `Set`.** `Set` gives each item a random soul, which a path rule cannot tell apart from anyone else's. `messages.Get(id).Put(ctx, msg)` gives it `users/ali/messages/<id>`.
 - **Check `PutAck`.** Like in GUN, a write is applied locally first and then sent. If the relay rejects it, nobody else ever sees it, but the writer's own copy keeps it until it is overwritten. `Put` does not wait for the answer, `PutAck` does.
-- **Reads are per node.** A user who may read `users/ali` sees its `private` field, but that field is only a link: the node it points to, with the content, is never sent. Put private data in its own node, as the example does.
+- **Reads are per field.** A field `CanRead` denies is cut from every node sent, and a node left with no field is as good as missing. A denied field that is a link hides only the link: the node it points to is checked on its own, by its soul. So deny both, as the examples do, or a user who knows the soul can still ask for the node directly.
 - **Clients offer what they read.** When a DB asks a peer for a node, it also sends its own copy, so writes made offline get through (see [section 6](#6-work-offline-sync-later)). For a node the client may only read, the relay rejects that copy like any other forbidden write, and the client ignores the error.
-- **Every message runs your rules.** Keep them fast and in memory: look the session up once in `Authenticate`, not on every `CanRead`.
+- **Every message runs your rules, per field.** Keep them fast and in memory: look the session up once in the middleware and store it in the context, as one value of your own type; don't hit a database from `CanRead`.
+- **The context is the connection's.** It lives as long as the WebSocket, not one request, and a cancelled context closes the connection. Middleware that puts a timeout on `r.Context()` therefore limits how long the connection lasts.
 - **Protect the token.** Use `wss://` (TLS) in production. Tokens in URLs can end up in proxy logs; short-lived tokens or cookies limit the damage.
 - **Rules or SEA?** Rules are enforced by a relay you trust and can also hide data. [SEA](#9-users-and-encryption-sea) is enforced by every peer with signatures, so nobody has to trust a server, but signed data is public unless you encrypt it. They combine: SEA for "only Ali writes her space", rules for what anonymous users may see.
 
 ### Who is online
 
-`Options.OnConnect` and `Options.OnDisconnect` are called for every connection, with a `PeerInfo`:
+`Options.OnConnect` and `Options.OnDisconnect` are called for every connection, with the connection's context (whatever your middleware stored in it) and a `PeerInfo`:
 
 | Field | What it is |
 |---|---|
 | `PeerID` | unique to this connection, chosen by gundb; a reconnect gets a new one |
-| `User`, `CustomID` | what `Authenticate` returned |
 | `URL` | on a client: which of its `Peers` connected |
 | `Remote` | the remote address |
 
-On a client, they tell you when you are online. On a relay, every tab is its own connection, so a user is online while they have at least one. To tell tabs from devices, have the client send a device ID (kept in `localStorage`, which every tab of a browser shares) and return it as the custom ID:
+On a client, they tell you when you are online. On a relay, every tab is its own connection, so a user is online while they have at least one. To tell tabs from devices, have the client send a device ID (kept in `localStorage`, which every tab of a browser shares) and store it in the session next to the user:
 
 ```go
-Authenticate: func(r *http.Request) (string, string, error) {
-	user, err := lookUp(r.URL.Query().Get("token"))
-	return user, r.URL.Query().Get("device"), err
-},
-OnConnect:    func(p gundb.PeerInfo) { /* p.User, p.CustomID, p.PeerID */ },
-OnDisconnect: func(p gundb.PeerInfo) { /* same PeerInfo as its OnConnect */ },
+s := &session{user: user, device: r.URL.Query().Get("device")} // in the middleware
+next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionKey{}, s)))
+
+OnConnect:    func(ctx context.Context, p gundb.PeerInfo) { /* ctx.Value(sessionKey{}), p.PeerID */ },
+OnDisconnect: func(ctx context.Context, p gundb.PeerInfo) { /* same ctx and PeerInfo as its OnConnect */ },
 ```
+
+By `OnDisconnect` the context is done, but the values in it are still there.
 
 [examples/presence](examples/presence/main.go) counts tabs per user and device. Things to know:
 
 - **The hooks run on the connection's goroutine.** Return quickly; hand slow work to another goroutine.
 - **A vanished peer is noticed within about 40s.** A closed tab or a stopped client is reported straight away. A phone that loses Wi-Fi closes nothing, so gundb pings every peer every 20s and drops one that does not answer within 20s. Browsers and Node answer pings on their own.
-- **The custom ID comes from the client.** It labels connections; it proves nothing. Base permissions on the user only.
+- **The device ID comes from the client.** It labels connections; it proves nothing. Base permissions on the user only.
 
 ## 9. Users and encryption (SEA)
 

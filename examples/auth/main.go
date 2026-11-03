@@ -22,6 +22,33 @@ type Message struct {
 // tokens stands in for your real login: sessions, JWTs, API keys...
 var tokens = map[string]string{"tok-ali": "ali", "tok-bob": "bob"}
 
+// userKey is the context key the middleware stores the user under.
+type userKey struct{}
+
+// userOf returns the user behind a connection's context, "" if anonymous.
+func userOf(ctx context.Context) string {
+	user, _ := ctx.Value(userKey{}).(string)
+	return user
+}
+
+// authenticate is plain HTTP middleware: who is connecting? Browsers
+// cannot set WebSocket headers, so the token comes in the URL. No token:
+// an anonymous, read-only user. A bad token: no connection at all.
+func authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if token := r.URL.Query().Get("token"); token != "" {
+			user, ok := tokens[token]
+			if !ok {
+				http.Error(w, "unknown token", http.StatusUnauthorized)
+				return
+			}
+			ctx = context.WithValue(ctx, userKey{}, user)
+		}
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // owner returns who a path belongs to: "users/ali/messages/m1" -> "ali".
 func owner(path string) string {
 	rest, ok := strings.CutPrefix(path, "users/")
@@ -35,31 +62,25 @@ func owner(path string) string {
 func main() {
 	ctx := context.Background()
 
+	// The rules get the connection's context: r.Context() of the WebSocket
+	// request, with the user authenticate stored in it.
 	relay := gundb.New(gundb.Options{
-		// Who is connecting? Browsers cannot set WebSocket headers, so the
-		// token comes in the URL. No token: an anonymous, read-only user.
-		Authenticate: func(r *http.Request) (string, string, error) {
-			token := r.URL.Query().Get("token")
-			if token == "" {
-				return "", "", nil
-			}
-			if user, ok := tokens[token]; ok {
-				return user, "", nil
-			}
-			return "", "", errors.New("unknown token")
-		},
 		// Write: users/<name>/... belongs to <name>. The check is on
 		// soul + "/" + field, so the link users -> ali is protected too.
-		CanWrite: func(user, soul, field string) bool {
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user := userOf(ctx)
 			if o := owner(soul + "/" + field); o != "" {
 				return o == user
 			}
 			return user != "" // anything else: any logged-in user
 		},
-		// Read: everything, except users/<name>/private.
-		CanRead: func(user, soul string) bool {
-			if o := owner(soul); o != "" && strings.HasPrefix(soul, "users/"+o+"/private") {
-				return o == user
+		// Read: everything, except users/<name>/private. Checking
+		// soul + "/" + field hides the link users/ali -> private as well as
+		// the node it points to.
+		CanRead: func(ctx context.Context, soul, field string) bool {
+			path := soul + "/" + field
+			if o := owner(path); o != "" && strings.HasPrefix(path, "users/"+o+"/private") {
+				return o == userOf(ctx)
 			}
 			return true
 		},
@@ -67,7 +88,7 @@ func main() {
 	defer relay.Close()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	check(err)
-	go http.Serve(l, relay)
+	go http.Serve(l, authenticate(relay))
 	url := "ws://" + l.Addr().String() + "/gun"
 
 	ali := gundb.New(gundb.Options{Peers: []string{url + "?token=tok-ali"}})

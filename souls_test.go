@@ -118,7 +118,7 @@ func TestSoulLexRepliesAreChunked(t *testing.T) {
 		relay.Get(fmt.Sprintf("n/%03d", i)).Put(ctx, map[string]any{"i": i})
 	}
 	conn := newScriptConn()
-	go relay.Attach(conn)
+	go relay.Attach(t.Context(), conn)
 	conn.recv <- []byte(`{"#":"q1","get":{"#":{"*":"n/"}}}`)
 	var nodes, chunks int
 	for last := false; !last; {

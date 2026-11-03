@@ -14,10 +14,9 @@ import (
 type peer struct {
 	db     *DB
 	conn   transport.Conn
-	origin *outbound // the configured peer this connection belongs to, if dialled
-	user   string    // who connected, from Options.Authenticate
-	id     string    // PeerInfo.PeerID
-	custom string    // PeerInfo.CustomID, from Options.Authenticate
+	origin *outbound       // the configured peer this connection belongs to, if dialled
+	rules  context.Context // the connection's context, for the rules and hooks
+	id     string          // PeerInfo.PeerID
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -60,9 +59,13 @@ var sendTimeout = 30 * time.Second
 var slowPeer = 5 * time.Second
 
 // run serves one connection until it closes.
-func (db *DB) run(conn transport.Conn, o *outbound, user, customID string) {
+func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
+	if rules == nil {
+		rules = context.Background()
+	}
 	ctx, cancel := context.WithCancel(db.ctx)
-	p := &peer{db: db, conn: conn, origin: o, user: user, id: randomID(16), custom: customID, outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	defer context.AfterFunc(rules, cancel)()
+	p := &peer{db: db, conn: conn, origin: o, rules: rules, id: randomID(16), outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -79,7 +82,7 @@ func (db *DB) run(conn transport.Conn, o *outbound, user, customID string) {
 	db.peersMu.Unlock()
 	db.log.Debug("gundb: peer connected", "peer", conn.RemoteAddr())
 	if db.onConnect != nil {
-		db.onConnect(p.info())
+		db.onConnect(p.rules, p.info())
 	}
 
 	go p.writeLoop()
@@ -108,12 +111,12 @@ func (db *DB) run(conn transport.Conn, o *outbound, user, customID string) {
 	db.peerGone(p)
 	db.log.Debug("gundb: peer disconnected", "peer", conn.RemoteAddr())
 	if db.onDisconnect != nil {
-		db.onDisconnect(p.info())
+		db.onDisconnect(p.rules, p.info())
 	}
 }
 
 func (p *peer) info() PeerInfo {
-	info := PeerInfo{PeerID: p.id, CustomID: p.custom, User: p.user, Remote: p.conn.RemoteAddr()}
+	info := PeerInfo{PeerID: p.id, Remote: p.conn.RemoteAddr()}
 	if p.origin != nil {
 		info.URL = p.origin.url
 	}
@@ -405,7 +408,7 @@ func (db *DB) sendOwn(m *message, raw []byte) {
 		}
 	}
 	db.peersMu.Unlock()
-	memo := map[string]readable{}
+	memo := &fanout{}
 	for _, p := range peers {
 		db.sendTo(p, m, raw, memo)
 	}

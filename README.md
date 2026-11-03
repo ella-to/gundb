@@ -40,9 +40,10 @@ program in [`examples/`](examples/).
   spaces that every peer verifies, and package `sea` for signing and
   encryption, byte-compatible with GUN.js. Package `sea/senderkey` adds
   encrypted group chat with Signal-style sender keys.
-- **Permissions.** A relay can authenticate each connection and decide
-  per user what it may read and write (`Authenticate`, `CanRead`,
-  `CanWrite`), for Go and GUN.js clients alike.
+- **Permissions.** A relay is an `http.Handler`: authenticate with your
+  own middleware, and `CanRead` / `CanWrite` decide, per field, what each
+  connection may read and write from the session in its context, for Go
+  and GUN.js clients alike.
 - **Offline-first.** Configured peers are re-dialled automatically. Writes
   made while offline are sent on reconnect, even after a restart, and
   subscriptions are restored.

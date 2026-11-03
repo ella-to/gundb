@@ -37,52 +37,58 @@ type Options struct {
 	// PID is this peer's ID in the DAM handshake. Default: random.
 	PID string
 
-	// Authenticate identifies the user behind an incoming WebSocket
-	// connection from its upgrade request: a token in the query string,
-	// a cookie or a header. Return "" for an anonymous user, or an error to
-	// refuse the connection with 401 Unauthorized. Default: everyone is
-	// anonymous.
+	// CanRead reports whether the connection behind ctx may read field of
+	// the node soul. Fields a connection may not read are never sent to it:
+	// not as an answer, not as a live update, not in a soul listing, and a
+	// node with no readable field is not found at all. Default: everyone may
+	// read everything.
 	//
-	// customID is any label you want for the connection, such as a device
-	// ID the client sends, so OnConnect and OnDisconnect can tell several
-	// tabs of one browser from different devices. It is reported back as
-	// PeerInfo.CustomID and nothing else; "" is fine.
+	// Checking fields, not just nodes, lets a list be private while its
+	// entries are not: deny every field of "users" but the reader's own, and
+	// db.Get("users").Get(id) still works for that id while listing "users"
+	// shows nobody else.
 	//
-	// Authenticate, CanRead and CanWrite apply to peers that connect to
-	// this DB. The DB's own calls (db.Get(...).Put) and the peers it dials
-	// (Peers) are trusted.
-	Authenticate func(r *http.Request) (user, customID string, err error)
+	// ctx is the connection's context: r.Context() of the WebSocket upgrade
+	// request for peers served by ServeHTTP, so a session your HTTP
+	// middleware stored in it is there; or the ctx given to Attach. It is
+	// the reader's context, also when another peer's write is being
+	// fanned out to it.
+	//
+	// CanRead and CanWrite run for every field of every message, so keep
+	// them fast: look the session up from ctx, don't do I/O.
+	CanRead func(ctx context.Context, soul, field string) bool
 
-	// CanRead reports whether user may read the node soul. Nodes a user may
-	// not read are never sent to them: not as an answer, not as a live
-	// update. Default: everyone may read everything.
-	CanRead func(user, soul string) bool
-
-	// CanWrite reports whether user may write field of the node soul. A put
-	// with any field denied is rejected whole, and PutAck on the writer
-	// returns ErrForbidden. Default: everyone may write everything.
-	CanWrite func(user, soul, field string) bool
+	// CanWrite reports whether the connection behind ctx (see CanRead) may
+	// write field of the node soul. A put with any field denied is rejected
+	// whole, and PutAck on the writer returns ErrForbidden. Default:
+	// everyone may write everything.
+	//
+	// CanRead and CanWrite apply to peers that connect to this DB. The DB's
+	// own calls (db.Get(...).Put) and the peers it dials (Peers) are
+	// trusted. To refuse a connection outright, refuse it in HTTP
+	// middleware before it reaches the DB.
+	CanWrite func(ctx context.Context, soul, field string) bool
 
 	// OnConnect is called when a peer connects: one we dialled (Peers),
 	// one that connected to us, or one handed to Attach. OnDisconnect is
-	// called once that connection is gone, with the same PeerInfo. A peer
-	// that vanishes without closing (a phone losing Wi-Fi) is noticed within
-	// about 40s.
+	// called once that connection is gone, with the same ctx and PeerInfo.
+	// ctx is the connection's context (see CanRead; for dialled peers, a
+	// context that ends with the DB); by OnDisconnect it may be done, but
+	// its values are still there. A peer that vanishes without closing (a
+	// phone losing Wi-Fi) is noticed within about 40s.
 	//
 	// Both run on the connection's goroutine, so they must return quickly;
 	// OnDisconnect always comes after the OnConnect it belongs to.
-	OnConnect    func(PeerInfo)
-	OnDisconnect func(PeerInfo)
+	OnConnect    func(ctx context.Context, info PeerInfo)
+	OnDisconnect func(ctx context.Context, info PeerInfo)
 }
 
 // PeerInfo describes one connection, for Options.OnConnect and
-// Options.OnDisconnect.
+// Options.OnDisconnect. Who is behind it is in the connection's context.
 type PeerInfo struct {
-	PeerID   string // unique to this connection, chosen by gundb
-	CustomID string // from Options.Authenticate or AttachAs
-	User     string // from Options.Authenticate or AttachAs; "" if anonymous
-	URL      string // the configured peer's URL, if this DB dialled it
-	Remote   string // the remote address
+	PeerID string // unique to this connection, chosen by gundb
+	URL    string // the configured peer's URL, if this DB dialled it
+	Remote string // the remote address
 }
 
 // DB is a GUN peer: a local graph that syncs with other peers in real time.
@@ -131,11 +137,10 @@ type DB struct {
 	subsMu sync.Mutex
 	subs   map[string]map[*peer]struct{} // soul -> peers that asked for it
 
-	authenticate func(*http.Request) (string, string, error)
-	canRead      func(user, soul string) bool
-	canWrite     func(user, soul, field string) bool
-	onConnect    func(PeerInfo)
-	onDisconnect func(PeerInfo)
+	canRead      func(ctx context.Context, soul, field string) bool
+	canWrite     func(ctx context.Context, soul, field string) bool
+	onConnect    func(context.Context, PeerInfo)
+	onDisconnect func(context.Context, PeerInfo)
 }
 
 // Errors returned by DB and Ref methods.
@@ -201,7 +206,6 @@ func New(opts ...Options) *DB {
 		mergeSeed: maphash.MakeSeed(),
 		subs:      map[string]map[*peer]struct{}{},
 
-		authenticate: o.Authenticate,
 		canRead:      o.CanRead,
 		canWrite:     o.CanWrite,
 		onConnect:    o.OnConnect,
@@ -267,7 +271,7 @@ func (db *DB) dialLoop(o *outbound) {
 			db.signalLocked()
 			db.peersMu.Unlock()
 		} else {
-			db.run(conn, o, "", "")
+			db.run(db.ctx, conn, o)
 		}
 		db.peersMu.Lock()
 		self := o.self
@@ -284,12 +288,18 @@ func (db *DB) dialLoop(o *outbound) {
 }
 
 // Attach runs the GUN protocol over an established connection and blocks
-// until it closes. Use it to plug in any transport:
+// until it closes, ctx is done or the DB is closed. Use it to plug in any
+// transport:
 //
-//	go db.Attach(conn)
-func (db *DB) Attach(conn transport.Conn) { db.run(conn, nil, "", "") }
+//	go db.Attach(ctx, conn)
+//
+// ctx is the connection's context: Options.CanRead, CanWrite, OnConnect
+// and OnDisconnect get it, so store whoever you identified behind conn in
+// it.
+func (db *DB) Attach(ctx context.Context, conn transport.Conn) { db.run(ctx, conn, nil) }
 
-// Serve accepts peers from l until l is closed or ctx is done.
+// Serve accepts peers from l until l is closed or ctx is done. Each peer
+// is attached with ctx as its context.
 func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
 	for {
 		conn, err := l.Accept(ctx)
@@ -299,27 +309,22 @@ func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
 			}
 			return err
 		}
-		go db.Attach(conn)
+		go db.Attach(ctx, conn)
 	}
 }
 
-// ServeHTTP upgrades the request to a WebSocket and serves it as a peer.
+// ServeHTTP upgrades the request to a WebSocket and serves it as a peer
+// until the connection closes. r.Context() becomes the connection's
+// context (see Options.CanRead), so authenticate in middleware in front
+// of the DB: refuse the request there, or store the session in the
+// request's context.
 func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var user, customID string
-	if db.authenticate != nil {
-		var err error
-		if user, customID, err = db.authenticate(r); err != nil {
-			db.log.Debug("gundb: authentication failed", "remote", r.RemoteAddr, "err", err)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
 	conn, err := ws.Accept(w, r)
 	if err != nil {
 		db.log.Debug("gundb: websocket upgrade failed", "remote", r.RemoteAddr, "err", err)
 		return
 	}
-	db.run(conn, nil, user, customID)
+	db.run(r.Context(), conn, nil)
 }
 
 // signalLocked wakes everyone waiting for connectivity to change.

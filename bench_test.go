@@ -330,9 +330,9 @@ func BenchmarkFanout(b *testing.B) {
 			var o Options
 			switch rules {
 			case "allow":
-				o.CanRead = func(string, string) bool { return true }
+				o.CanRead = func(context.Context, string, string) bool { return true }
 			case "hide":
-				o.CanRead = func(_, soul string) bool { return soul != "secret" }
+				o.CanRead = func(_ context.Context, soul, _ string) bool { return soul != "secret" }
 			}
 			db := New(o)
 			defer db.Close()

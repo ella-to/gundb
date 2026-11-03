@@ -51,25 +51,34 @@ func login(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, token)
 }
 
+// userKey is the context key requireLogin stores the user under.
+type userKey struct{}
+
+// requireLogin is HTTP middleware for authentication: who is connecting?
+// The token comes in the URL (browsers cannot set WebSocket headers). No
+// valid token, no connection: only logged-in users can read or post.
+func requireLogin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		user, ok := sessions[r.URL.Query().Get("token")]
+		mu.Unlock()
+		if !ok {
+			http.Error(w, "not logged in", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
+	})
+}
+
 func main() {
 	ctx := context.Background()
 
 	relay := gundb.New(gundb.Options{
-		// Authentication: who is connecting? The token comes in the URL
-		// (browsers cannot set WebSocket headers). No valid token, no
-		// connection: only logged-in users can read or post.
-		Authenticate: func(r *http.Request) (string, string, error) {
-			mu.Lock()
-			user, ok := sessions[r.URL.Query().Get("token")]
-			mu.Unlock()
-			if !ok {
-				return "", "", errors.New("not logged in")
-			}
-			return user, "", nil
-		},
 		// Authorization: what may they do? Messages live at
-		// chat/<user>/<id>, and only <user> may write there.
-		CanWrite: func(user, soul, field string) bool {
+		// chat/<user>/<id>, and only <user> may write there. The user is
+		// the one requireLogin stored in the connection's context.
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user, _ := ctx.Value(userKey{}).(string)
 			path := strings.Split(soul+"/"+field, "/") // chat, ali, m1, text
 			return path[0] == "chat" && path[1] == user
 		},
@@ -78,7 +87,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /login", login)
-	mux.Handle("/gun", relay)
+	mux.Handle("/gun", requireLogin(relay))
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	check(err)
 	go http.Serve(l, mux)

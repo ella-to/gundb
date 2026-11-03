@@ -2,7 +2,6 @@ package gundb
 
 import (
 	"context"
-	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -14,16 +13,24 @@ type events struct {
 	mu      sync.Mutex
 	up      []PeerInfo
 	down    []PeerInfo
+	upS     []*session // the session in each OnConnect's context
+	downS   []*session
 	balance bool // an OnDisconnect never came before its OnConnect
 }
 
-func (e *events) connect(p PeerInfo) {
+func sessionOf(ctx context.Context) *session {
+	s, _ := ctx.Value(sessionKey{}).(*session)
+	return s
+}
+
+func (e *events) connect(ctx context.Context, p PeerInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.up = append(e.up, p)
+	e.upS = append(e.upS, sessionOf(ctx))
 }
 
-func (e *events) disconnect(p PeerInfo) {
+func (e *events) disconnect(ctx context.Context, p PeerInfo) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	found := false
@@ -32,6 +39,7 @@ func (e *events) disconnect(p PeerInfo) {
 	}
 	e.balance = e.balance || !found
 	e.down = append(e.down, p)
+	e.downS = append(e.downS, sessionOf(ctx))
 }
 
 func (e *events) counts() (up, down int) {
@@ -40,38 +48,36 @@ func (e *events) counts() (up, down int) {
 	return len(e.up), len(e.down)
 }
 
-func TestOnConnectReportsUserAndCustomID(t *testing.T) {
+// OnConnect and OnDisconnect get the connection's context, with whatever
+// the HTTP middleware stored in it.
+func TestOnConnectSeesTheConnectionContext(t *testing.T) {
 	var server events
-	relay := New(Options{
-		Authenticate: func(r *http.Request) (string, string, error) {
-			return r.URL.Query().Get("user"), r.URL.Query().Get("device"), nil
-		},
-		OnConnect:    server.connect,
-		OnDisconnect: server.disconnect,
-	})
+	relay := New(Options{OnConnect: server.connect, OnDisconnect: server.disconnect})
 	defer relay.Close()
-	srv := httptest.NewServer(relay)
+	srv := httptest.NewServer(requireToken(relay))
 	defer srv.Close()
 
 	// Two tabs on one device, and a second device.
 	var tab1 events
-	url1 := srv.URL + "/gun?user=ali&device=laptop"
+	url1 := srv.URL + "/gun?token=tok-ali&device=laptop"
 	a := New(Options{Peers: []string{url1}, OnConnect: tab1.connect, OnDisconnect: tab1.disconnect})
 	defer a.Close()
-	b := New(Options{Peers: []string{srv.URL + "/gun?user=ali&device=laptop"}})
+	b := New(Options{Peers: []string{srv.URL + "/gun?token=tok-ali&device=laptop"}})
 	defer b.Close()
-	c := New(Options{Peers: []string{srv.URL + "/gun?user=ali&device=phone"}})
+	c := New(Options{Peers: []string{srv.URL + "/gun?token=tok-ali&device=phone"}})
 	defer c.Close()
 	eventually(t, func() bool { up, _ := server.counts(); return up == 3 })
 
 	server.mu.Lock()
 	ids, devices := map[string]bool{}, map[string]int{}
-	for _, p := range server.up {
-		if p.User != "ali" || p.URL != "" || p.Remote == "" {
-			t.Errorf("server saw %+v", p)
+	for i, p := range server.up {
+		s := server.upS[i]
+		if s == nil || s.user != "ali" || p.URL != "" || p.Remote == "" {
+			t.Errorf("server saw %+v, %+v", p, s)
+			continue
 		}
 		ids[p.PeerID] = true
-		devices[p.CustomID]++
+		devices[s.device]++
 	}
 	server.mu.Unlock()
 	if len(ids) != 3 {
@@ -87,12 +93,13 @@ func TestOnConnectReportsUserAndCustomID(t *testing.T) {
 		t.Errorf("client saw %+v", p)
 	}
 
-	// Closing a tab is reported with the same PeerInfo it connected with.
+	// Closing a tab is reported with the same PeerInfo it connected with,
+	// and its context still holds the session.
 	b.Close()
 	eventually(t, func() bool { _, down := server.counts(); return down == 1 })
 	server.mu.Lock()
-	if p := server.down[0]; p.CustomID != "laptop" || !ids[p.PeerID] {
-		t.Errorf("disconnect %+v", p)
+	if p, s := server.down[0], server.downS[0]; s == nil || s.device != "laptop" || !ids[p.PeerID] {
+		t.Errorf("disconnect %+v, %+v", p, s)
 	}
 	server.mu.Unlock()
 
@@ -146,10 +153,10 @@ func TestPeerThatStopsAnsweringIsDropped(t *testing.T) {
 	var got events
 	relay := New(Options{OnConnect: got.connect, OnDisconnect: got.disconnect})
 	defer relay.Close()
-	go relay.AttachAs(silentConn{newScriptConn()}, "ali", "phone")
+	go relay.Attach(withSession(t.Context(), &session{user: "ali", device: "phone"}), silentConn{newScriptConn()})
 	eventually(t, func() bool { _, down := got.counts(); return down == 1 })
-	if p := got.down[0]; p.User != "ali" || p.CustomID != "phone" {
-		t.Errorf("disconnect %+v", p)
+	if s := got.downS[0]; s == nil || s.user != "ali" || s.device != "phone" {
+		t.Errorf("disconnect %+v", s)
 	}
 }
 

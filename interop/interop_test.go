@@ -221,17 +221,19 @@ func TestJSClientsWithGoRelay(t *testing.T) {
 // token rides in the peer URL, as browsers cannot set WebSocket headers.
 func TestJSClientsWithAuthRelay(t *testing.T) {
 	requireNode(t)
+	type userKey struct{}
 	relay := gundb.New(gundb.Options{
-		Authenticate: func(r *http.Request) (string, string, error) {
-			return strings.TrimPrefix(r.URL.Query().Get("token"), "tok-"), "", nil
-		},
-		CanWrite: func(user, soul, field string) bool {
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user, _ := ctx.Value(userKey{}).(string)
 			owner, _, _ := strings.Cut(strings.TrimPrefix(soul, "users/"), "/")
 			return !strings.HasPrefix(soul, "users/") || owner == user
 		},
 	})
 	defer relay.Close()
-	srv := httptest.NewServer(relay)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := strings.TrimPrefix(r.URL.Query().Get("token"), "tok-")
+		relay.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
+	}))
 	defer srv.Close()
 	peer := srv.URL + "/gun"
 
