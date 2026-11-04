@@ -78,7 +78,16 @@ gundb get users -H "Authorization=Bearer 1234" # headers for your auth middlewar
 gundb user create -u ali -p secret123          # SEA user with its own key pair
 gundb put '~/notes/1' 'secret' --enc -u ali -p secret123
 gundb get '~/notes' --dec -u ali -p secret123
+gundb put '~/shared/bob/wifi' 'hunter2' --enc --to bob -u ali -p secret123
+
+gundb group init -u ali -p secret123           # encrypted group chat (a ratchet)
+gundb group create team -u ali -p secret123
+gundb group add team bob carol -u ali -p secret123
+gundb group send team 'hi' -u ali -p secret123
+gundb group sub ali/team -u bob -p …           # as bob
 ```
+
+The [guide](GUIDE.md#14-the-gundb-command) walks through all of it.
 
 `--addr` (or `GUNDB_ADDR`) picks the server, and `--timeout` bounds each
 command (default 2s; 0 waits forever). Run `gundb <command> --help` for

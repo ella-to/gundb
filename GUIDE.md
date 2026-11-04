@@ -7,6 +7,44 @@ Every code block below is a complete program from [`examples/`](examples/)
 go get ella.to/gundb   # needs Go 1.27+
 ```
 
+## Contents
+
+- [JS → Go cheat sheet](#js--go-cheat-sheet)
+- [1. Store and read data](#1-store-and-read-data)
+- [2. Live updates](#2-live-updates)
+- [3. Nested data and links](#3-nested-data-and-links)
+  - [Circular links](#circular-links)
+- [4. Lists](#4-lists)
+  - [A list of links: friends](#a-list-of-links-friends)
+  - [Large lists: read the links, load what you need](#large-lists-read-the-links-load-what-you-need)
+- [5. Sync between peers](#5-sync-between-peers)
+- [6. Work offline, sync later](#6-work-offline-sync-later)
+- [7. Run a relay](#7-run-a-relay)
+- [8. Permissions: who can read and write](#8-permissions-who-can-read-and-write)
+  - [Logging in from a client](#logging-in-from-a-client)
+  - [Example: a chat with user names and passwords](#example-a-chat-with-user-names-and-passwords)
+  - [A private list](#a-private-list)
+  - [Who is online](#who-is-online)
+- [9. Users and encryption (SEA)](#9-users-and-encryption-sea)
+  - [Encrypted group chat with a shared key](#encrypted-group-chat-with-a-shared-key)
+  - [Encrypted group chat with sender keys (a ratchet)](#encrypted-group-chat-with-sender-keys-a-ratchet)
+- [10. Browser + Go chat](#10-browser--go-chat)
+- [11. Persist to disk](#11-persist-to-disk)
+- [12. Read history](#12-read-history)
+- [13. Write your own Store](#13-write-your-own-store)
+- [14. The gundb command](#14-the-gundb-command)
+  - [Start a relay](#start-a-relay)
+  - [Write, read and watch](#write-read-and-watch)
+  - [Link nodes](#link-nodes)
+  - [Users](#users)
+  - [Sign](#sign)
+  - [Encrypt for yourself: a vault](#encrypt-for-yourself-a-vault)
+  - [Share a secret with one person](#share-a-secret-with-one-person)
+  - [Encrypted group chat](#encrypted-group-chat)
+  - [Write your own client](#write-your-own-client)
+- [15. Run in the browser (WebAssembly)](#15-run-in-the-browser-webassembly)
+- [Bring your own transport](#bring-your-own-transport)
+
 ## JS → Go cheat sheet
 
 | GUN (JavaScript)                         | gundb (Go)                                          |
@@ -2428,9 +2466,293 @@ func check(err error) {
 
 The runtime does all HAM merging and calls `Put` with the whole merged node. A store that also implements `gundb.FieldStore` gets `PutFields` instead, with only the fields that changed. That is how `pebblestore` writes history without rewriting unchanged fields. A `FieldStore` that also implements `gundb.FieldReader` (`GetFields(ctx, soul, fields)`) is asked for only the fields a merge touches, so writing one field of a node with thousands of fields stays as cheap as writing a small one; the default store, `memstore` and `pebblestore` do. A `FieldStore` that implements `gundb.BatchStore` (`PutBatch(ctx, nodes)`) gets every node of a multi-node write (a `Set`, a nested struct) in one call, so it can commit them with one disk sync; `pebblestore` does. A store that implements `gundb.SoulStore` (`ListSouls(ctx, prefix)`) can also answer LEX queries over souls (`db.Souls`, or `{"#": {"*": prefix}}` from GUN.js). The default store, `memstore` and `pebblestore` all do.
 
-## 14. A CLI for any GUN peer
+## 14. The gundb command
 
-Works against Go and JS relays alike: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
+`gundb` is a relay and a client in one binary. It is a quick way to test a
+GUN app (it talks to Go and JS peers alike), and a small tool for keeping
+your own data, including secrets, and sharing parts of it with people you
+choose. This section walks through it with three people: alice, bob and
+carol.
+
+```sh
+go install ella.to/gundb/cmd/gundb@latest
+gundb --help                 # and gundb <command> --help
+```
+
+### Start a relay
+
+```sh
+gundb server                                    # http://localhost:8765/gun, in memory
+gundb server --store pebble --data ~/gundb-data # on disk, with full history
+```
+
+Every other command connects to `http://localhost:8765/gun`; point it
+elsewhere with `--addr`, or `export GUNDB_ADDR=https://my-relay/gun` once.
+
+### Write, read and watch
+
+A path names a place in the graph, one key per segment: `notes/1/title` is
+`gun.get('notes').get('1').get('title')`.
+
+```sh
+gundb put notes/1 '{"title":"todo","body":"buy milk"}'
+gundb put notes/1/body 'buy oat milk'          # change one field
+gundb put notes/1/body null                    # delete it
+gundb get notes/1
+```
+
+Values are JSON when they parse as JSON (`42`, `true`, `{"a":1}`), text
+otherwise. `--string` always stores text, and `-` reads the value from
+stdin: `gundb put notes/2/body - < letter.txt`.
+
+A list is a `set`: each item gets its own random key.
+
+```sh
+$ gundb set todos '{"title":"buy milk","done":false}'
+ok  todos/mw22ehcf000V3DCsJr30 = {"done":false,"title":"buy milk"}
+
+$ gundb put todos/mw22ehcf000V3DCsJr30/done true     # update an item
+$ gundb put todos/mw22ehcf000V3DCsJr30 null          # remove it
+```
+
+`sub` prints the value now, and again each time it changes, until Ctrl-C.
+With `--map` it prints only the item that changed. Leave it running in one
+terminal and write from another:
+
+```sh
+$ gundb sub todos --map
+07:12:03  mw22ehcf000V3DCsJr30  {"done":false,"title":"buy milk"}
+07:12:41  mw22ewq8000a3XyH1kLm  {"done":false,"title":"call mum"}
+```
+
+### Link nodes
+
+`--link <path>` takes the place of the value and stores a link to that node,
+not a copy. Change the node and every link sees it.
+
+```sh
+$ gundb put people/bob '{"name":"Bob","city":"Berlin"}'
+$ gundb put people/carol '{"name":"Carol","city":"Rome"}'
+
+$ gundb put people/alice/best --link people/bob       # one link
+ok  people/alice/best links to people/bob
+
+$ gundb set people/alice/friends --link people/bob    # a list of links
+$ gundb set people/alice/friends --link people/carol
+$ gundb get people/alice/friends                      # links are followed
+{
+  "people/bob": { "city": "Berlin", "name": "Bob" },
+  "people/carol": { "city": "Rome", "name": "Carol" }
+}
+
+$ gundb unset people/alice/friends --link people/carol  # unlink; carol's node stays
+$ gundb put people/alice/best null                      # remove a put link
+
+$ gundb get people/alice --links                      # as stored: links, not copies
+{
+  "_": { "#": "people/alice" },
+  "best": { "#": "people/bob" },
+  "friends": { "#": "people/alice/friends" }
+}
+```
+
+`--link` checks with the server that the node is there and links to the soul
+it really has, which is not always its path (a `set` item, or a node from
+GUN.js, has a random one). It also takes a soul, as `--links` prints it, or a
+user: `--link '~@bob'`. See [A list of links](#a-list-of-links-friends) for
+the same in Go.
+
+### Users
+
+A user is a SEA key pair. The server stores it the way `gun.user()` does, with
+the private keys encrypted by the password, so you can log in from any
+machine and from GUN.js.
+
+```sh
+gundb user create -u alice -p 'alice-secret'
+gundb user create -u bob   -p 'bob-secret'
+gundb user create -u carol -p 'carol-secret'
+```
+
+Logged in, `~/` is your own space. Only you can write there: every write is
+signed, and every peer checks it. Anyone can read it as `~@alice/...`.
+
+Typing a password on the command line leaves it in your shell history. For
+daily use, set it once per terminal instead:
+
+```sh
+export GUNDB_USERNAME=alice
+read -s GUNDB_PASSWORD && export GUNDB_PASSWORD   # type it; nothing is shown
+gundb put '~/profile/name' 'Alice'
+```
+
+The examples below keep `-u` and `-p` so you can see who is acting.
+
+### Sign
+
+A signed value carries a signature anyone can check against the signer's
+public key. Writing to `~/` already proves who wrote it; `--sign` also
+signs a value you write elsewhere, or that others will copy.
+
+```sh
+$ gundb put '~/profile/bio' 'Go and GUN' --sign -u alice -p 'alice-secret'
+ok  ~/profile/bio = "Go and GUN" (signed)
+
+$ gundb get '~@alice/profile/bio' --verify --from alice     # fails unless alice signed it
+"Go and GUN"
+```
+
+### Encrypt for yourself: a vault
+
+`--enc` encrypts with your own keys. The relay only sees the ciphertext.
+
+```sh
+$ gundb put '~/vault/bank' 'IBAN DE89 3704 0044' --enc -u alice -p 'alice-secret'
+ok  ~/vault/bank = (encrypted)
+
+$ gundb get '~/vault' -u alice -p 'alice-secret'
+{
+  "bank": "SEA{\"ct\":\"TFf0ZcUVO2afgTVNTmfqaykPx5P0W7RJH36mNE0QamZVLIk=\",\"iv\":...}"
+}
+note:  some values are encrypted; read them with --dec (...)
+
+$ gundb get '~/vault' --dec -u alice -p 'alice-secret'
+{
+  "bank": "IBAN DE89 3704 0044"
+}
+```
+
+### Share a secret with one person
+
+`--enc --to bob` encrypts for bob with a key only alice and bob can derive
+(SEA ECDH). Bob reads it from alice's space with `--dec --from alice`, and
+since it is in alice's space, he knows alice wrote it.
+
+```sh
+$ gundb put '~/shared/bob/wifi' 'hunter2' --enc --to bob -u alice -p 'alice-secret'
+ok  ~/shared/bob/wifi = (encrypted)
+
+$ gundb get '~@alice/shared/bob/wifi' --dec --from alice -u bob -p 'bob-secret'
+"hunter2"
+
+$ gundb get '~@alice/shared/bob/wifi' --dec --from alice -u carol -p 'carol-secret'
+error: cannot decrypt ~@alice/shared/bob/wifi with the key you share with alice
+```
+
+To take it back, delete it: `gundb put '~/shared/bob/wifi' null`. Bob may
+have kept a copy, as with any secret you share.
+
+### Encrypted group chat
+
+For more than two people, `gundb group` runs a group chat with sender keys,
+the ratchet Signal and WhatsApp use for groups (see
+[sender keys](#encrypted-group-chat-with-sender-keys-a-ratchet) for how it
+works). Every message has its own key, used once and then deleted:
+
+- a new member reads from when they joined, never the history;
+- a removed member can't read anything sent after;
+- your password alone reads nothing: the keys never leave your device;
+- a copy of your device can't decrypt what you already read again.
+
+The keys live on your device, under `--dir` (default: your config
+directory, like `~/.config/gundb` or `~/Library/Application Support/gundb`;
+or set `GUNDB_DIR`), in one file per user and server, encrypted with your
+password and readable only by you. Each person sets up once per device:
+
+```sh
+gundb group init -u alice -p 'alice-secret'     # on alice's machine
+gundb group init -u bob   -p 'bob-secret'       # on bob's
+gundb group init -u carol -p 'carol-secret'     # on carol's
+```
+
+Alice creates a group and adds the others. She names it `family`; everyone
+else names it `alice/family`.
+
+```sh
+$ gundb group create family -u alice -p 'alice-secret'
+ok  created family; others name it alice/family
+
+$ gundb group add family bob carol -u alice -p 'alice-secret'
+ok  added bob, carol to family; they read it as alice/family
+
+$ gundb group send family 'dinner at 8?' -u alice -p 'alice-secret'
+ok  sent to alice/family
+```
+
+Carol keeps it open; bob reads and answers:
+
+```sh
+$ gundb group sub alice/family -u carol -p 'carol-secret'     # carol, until Ctrl-C
+2026-11-04 07:00  alice: dinner at 8?
+2026-11-04 07:00  bob: yes, I bring dessert
+
+$ gundb group read alice/family -u bob -p 'bob-secret'        # bob
+2026-11-04 07:00  alice: dinner at 8?
+
+$ gundb group send alice/family 'yes, I bring dessert' -u bob -p 'bob-secret'
+ok  sent to alice/family
+```
+
+`read` prints the whole conversation (`--new`: only what arrived since the
+last read). A message can be decrypted only once, so what was said is kept
+in the device file; that is also why reading it again works.
+
+Alice removes carol. Everyone's next message goes out on a new chain that
+carol never gets:
+
+```sh
+$ gundb group members family -u alice -p 'alice-secret'
+alice  (owner)
+bob
+carol
+
+$ gundb group remove family carol -u alice -p 'alice-secret'
+ok  removed carol from family; your new chain is not shared with them
+
+$ gundb group send family 'carol cannot read this' -u alice -p 'alice-secret'
+$ gundb group read alice/family --new -u bob -p 'bob-secret'
+2026-11-04 07:00  alice: carol cannot read this
+
+$ gundb group read alice/family -u carol -p 'carol-secret'
+error: you are not a member of alice/family
+```
+
+And bob's password on a new laptop, without his device file, opens nothing:
+
+```sh
+$ gundb group read alice/family --dir /tmp/new-laptop -u bob -p 'bob-secret'
+error: this device has no group keys for bob
+```
+
+`gundb group ls` lists the groups on this device.
+
+### Things to know
+
+- **Paths are not secret.** `--enc` hides values, not keys: the relay sees
+  `~alice/vault/bank`, and when it was written. Use dull key names
+  (`~/vault/1`) when the name says too much.
+- **A relay with `--store pebble` keeps every version.** Encrypted values
+  stay encrypted in its history, but deleting a secret doesn't remove the
+  old ciphertext from the relay's disk.
+- **Your vault is only as safe as your password.** `--enc` uses your SEA
+  keys, which anyone with your password can unlock from any machine. Group
+  chats don't have that weakness; their keys stay on the device.
+- **Back up the device file for group chats** (`--dir`). Lose it and you
+  lose your history: run `group init` on the new device, and the others
+  share their chains with it the next time they use the group. You read
+  from then on, never what came before.
+- **One device per user for groups.** `group init` on a second machine
+  publishes a new prekey, so new chains are sealed to it, and the first
+  device stops receiving them.
+- **Keys arrive with use.** You can only add people who have run
+  `group init`. Each member shares their chain when they next run a group
+  command (or right away, if they have `group sub` open), so a message
+  can wait for its key; `read` picks it up later, and says so meanwhile.
+
+### Write your own client
+
+`gundb` is built on the same API as the rest of this guide. A minimal client
+of your own, for any GUN peer: `go run ./examples/client put users.alice '{"name":"Alice"}'`.
 
 <!-- example: examples/client/main.go -->
 ```go
