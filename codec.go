@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -153,6 +154,111 @@ func (r *reader) soulOf(path []string) string {
 		return soul + "/" + strings.Join(path[i+1:], "/")
 	}
 	return soul
+}
+
+// fetchRefs reads from peers, under ctx, the nodes on the path of every
+// *Ref in v, all at once. Encoding v then links each ref to the soul its
+// node really has: Ref.MarshalJSON cannot wait for the network, so on its
+// own it only sees what this DB has already read, and a ref to a node it
+// has not (a Set item or a GUN.js node, with a random soul) would link to
+// the soul its path would get if it were new.
+func fetchRefs(ctx context.Context, v any) {
+	switch v.(type) {
+	case nil, string, bool, float64, int, int64, json.Number:
+		return // the common values, without asking reflect
+	}
+	if t := reflect.TypeOf(v); t != refType && !mayHoldRef(t) {
+		return
+	}
+	var wg sync.WaitGroup
+	refsIn(reflect.ValueOf(v), 0, func(r *Ref) {
+		if len(r.path) > 1 { // a root ref's soul is its key
+			wg.Go(func() { (&reader{db: r.db, ctx: ctx, net: true}).soulOf(r.path) })
+		}
+	})
+	wg.Wait()
+}
+
+var (
+	refType       = reflect.TypeFor[*Ref]()
+	marshalerType = reflect.TypeFor[json.Marshaler]()
+	holdsRef      sync.Map // reflect.Type -> bool, see mayHoldRef
+)
+
+// refsIn calls found for every *Ref that encoding v as JSON would encode:
+// in pointers, interfaces, maps and the fields encoding/json writes.
+func refsIn(v reflect.Value, depth int, found func(*Ref)) {
+	if !v.IsValid() || depth > 1000 { // deeper, encoding/json reports a cycle
+		return
+	}
+	if v.Type() == refType {
+		if !v.IsNil() && v.CanInterface() {
+			found(v.Interface().(*Ref))
+		}
+		return
+	}
+	if !mayHoldRef(v.Type()) {
+		return
+	}
+	switch v.Kind() {
+	case reflect.Interface, reflect.Pointer:
+		if !v.IsNil() {
+			refsIn(v.Elem(), depth+1, found)
+		}
+	case reflect.Map:
+		for it := v.MapRange(); it.Next(); {
+			refsIn(it.Value(), depth+1, found)
+		}
+	case reflect.Struct:
+		t := v.Type()
+		for i := range t.NumField() {
+			if encoded(t.Field(i)) {
+				refsIn(v.Field(i), depth+1, found)
+			}
+		}
+	}
+}
+
+// mayHoldRef reports whether a value of type t can contain a *Ref, so
+// values that cannot (most structs) are not walked.
+func mayHoldRef(t reflect.Type) bool {
+	if b, ok := holdsRef.Load(t); ok {
+		return b.(bool)
+	}
+	b := reachesRef(t, map[reflect.Type]bool{})
+	holdsRef.Store(t, b) // only t's answer: those of types seen on the way can be cut short by seen
+	return b
+}
+
+func reachesRef(t reflect.Type, seen map[reflect.Type]bool) bool {
+	if t == refType {
+		return true
+	}
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	if t.Kind() != reflect.Interface && t.Implements(marshalerType) {
+		return false // it encodes itself
+	}
+	switch t.Kind() {
+	case reflect.Interface:
+		return true
+	case reflect.Pointer, reflect.Map:
+		return reachesRef(t.Elem(), seen)
+	case reflect.Struct:
+		for i := range t.NumField() {
+			if f := t.Field(i); encoded(f) && reachesRef(f.Type, seen) {
+				return true
+			}
+		}
+	}
+	return false // slices and arrays are refused by GUN anyway
+}
+
+// encoded reports whether encoding/json writes the struct field f.
+func encoded(f reflect.StructField) bool {
+	return (f.IsExported() || f.Anonymous) && f.Tag.Get("json") != "-"
 }
 
 // build adds obj to g as node soul. Nested objects become their own nodes,

@@ -57,6 +57,7 @@ func (r *Ref) put(ctx context.Context, v any, ack bool) error {
 
 // addTo adds to g the nodes that putting v here writes.
 func (r *Ref) addTo(ctx context.Context, g graph, v any, state float64) error {
+	fetchRefs(ctx, v)
 	t, err := toTree(v)
 	if err != nil {
 		return err
@@ -100,6 +101,7 @@ func (r *Ref) Set(ctx context.Context, v any) (*Ref, error) {
 
 // setTo adds to g the nodes that Set(v) writes, and returns the new item.
 func (r *Ref) setTo(ctx context.Context, g graph, v any, state float64) (*Ref, error) {
+	fetchRefs(ctx, v)
 	t, err := toTree(v)
 	if err != nil {
 		return nil, err
@@ -252,7 +254,9 @@ func (r *Ref) root(soul string) *Ref { return &Ref{db: r.db, path: []string{soul
 func (r *Ref) Map() *MapRef { return &MapRef{ref: r} }
 
 // MarshalJSON encodes the ref as a link, so a *Ref inside a struct you Put
-// is stored as a reference to that node.
+// is stored as a reference to that node. It links to the node's soul as
+// this DB knows it; Put and Set first read from peers the souls of the
+// refs they are given, so there they link to the node as peers have it.
 func (r *Ref) MarshalJSON() ([]byte, error) {
 	rd := &reader{db: r.db, ctx: r.db.ctx}
 	return Link{Soul: rd.soulOf(r.path)}.MarshalJSON()

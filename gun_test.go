@@ -160,6 +160,57 @@ func TestPutRefStoresLink(t *testing.T) {
 	}
 }
 
+// A ref to a node this DB has never read still links to that node's real
+// soul, read from peers, not to the soul its path would have if it were
+// new: nodes added with Set, or written by GUN.js, have random souls.
+func TestRefLinksResolveFromPeers(t *testing.T) {
+	type withRef struct {
+		Name string `json:"name"`
+		Boss *Ref   `json:"boss"`
+	}
+	for name, write := range map[string]func(ctx context.Context, d *DB, bob *Ref) (*Ref, error){
+		"Put": func(ctx context.Context, d *DB, bob *Ref) (*Ref, error) {
+			return d.Get("alice"), d.Get("alice").Get("boss").PutAck(ctx, bob)
+		},
+		"field": func(ctx context.Context, d *DB, bob *Ref) (*Ref, error) {
+			return d.Get("alice"), d.Get("alice").PutAck(ctx, withRef{Name: "Alice", Boss: bob})
+		},
+		"Set": func(ctx context.Context, d *DB, bob *Ref) (*Ref, error) {
+			b := d.Batch()
+			item, err := b.Set(ctx, d.Get("alice").Get("bosses"), bob)
+			if err != nil {
+				return nil, err
+			}
+			if item.Key() != bob.Key() { // the item is the linked node
+				return nil, fmt.Errorf("Set returned the item %q", item.Key())
+			}
+			return d.Get("alice").Get("bosses"), b.CommitAck(ctx)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			a, d := newDB(t), newDB(t)
+			created, err := a.Get("people").Set(ctx, Member{Name: "Bob"}) // a random soul
+			if err != nil {
+				t.Fatal(err)
+			}
+			soul := created.Key()
+			link(t, a, d) // d has never read people
+			from, err := write(ctx, d, d.Get("people").Get(soul))
+			if err != nil {
+				t.Fatal(err)
+			}
+			links, err := from.Links(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(slices.Collect(maps.Values(links)), soul) {
+				t.Fatalf("links %v, want one to %q", links, soul)
+			}
+		})
+	}
+}
+
 func TestCyclesAreSafe(t *testing.T) {
 	ctx := t.Context()
 	db := newDB(t)
