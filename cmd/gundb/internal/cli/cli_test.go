@@ -516,3 +516,88 @@ func TestLinks(t *testing.T) {
 		wantOut(t, stderr, tc.want...)
 	}
 }
+
+func TestGroupChat(t *testing.T) {
+	addr := startServer(t)
+	dir := t.TempDir()
+	as := func(name string, args ...string) []string {
+		return append(args, "--addr", addr, "--dir", dir, "-u", name, "-p", name+" password")
+	}
+	for _, name := range []string{"alice", "bob", "carol", "dave"} {
+		must(t, "user", "create", "-u", name, "-p", name+" password", "--addr", addr)
+	}
+	// Bob can't be added before he sets up this device.
+	must(t, as("alice", "group", "init")...)
+	must(t, as("alice", "group", "create", "team")...)
+	_, stderr, err := run(t, "", as("alice", "group", "add", "team", "bob")...)
+	if err == nil {
+		t.Fatal("added a member without group keys")
+	}
+	wantOut(t, stderr, "bob has not set up group chats yet", "gundb group init -u bob")
+
+	must(t, as("bob", "group", "init")...)
+	must(t, as("carol", "group", "init")...)
+	wantOut(t, must(t, as("alice", "group", "add", "team", "bob", "carol")...), "added bob, carol", "alice/team")
+	wantOut(t, must(t, as("bob", "group", "members", "alice/team")...), "alice  (owner)", "bob", "carol")
+
+	must(t, as("alice", "group", "send", "team", "hi team")...)
+	must(t, as("bob", "group", "send", "alice/team", "hello alice")...)
+	wantOut(t, must(t, as("carol", "group", "read", "alice/team")...), "alice: hi team", "bob: hello alice")
+	// Read again: the history is on the device, though each key is gone.
+	wantOut(t, must(t, as("carol", "group", "read", "alice/team")...), "alice: hi team", "bob: hello alice")
+	if out := must(t, as("carol", "group", "read", "alice/team", "--new")...); out != "" {
+		t.Errorf("--new printed old messages: %q", out)
+	}
+
+	// Dave joins late: he reads from now on, not the history.
+	must(t, as("dave", "group", "init")...)
+	must(t, as("alice", "group", "add", "team", "dave")...)
+	must(t, as("alice", "group", "send", "team", "welcome dave")...)
+	out := must(t, as("dave", "group", "read", "alice/team")...)
+	wantOut(t, out, "alice: welcome dave")
+	if strings.Contains(out, "hi team") {
+		t.Errorf("dave read the history: %s", out)
+	}
+
+	// Carol watches; she sees new messages as they arrive.
+	ctx, cancel := context.WithCancel(t.Context())
+	var subOut, subErr buffer
+	done := make(chan error, 1)
+	go func() {
+		a := &App{Stdin: strings.NewReader(""), Stdout: &subOut, Stderr: &subErr}
+		done <- a.Command().Run(ctx, append([]string{"gundb"}, as("carol", "group", "sub", "alice/team")...))
+	}()
+	waitFor(t, &subErr, "watching")
+	must(t, as("bob", "group", "send", "alice/team", "live from bob")...)
+	waitFor(t, &subOut, "bob: live from bob")
+	cancel()
+	<-done
+
+	// Carol is removed: everyone's next message is on a new chain.
+	wantOut(t, must(t, as("alice", "group", "remove", "team", "carol")...), "removed carol")
+	must(t, as("bob", "group", "send", "alice/team", "carol can't read this")...)
+	wantOut(t, must(t, as("alice", "group", "read", "team")...), "bob: carol can't read this")
+	_, stderr, err = run(t, "", as("carol", "group", "read", "alice/team")...)
+	if err == nil {
+		t.Fatal("a removed member read the group")
+	}
+	wantOut(t, stderr, "you are not a member of alice/team")
+
+	// Bob's password on another device (no keys there) reads nothing.
+	_, stderr, err = run(t, "", "group", "read", "alice/team", "--addr", addr, "--dir", t.TempDir(), "-u", "bob", "-p", "bob password")
+	if err == nil {
+		t.Fatal("read without the device's keys")
+	}
+	wantOut(t, stderr, "this device has no group keys for bob", "gundb group init")
+}
+
+// waitFor waits until b contains want.
+func waitFor(t *testing.T, b *buffer, want string) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if strings.Contains(b.String(), want) {
+			return
+		}
+	}
+	t.Fatalf("no %q in %q", want, b.String())
+}
