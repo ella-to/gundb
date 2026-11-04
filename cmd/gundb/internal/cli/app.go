@@ -129,7 +129,10 @@ With --username and --password, ~/ is your own space (signed writes),
 and ~@alias/... or ~<pub>/... is another user's.
 
 Values are JSON when they parse as JSON (42, true, {"a":1}, "quoted"),
-text otherwise; --string always stores text, and - reads stdin.`,
+text otherwise; --string always stores text, and - reads stdin.
+
+--link <path> stores a link to another node instead of a value:
+put users/1/best --link users/2, set users/1/friends --link users/2.`,
 		HideVersion:           true,
 		EnableShellCompletion: true,
 		OnUsageError:          usageError,
@@ -138,6 +141,7 @@ text otherwise; --string always stores text, and - reads stdin.`,
 			a.getCommand(),
 			a.putCommand(),
 			a.setCommand(),
+			a.unsetCommand(),
 			a.subCommand(),
 			a.userCommand(),
 		},

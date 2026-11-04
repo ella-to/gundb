@@ -70,6 +70,9 @@ gundb put users/1/name 'Ali'                   # write, and wait for the server
 gundb get users/1                              # read, as JSON
 gundb set todos '{"title":"buy milk"}'         # add to a list
 gundb sub todos --map                          # print every change, Ctrl-C to stop
+gundb put users/1/best --link users/2          # link to another node
+gundb set users/1/friends --link users/2       # a list of links; unset removes one
+gundb get users/1 --links                      # as stored: links unfollowed, souls shown
 gundb get users -H "Authorization=Bearer 1234" # headers for your auth middleware
 
 gundb user create -u ali -p secret123          # SEA user with its own key pair

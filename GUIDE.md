@@ -448,6 +448,11 @@ func check(err error) {
 
 Things to know:
 
+- A ref links to the soul its node really has, which isn't always its
+  path: items added with `Set`, and nodes written by GUN.js, have random
+  souls. `Put` and `Set` read the ref's path from peers first, so
+  `friends.Set(ctx, db.Get("people").Get(id))` links to the right node even
+  if this DB has never read `people`.
 - Setting the same ref twice doesn't duplicate it: the key is the soul, so
   a list never holds a friend twice. Removing and adding again brings the
   link back.
@@ -458,6 +463,31 @@ Things to know:
   `Put(nil)` instead.
 - A removed item stays in the node as a tombstone (`null`), like in GUN.js,
   so every peer learns about the removal. `Once` and `Map().On` skip it.
+
+#### From the command line
+
+The [`gundb` command](README.md#command-line) does the same with `--link`,
+which takes the place of the value and names the node to link to by its
+path:
+
+```sh
+gundb put alice '{"name":"Alice","city":"Paris"}'
+gundb put bob '{"name":"Bob","city":"Berlin"}'
+
+gundb put alice/best --link bob          # one link:      alice.Get("best").Put(ctx, db.Get("bob"))
+gundb set alice/friends --link bob       # a list:        friends.Set(ctx, db.Get("bob"))
+gundb unset alice/friends --link bob     # remove it:     friends.Get("bob").Put(ctx, nil)
+gundb put alice/best null                # remove a put link
+
+gundb get alice                          # links followed: "best": {"name": "Bob", ...}
+gundb get alice --links                  # as stored: "best": {"#": "bob"}, and alice's soul under "_"
+```
+
+A link stores the target's soul, which isn't always its path: an item added
+with `set`, or a node written by GUN.js, has a random one. `--link` asks the
+server for it, and fails if nothing is there, so a typo doesn't leave a link
+to nowhere. It also takes a soul, as `get --links` prints it, or a user:
+`--link '~@ali'`.
 
 ### Large lists: read the links, load what you need
 

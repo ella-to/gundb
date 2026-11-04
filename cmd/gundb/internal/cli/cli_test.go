@@ -460,3 +460,59 @@ func eventually(t *testing.T, ok func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+func TestLinks(t *testing.T) {
+	addr := startServer(t)
+	a := "--addr=" + addr
+	must(t, "put", "users/1", `{"name":"Ali"}`, a)
+	must(t, "put", "users/2", `{"name":"Bob","city":"Berlin"}`, a)
+
+	// put --link: one link, followed by get, shown as stored by --links.
+	wantOut(t, must(t, "put", "users/1/best", "--link", "users/2", a), "ok  users/1/best links to users/2")
+	wantOut(t, must(t, "get", "users/1/best/city", a), "Berlin")
+	wantOut(t, must(t, "get", "users/1", "--links", a), `"#": "users/1"`, `"best": {`, `"#": "users/2"`)
+
+	// Writing through the link changes the linked node.
+	must(t, "put", "users/1/best/city", "Madrid", a)
+	wantOut(t, must(t, "get", "users/2/city", a), "Madrid")
+
+	// set --link: a list of links, keyed by soul. A set item has a random
+	// soul, which is resolved from its path.
+	item := strings.Fields(must(t, "set", "groups", `{"name":"Go"}`, a))[1] // groups/<soul>
+	soul := strings.TrimPrefix(item, "groups/")
+	must(t, "set", "users/1/friends", "--link", "users/2", a)
+	wantOut(t, must(t, "set", "users/1/groups", "--link", item, a), "now has a link to "+item+" (soul "+soul+")")
+	must(t, "set", "users/1/groups", "--link", soul, a) // the soul itself works too, and does not duplicate
+	wantOut(t, must(t, "get", "users/1", a), `"name": "Bob"`, `"name": "Go"`)
+	nodes := must(t, "get", "users/1/groups", "--links", a)
+	if strings.Count(nodes, `"#"`) != 2 { // its own soul, and the one link
+		t.Errorf("groups: %s", nodes)
+	}
+
+	// unset removes the link and leaves the node.
+	wantOut(t, must(t, "unset", "users/1/friends", "--link", "users/2", a), "no longer links to users/2")
+	if out := must(t, "get", "users/1/friends", a); strings.Contains(out, "Bob") {
+		t.Errorf("friend not removed: %s", out)
+	}
+	wantOut(t, must(t, "get", "users/2/name", a), "Bob")
+
+	for _, tc := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"put", "users/1/x", "--link", "users/9", a}, []string{"nothing at users/9 to link to"}},
+		{[]string{"put", "users/1/x", "--link", "users/2/name", a}, []string{"users/2/name is a value, not a node", "--link users/2"}},
+		{[]string{"put", "users/1/x", "v", "--link", "users/2", a}, []string{"takes the place of the value"}},
+		{[]string{"put", "users", "--link", "users/2", a}, []string{"top-level node", "gundb set users --link users/2"}},
+		{[]string{"put", "users/1/x", "--link", "users/2", "--enc", a}, []string{"--enc does not work with --link"}},
+		{[]string{"unset", "users/1/friends", a}, []string{"unset needs --link"}},
+		{[]string{"get", "users/1/name", "--links", a}, []string{"is a value, not a node"}},
+	} {
+		_, stderr, err := run(t, "", tc.args...)
+		if err == nil {
+			t.Errorf("gundb %s succeeded", strings.Join(tc.args, " "))
+			continue
+		}
+		wantOut(t, stderr, tc.want...)
+	}
+}
