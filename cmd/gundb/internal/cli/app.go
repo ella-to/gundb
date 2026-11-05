@@ -145,6 +145,7 @@ put users/1/best --link users/2, set users/1/friends --link users/2.`,
 			a.subCommand(),
 			a.userCommand(),
 			a.groupCommand(),
+			a.visualCommand(),
 		},
 	}
 }

@@ -8,6 +8,7 @@
 //	gundb set users/1/friends --link users/2 # link to another node
 //	gundb user create -u ali -p secret123 # a SEA user with its own key pair
 //	gundb group send team 'hi' -u ali -p … # encrypted group chat
+//	gundb visual                          # a live graph in the browser
 //
 // Run gundb --help, or gundb <command> --help, for everything else.
 package main

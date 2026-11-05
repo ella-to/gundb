@@ -41,6 +41,7 @@ go get ella.to/gundb   # needs Go 1.27+
   - [Encrypt for yourself: a vault](#encrypt-for-yourself-a-vault)
   - [Share a secret with one person](#share-a-secret-with-one-person)
   - [Encrypted group chat](#encrypted-group-chat)
+  - [See the graph live](#see-the-graph-live)
   - [Write your own client](#write-your-own-client)
 - [15. Run in the browser (WebAssembly)](#15-run-in-the-browser-webassembly)
 - [Bring your own transport](#bring-your-own-transport)
@@ -2748,6 +2749,40 @@ error: this device has no group keys for bob
   `group init`. Each member shares their chain when they next run a group
   command (or right away, if they have `group sub` open), so a message
   can wait for its key; `read` picks it up later, and says so meanwhile.
+
+### See the graph live
+
+`gundb visual` opens a page in your browser that draws everything on a
+server as a graph, and keeps it live while others write:
+
+```sh
+gundb visual                                      # the server on http://localhost:8765/gun
+gundb visual --addr https://relay.example.com/gun
+gundb visual --listen localhost:9000 --no-open    # print the URL instead of opening it
+```
+
+The page is GUN.js and D3, loaded from a CDN, so it needs internet access.
+It connects to `--addr` as an ordinary GUN peer, lists every soul, and draws
+each node as a circle (purple in a user's space), its links as edges, and its
+values as small dots. Click a node to see its fields.
+
+- **New nodes and values** grow out of the node that links to them, with a
+  green glow. Changed ones flash orange. Deleted values turn red and fade
+  away, and a node with nothing left stays as a dashed outline, since GUN
+  never forgets a soul.
+- **Badges** sit on top of a node's circle: a lock when it holds encrypted
+  data, a green check when its signatures verify against the owner's key
+  (the page checks them itself with SEA), a red cross when one does not,
+  and a grey seal for data signed by someone the page can't tell, such as
+  `put --sign` outside your own space.
+- **The log** at the bottom lists each PUT, SET (a link added under its own
+  soul), DEL and GET, and clicking a row finds the node.
+
+The page sees writes to nodes it already has as they happen. A brand-new
+node that nothing links to shows up on the next rescan (`--rescan`, every
+5s by default). GETs from other clients show up only when the server passes
+them on, which it does when it cannot answer from its own store. Listing
+every soul needs a gundb server, or a GUN.js relay with radisk.
 
 ### Write your own client
 

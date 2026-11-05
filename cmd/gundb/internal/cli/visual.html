@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gundb visual</title>
+<style>
+:root {
+  --bg: #0f1115; --panel: #161a21; --panel-2: #1c2129; --line: #2a303b;
+  --text: #e6e9ef; --muted: #8b93a3; --faint: #5b6373;
+  --accent: #5aa9ff; --user: #b48cff; --leaf: #6b7486;
+  --new: #3ddc97; --upd: #ffb547; --del: #ff5d6c;
+  --lock: #f0b429; --ok: #2fbf71; --sig: #7d8597; --bad: #e5484d;
+  --edge-link: #5aa9ff66; --edge-val: #ffffff1a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f7f9; --panel: #ffffff; --panel-2: #f0f2f5; --line: #dde1e7;
+    --text: #1b1f27; --muted: #5d6573; --faint: #9aa1ad;
+    --accent: #1f6feb; --user: #7c4dff; --leaf: #8a93a3;
+    --new: #12a36b; --upd: #c77700; --del: #d63848;
+    --lock: #c98a00; --ok: #1a9a55; --sig: #8a93a3; --bad: #d63848;
+    --edge-link: #1f6feb55; --edge-val: #0000001f;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); height: 100vh; overflow: hidden; }
+
+header { display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+.addr { font-family: var(--mono); color: var(--muted); font-size: 12px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--del); display: inline-block; margin-right: 6px; }
+.dot.on { background: var(--new); box-shadow: 0 0 8px var(--new); }
+.stats { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.spacer { flex: 1; }
+.ctl { display: flex; gap: 8px; align-items: center; }
+.ctl label { color: var(--muted); font-size: 12px; display: flex; gap: 4px; align-items: center; cursor: pointer; }
+input[type=search] { background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  border-radius: 6px; padding: 4px 8px; font: 12px var(--mono); width: 180px; }
+button { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); border-radius: 6px;
+  padding: 3px 9px; font-size: 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+
+main { position: relative; min-height: 0; min-width: 0; display: flex; overflow: hidden; }
+#graph { flex: 1; min-width: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+#graph:active { cursor: grabbing; }
+.legend { position: absolute; left: 12px; bottom: 10px; display: flex; gap: 12px; color: var(--muted);
+  font-size: 11px; background: color-mix(in srgb, var(--panel) 85%, transparent); padding: 5px 9px;
+  border: 1px solid var(--line); border-radius: 6px; flex-wrap: wrap; pointer-events: none; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend svg { overflow: visible; }
+
+aside { width: 340px; max-width: 45vw; border-left: 1px solid var(--line); background: var(--panel);
+  overflow: auto; padding: 12px 14px; display: none; }
+aside.open { display: block; }
+aside h2 { font: 600 13px var(--mono); margin: 0 0 4px; word-break: break-all; }
+aside .sub { color: var(--muted); font-size: 12px; margin-bottom: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { display: inline-flex; align-items: center; gap: 4px; border-radius: 10px; padding: 1px 8px; font-size: 11px;
+  border: 1px solid var(--line); }
+.chip.ok { color: var(--ok); border-color: var(--ok); } .chip.lock { color: var(--lock); border-color: var(--lock); }
+.chip.bad { color: var(--bad); border-color: var(--bad); } .chip.sig { color: var(--sig); }
+.field { border-top: 1px solid var(--line); padding: 7px 0; }
+.field .k { font: 600 12px var(--mono); display: flex; gap: 6px; align-items: center; }
+.field .v { font: 12px var(--mono); color: var(--muted); white-space: pre-wrap; word-break: break-all; margin-top: 2px; max-height: 160px; overflow: auto; }
+.field .v a { color: var(--accent); cursor: pointer; text-decoration: underline; }
+.field .t { color: var(--faint); font-size: 11px; }
+.field.null .k { color: var(--del); text-decoration: line-through; }
+
+footer { border-top: 1px solid var(--line); background: var(--panel); height: 220px; display: flex; flex-direction: column; min-height: 0; }
+.logbar { display: flex; align-items: center; gap: 8px; padding: 5px 12px; border-bottom: 1px solid var(--line); }
+.logbar strong { font-size: 12px; }
+.filter { font: 600 10px var(--mono); padding: 2px 7px; border-radius: 4px; opacity: .35; }
+.filter.on { opacity: 1; }
+#log { flex: 1; overflow: auto; font: 12px/1.55 var(--mono); padding: 4px 0; }
+.row { display: grid; grid-template-columns: 92px 42px minmax(120px, 260px) 1fr; gap: 10px; padding: 0 12px; cursor: pointer; white-space: nowrap; }
+.row:hover { background: var(--panel-2); }
+.row .tm { color: var(--faint); } .row .soul { overflow: hidden; text-overflow: ellipsis; }
+.row .det { overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.row .det .null { color: var(--del); }
+.row.self { opacity: .6; }
+.row.fresh { animation: fresh 1.6s ease-out; }
+@keyframes fresh { from { background: color-mix(in srgb, var(--accent) 22%, transparent); } to { background: transparent; } }
+.tag { font-weight: 700; font-size: 10px; border-radius: 3px; text-align: center; padding: 0 3px; align-self: center; line-height: 16px; }
+.tag.PUT { background: color-mix(in srgb, var(--upd) 22%, transparent); color: var(--upd); }
+.tag.SET { background: color-mix(in srgb, var(--new) 22%, transparent); color: var(--new); }
+.tag.GET { background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--accent); }
+.tag.DEL { background: color-mix(in srgb, var(--del) 22%, transparent); color: var(--del); }
+.tag.SYS { background: var(--panel-2); color: var(--muted); }
+
+/* graph */
+.edge { fill: none; }
+.edge.link { stroke: var(--edge-link); stroke-width: 1.4; }
+.edge.val { stroke: var(--edge-val); stroke-width: 1; }
+.edge.dying { stroke: var(--del); }
+.elabel { font: 9px var(--mono); fill: var(--faint); pointer-events: none; }
+.node circle.body { stroke-width: 1.5; transition: stroke .4s, fill .4s; }
+.node.soul circle.body { fill: color-mix(in srgb, var(--accent) 25%, var(--panel)); stroke: var(--accent); }
+.node.soul.user circle.body { fill: color-mix(in srgb, var(--user) 25%, var(--panel)); stroke: var(--user); }
+.node.soul.ghost circle.body { fill: var(--panel); stroke-dasharray: 3 3; opacity: .55; }
+.node.leaf circle.body { fill: var(--leaf); stroke: none; }
+.node.leaf.enc circle.body { fill: var(--lock); }
+.node.hot circle.body { stroke: var(--upd); stroke-width: 3; }
+.node.born circle.body { stroke: var(--new); stroke-width: 3; }
+.node.selected circle.body { stroke: var(--text); stroke-width: 2.5; }
+.node.dim { opacity: .18; }
+.node.dying circle.body { fill: var(--del); stroke: var(--del); }
+.node text { font: 11px var(--mono); fill: var(--text); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; pointer-events: none; }
+.node.leaf text { font-size: 10px; fill: var(--muted); }
+.node.dying text { fill: var(--del); text-decoration: line-through; }
+.pulse { fill: none; pointer-events: none; }
+.badge circle { stroke: var(--bg); stroke-width: 1.5; }
+.badge path, .badge rect { fill: none; stroke: #fff; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
+.badge rect.solid { fill: #fff; stroke: none; }
+.empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); pointer-events: none; text-align: center; }
+
+@media (max-width: 700px) {
+  aside { position: absolute; right: 0; top: 0; bottom: 0; max-width: 90vw; }
+  .row { grid-template-columns: 70px 38px 110px 1fr; }
+  footer { height: 170px; }
+  input[type=search] { width: 120px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>gundb visual</h1>
+  <span class="addr"><span id="dot" class="dot"></span><span id="addr"></span></span>
+  <span class="stats" id="stats"></span>
+  <span class="spacer"></span>
+  <div class="ctl">
+    <input id="search" type="search" placeholder="find soul or key…">
+    <label><input id="showValues" type="checkbox" checked> values</label>
+    <button id="fit" title="Zoom to fit">fit</button>
+    <button id="rescan" title="List every soul again">rescan</button>
+  </div>
+</header>
+<main>
+  <svg id="graph"></svg>
+  <div class="empty" id="empty">Connecting…</div>
+  <div class="legend" id="legend"></div>
+  <aside id="details"></aside>
+</main>
+<footer>
+  <div class="logbar">
+    <strong>Log</strong>
+    <span class="filter tag PUT on" data-t="PUT">PUT</span>
+    <span class="filter tag SET on" data-t="SET">SET</span>
+    <span class="filter tag DEL on" data-t="DEL">DEL</span>
+    <span class="filter tag GET on" data-t="GET">GET</span>
+    <span class="filter tag SYS on" data-t="SYS">SYS</span>
+    <span class="spacer"></span>
+    <label class="stats"><input id="follow" type="checkbox" checked> follow</label>
+    <button id="clear">clear</button>
+  </div>
+  <div id="log"></div>
+</footer>
+
+<script>window.GUNDB_VISUAL = {/*CONFIG*/};</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gun@0.2020.1241/gun.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/gun@0.2020.1241/sea.js"></script>
+<script>
+(function () {
+'use strict';
+const CFG = window.GUNDB_VISUAL;
+const $ = (id) => document.getElementById(id);
+$('addr').textContent = CFG.addr;
+if (!window.d3 || !window.Gun) {
+  $('empty').textContent = 'Could not load D3 or GUN from the CDN. Are you online?';
+  return;
+}
+
+// ---------------------------------------------------------------- data
+// souls: soul -> {soul, fields: {key: value}, states: {key: number}, loaded}
+const souls = new Map();
+const isLink = (v) => v && typeof v === 'object' && typeof v['#'] === 'string' && Object.keys(v).length === 1;
+const isUser = (soul) => soul[0] === '~' && soul[1] !== '@';
+const pubOf = (soul) => { if (!isUser(soul)) return ''; const s = soul.slice(1).split('/')[0]; return s.includes('.') ? s : ''; };
+
+function entry(soul) {
+  let e = souls.get(soul);
+  if (!e) { e = { soul, fields: {}, states: {}, loaded: false }; souls.set(soul, e); }
+  return e;
+}
+
+// merge applies one node off the wire by GUN's state rules and returns
+// what changed.
+function merge(soul, node) {
+  const e = entry(soul), wasNew = !e.loaded, changes = [];
+  const st = (node && node._ && node._['>']) || {};
+  for (const key in node) {
+    if (key === '_') continue;
+    const v = node[key], s = st[key];
+    const known = e.states[key];
+    if (known !== undefined && s !== undefined && s < known) continue;
+    const old = e.fields[key];
+    if (key in e.fields && JSON.stringify(old) === JSON.stringify(v)) { if (s !== undefined) e.states[key] = s; continue; }
+    e.fields[key] = v;
+    if (s !== undefined) e.states[key] = s;
+    changes.push({ soul, key, old, v });
+  }
+  e.loaded = true;
+  return { wasNew, changes };
+}
+
+// ---------------------------------------------------------------- SEA
+// sec(soul, key) describes a stored value:
+//   {enc, signed, status: 'ok' | 'bad' | 'pending' | 'unknown', plain}
+const verified = new Map(); // soul\x01key\x01state -> 'ok' | 'bad' | 'pending'
+function parseSEA(v) {
+  if (typeof v !== 'string') return null;
+  try {
+    if (v.startsWith('SEA{')) return JSON.parse(v.slice(3));
+    if (v[0] === '{') { const o = JSON.parse(v); if (o && ':' in o && '~' in o) return o; }
+  } catch (e) {}
+  return null;
+}
+// unwrap returns the value inside a signed user-space field, so a signed
+// link is still a link.
+function unwrap(v) { const o = parseSEA(v); return o && ':' in o && '~' in o ? o[':'] : v; }
+// gone reports a deleted field: null, or a signed null in user space.
+const gone = (v) => v === null || unwrap(v) === null;
+const isCipher = (v) => { const o = typeof v === 'string' ? parseSEA(v) : v; return !!(o && typeof o === 'object' && 'ct' in o && 'iv' in o); };
+
+function sec(soul, key) {
+  const e = souls.get(soul); if (!e) return null;
+  const v = e.fields[key];
+  const o = parseSEA(v);
+  if (!o) return null;
+  if ('ct' in o && 'iv' in o) return { enc: true, signed: false, status: '', plain: '(encrypted)' };
+  if (':' in o && '~' in o) { // a field in a user's space: {":": value, "~": signature}
+    const pub = pubOf(soul);
+    const res = { enc: isCipher(o[':']), signed: true, status: 'unknown', plain: o[':'] };
+    if (pub) res.status = verifyField(soul, key, o, e.states[key], pub);
+    return res;
+  }
+  if ('m' in o && 's' in o) return { enc: isCipher(o.m), signed: true, status: 'unknown', plain: o.m };
+  return null;
+}
+
+// verifyField checks a user-space signature against the soul owner's key,
+// the way SEA does: over {"#": soul, ".": key, ":": value, ">": state}.
+function verifyField(soul, key, o, state, pub) {
+  const id = soul + '\x01' + key + '\x01' + state;
+  const had = verified.get(id);
+  if (had) return had;
+  if (!window.SEA || state === undefined || (soul === '~' + pub && key === 'pub')) { return 'unknown'; }
+  verified.set(id, 'pending');
+  const m = JSON.stringify({ '#': soul, '.': key, ':': o[':'], '>': state });
+  Promise.resolve(SEA.verify({ m, s: o['~'] }, pub))
+    .then((r) => verified.set(id, r === undefined ? 'bad' : 'ok'))
+    .catch(() => verified.set(id, 'bad'))
+    .then(() => { schedule(); refreshDetails(); });
+  return 'pending';
+}
+
+// nodeSec sums a soul's fields: any encrypted, any signed, and the worst
+// signature status.
+function nodeSec(soul) {
+  const e = souls.get(soul); const r = { enc: false, signed: false, status: '' };
+  if (!e) return r;
+  const rank = { bad: 4, pending: 3, unknown: 2, ok: 1, '': 0 };
+  for (const key in e.fields) {
+    if (gone(e.fields[key])) continue;
+    const s = sec(soul, key); if (!s) continue;
+    r.enc = r.enc || s.enc;
+    if (s.signed) { r.signed = true; if (rank[s.status] > rank[r.status]) r.status = s.status; }
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------- GUN
+const gun = Gun({ peers: [CFG.addr], localStorage: false, radisk: false, axe: false });
+const root = gun._;
+const mesh = root.opt.mesh;
+const scans = new Map(); // our get id -> {kind, soul, found, fresh}
+let connected = 0, firstScanDone = false;
+
+function rid() { return String.random ? String.random(9) : Math.random().toString(36).slice(2, 11); }
+function send(get, kind, soul) {
+  const id = rid();
+  scans.set(id, { kind, soul, found: 0, fresh: 0, at: Date.now() });
+  setTimeout(() => scans.delete(id), 60000);
+  root.on('out', { '#': id, get });
+  return id;
+}
+function scanAll(why) {
+  send({ '#': { '*': '' } }, 'scan', '*');
+  if (why) log('GET', '*', why, true);
+}
+const requested = new Set();
+function want(soul) {
+  if (requested.has(soul)) return;
+  requested.add(soul);
+  send({ '#': soul }, 'one', soul);
+}
+
+// Every message from the server passes through mesh.hear: read it there,
+// before GUN's own handling.
+const hear = mesh.hear;
+mesh.hear = function (raw, peer) {
+  try {
+    let msgs = raw;
+    if (typeof raw === 'string') msgs = JSON.parse(raw);
+    [].concat(msgs).forEach(inspect);
+  } catch (e) { /* not JSON: GUN will complain about it itself */ }
+  return hear.apply(this, arguments);
+};
+
+root.on('hi', function (peer) {
+  this.to && this.to.next && this.to.next(peer);
+  connected++; status();
+  log('SYS', '', 'connected to ' + CFG.addr, true);
+  scanAll(firstScanDone ? 'list every soul (reconnected)' : 'list every soul');
+  requested.clear();
+});
+root.on('bye', function (peer) {
+  this.to && this.to.next && this.to.next(peer);
+  connected = Math.max(0, connected - 1); status();
+  log('SYS', '', 'disconnected; GUN will reconnect', true);
+});
+if (CFG.rescan > 0) setInterval(() => { if (connected) scanAll(); }, CFG.rescan);
+
+function inspect(msg) {
+  if (!msg || typeof msg !== 'object' || msg.dam) return;
+  const reply = msg['@'] && scans.get(msg['@']);
+  if (msg.get && !msg['@']) {
+    const g = msg.get, soul = typeof g['#'] === 'string' ? g['#'] : JSON.stringify(g['#']);
+    log('GET', soul, g['.'] ? '.' + (typeof g['.'] === 'string' ? g['.'] : JSON.stringify(g['.'])) : '', false);
+  }
+  if (!msg.put || typeof msg.put !== 'object') {
+    if (reply && reply.kind === 'scan' && !msg['%']) scanDone(reply);
+    return;
+  }
+  // A put is one node per soul, {_: {#, >}, key: value…}; a few GUN
+  // versions send one field at a time as {#, ., :, >}.
+  let put = msg.put;
+  if (typeof put['#'] === 'string' && '.' in put) {
+    put = { [put['#']]: { _: { '#': put['#'], '>': { [put['.']]: put['>'] } }, [put['.']]: put[':'] } };
+  }
+  const fromOthers = !msg['@'];
+  for (const soul in put) {
+    const node = put[soul];
+    if (!node || typeof node !== 'object') continue;
+    const before = souls.has(soul) && souls.get(soul).loaded;
+    const { changes } = merge(soul, node);
+    if (reply) { reply.found++; if (!before) reply.fresh++; }
+    if (changes.length === 0) continue;
+    const quiet = !firstScanDone && !fromOthers;
+    for (const c of changes) {
+      const lv = unwrap(c.v);
+      if (isLink(lv) && !souls.has(lv['#'])) want(lv['#']);
+      if (!quiet) mark(c, before);
+    }
+    if (fromOthers) logPut(soul, changes);
+    else if (firstScanDone && reply && reply.kind === 'scan') logPut(soul, changes, before ? 'missed update, found by rescan' : 'new node, found by rescan');
+  }
+  if (reply && reply.kind === 'scan' && !msg['%']) scanDone(reply);
+  schedule();
+}
+
+function scanDone(r) {
+  if (!firstScanDone) {
+    firstScanDone = true;
+    log('SYS', '*', souls.size + ' node' + (souls.size === 1 ? '' : 's') + ' loaded', true);
+    setTimeout(fit, 900);
+  }
+  for (const [, e] of souls) if (!e.loaded) want(e.soul);
+  schedule();
+}
+
+// A set adds a link keyed by the linked soul itself (gun.set and gundb
+// set both do); a path's parent link is keyed by the last segment only.
+function isSetChange(c) {
+  const v = unwrap(c.v);
+  return isLink(v) && v['#'] === c.key;
+}
+function logPut(soul, changes, note) {
+  const dels = changes.filter((c) => gone(c.v));
+  const sets = changes.filter(isSetChange);
+  const type = dels.length === changes.length ? 'DEL' : sets.length && sets.length === changes.length - dels.length ? 'SET' : 'PUT';
+  const parts = changes.map((c) => ({ key: c.key, text: gone(c.v) ? null : short(display(soul, c.key, c.v), 60) }));
+  log(type, soul, parts, false, note);
+}
+
+// ---------------------------------------------------------------- effects
+// Pending visual effects, applied once the nodes are drawn.
+const effects = new Map(); // node id -> 'born' | 'hot'
+const parentHint = new Map(); // node id -> node id to grow out of
+function mark(c, soulExisted) {
+  // Re-signing a field with the same value is a write, but not a change.
+  if (c.old !== undefined && JSON.stringify(unwrap(c.old)) === JSON.stringify(unwrap(c.v))) return;
+  const sid = 's:' + c.soul;
+  if (!soulExisted) effects.set(sid, 'born');
+  else if (!effects.has(sid)) effects.set(sid, 'hot');
+  const lv = unwrap(c.v);
+  if (isLink(lv)) {
+    const tid = 's:' + lv['#'];
+    parentHint.set(tid, sid);
+    if (!souls.has(lv['#']) || !souls.get(lv['#']).loaded) effects.set(tid, 'born');
+  } else if (!gone(c.v)) {
+    const lid = 'v:' + c.soul + '\x01' + c.key;
+    effects.set(lid, c.old === undefined || gone(c.old) ? 'born' : 'hot');
+  }
+}
+
+// ---------------------------------------------------------------- display helpers
+function display(soul, key, v) {
+  if (gone(v)) return '∅';
+  if (isLink(unwrap(v))) return '→ ' + unwrap(v)['#'];
+  const s = sec(soul, key);
+  if (s) {
+    if (s.enc) return '(encrypted)';
+    v = s.plain;
+  }
+  return typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v);
+}
+function short(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
+function shortSoul(soul) {
+  if (isUser(soul)) {
+    const i = soul.indexOf('/'), pub = i < 0 ? soul.slice(1) : soul.slice(1, i);
+    return '~' + pub.slice(0, 6) + '…' + (i < 0 ? '' : soul.slice(i));
+  }
+  return short(soul, 28);
+}
+
+// ---------------------------------------------------------------- log
+const logEl = $('log');
+const filters = new Set(['PUT', 'SET', 'DEL', 'GET', 'SYS']);
+const logRows = [];
+function log(type, soul, detail, self, note) {
+  const row = document.createElement('div');
+  row.className = 'row fresh' + (self ? ' self' : '');
+  row.dataset.t = type;
+  const tm = document.createElement('span'); tm.className = 'tm';
+  const d = new Date();
+  tm.textContent = d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  const tg = document.createElement('span'); tg.className = 'tag ' + type; tg.textContent = type;
+  const sl = document.createElement('span'); sl.className = 'soul'; sl.textContent = soul; sl.title = soul;
+  const dt = document.createElement('span'); dt.className = 'det';
+  if (Array.isArray(detail)) {
+    detail.forEach((p, i) => {
+      if (i) dt.append('  ');
+      if (p.text === null) { const x = document.createElement('span'); x.className = 'null'; x.textContent = p.key + ' ✕'; dt.append(x); }
+      else dt.append(p.key + '=' + p.text);
+    });
+  } else dt.textContent = detail || '';
+  if (note) { const n = document.createElement('i'); n.textContent = '  (' + note + ')'; n.style.color = 'var(--faint)'; dt.append(n); }
+  dt.title = dt.textContent;
+  row.append(tm, tg, sl, dt);
+  if (soul && soul !== '*' && souls.has(soul)) row.onclick = () => select('s:' + soul, true);
+  row.style.display = filters.has(type) ? '' : 'none';
+  logEl.append(row); logRows.push(row);
+  while (logRows.length > 1000) logRows.shift().remove();
+  if ($('follow').checked) logEl.scrollTop = logEl.scrollHeight;
+}
+document.querySelectorAll('.filter').forEach((f) => f.onclick = () => {
+  const t = f.dataset.t;
+  if (filters.has(t)) filters.delete(t); else filters.add(t);
+  f.classList.toggle('on', filters.has(t));
+  logRows.forEach((r) => r.style.display = filters.has(r.dataset.t) ? '' : 'none');
+});
+$('clear').onclick = () => { logRows.splice(0).forEach((r) => r.remove()); };
+
+// ---------------------------------------------------------------- graph
+const svg = d3.select('#graph');
+const viewport = svg.append('g');
+const gEdges = viewport.append('g');
+const gNodes = viewport.append('g');
+const zoom = d3.zoom().scaleExtent([0.05, 6]).on('zoom', (ev) => viewport.attr('transform', ev.transform));
+svg.call(zoom).on('dblclick.zoom', null);
+svg.on('click', (ev) => { if (ev.target === svg.node()) select(null); });
+
+const sim = d3.forceSimulation()
+  .force('link', d3.forceLink().id((d) => d.id).distance((l) => l.kind === 'val' ? 44 : 100).strength((l) => l.kind === 'val' ? 0.9 : 0.35))
+  .force('charge', d3.forceManyBody().strength((d) => d.kind === 'leaf' ? -35 : -260).distanceMax(600))
+  .force('collide', d3.forceCollide().radius((d) => d.r + (d.kind === 'leaf' ? 3 : 10)))
+  .force('x', d3.forceX(0).strength(0.025))
+  .force('y', d3.forceY(0).strength(0.025))
+  .alphaDecay(0.025)
+  .on('tick', tick);
+
+let nodes = [], links = [];
+const byId = new Map();
+let selected = null;
+
+function resize() {
+  const r = svg.node().getBoundingClientRect();
+  svg.attr('viewBox', [-r.width / 2, -r.height / 2, r.width, r.height]);
+}
+new ResizeObserver(resize).observe(svg.node()); resize();
+
+let pending = 0;
+function schedule() {
+  if (pending) return;
+  pending = setTimeout(() => { pending = 0; render(); }, 60);
+}
+
+function radius(e) { return 8 + Math.min(10, Math.sqrt(Object.keys(e.fields).length) * 2); }
+
+function build() {
+  const showValues = $('showValues').checked;
+  const want = [], wantLinks = [];
+  for (const [soul, e] of souls) {
+    const live = Object.keys(e.fields).filter((k) => !gone(e.fields[k]));
+    want.push({ id: 's:' + soul, kind: 'soul', soul, r: radius(e), ghost: !e.loaded || live.length === 0 });
+    for (const key of live) {
+      const v = unwrap(e.fields[key]);
+      if (isLink(v)) {
+        entry(v['#']);
+        wantLinks.push({ id: 'e:' + soul + '\x01' + key, source: 's:' + soul, target: 's:' + v['#'], kind: 'link', key });
+      } else if (showValues) {
+        const id = 'v:' + soul + '\x01' + key;
+        want.push({ id, kind: 'leaf', soul, key, r: 4 });
+        wantLinks.push({ id: 'e:' + soul + '\x01' + key, source: 's:' + soul, target: id, kind: 'val', key });
+      }
+    }
+  }
+  // links may have added entries for unknown souls: give them nodes too
+  for (const [soul, e] of souls) if (!want.some((n) => n.id === 's:' + soul)) want.push({ id: 's:' + soul, kind: 'soul', soul, r: radius(e), ghost: true });
+  return { want, wantLinks };
+}
+
+function render() {
+  const { want, wantLinks } = build();
+  // Keep the objects D3 already positions; place new ones at the node
+  // they grow from.
+  const next = [];
+  const firstLinker = new Map();
+  for (const l of wantLinks) if (!firstLinker.has(l.target)) firstLinker.set(l.target, l.source);
+  for (const n of want) {
+    let o = byId.get(n.id);
+    if (o) { Object.assign(o, { r: n.r, ghost: n.ghost }); }
+    else {
+      o = n;
+      const from = byId.get(parentHint.get(n.id) || firstLinker.get(n.id) || ('s:' + n.soul));
+      if (from && from.x !== undefined) {
+        o.x = from.x + (Math.random() - 0.5) * 6; o.y = from.y + (Math.random() - 0.5) * 6;
+      } else {
+        const a = Math.random() * Math.PI * 2, d = 40 + Math.random() * 120;
+        o.x = Math.cos(a) * d; o.y = Math.sin(a) * d;
+      }
+      o.isNew = true;
+    }
+    next.push(o);
+  }
+  byId.clear(); next.forEach((n) => byId.set(n.id, n));
+  nodes = next;
+  links = wantLinks;
+
+  // edges
+  const eSel = gEdges.selectAll('g.edgewrap').data(links, (d) => d.id);
+  eSel.exit().each(function () {
+    d3.select(this).select('line').classed('dying', true);
+  }).transition().duration(1500).style('opacity', 0).remove();
+  const eEnter = eSel.enter().append('g').attr('class', 'edgewrap').style('opacity', 0);
+  eEnter.append('line').attr('class', (d) => 'edge ' + d.kind);
+  eEnter.filter((d) => d.kind === 'link').append('text').attr('class', 'elabel').text((d) => short(d.key, 18));
+  eEnter.transition().duration(firstScanDone ? 1400 : 300).style('opacity', 1);
+
+  // nodes
+  const nSel = gNodes.selectAll('g.node').data(nodes, (d) => d.id);
+  nSel.exit().classed('dying', true).raise()
+    .transition().duration(1600).ease(d3.easeCubicIn).style('opacity', 0)
+    .select('circle.body').attr('r', 0);
+  nSel.exit().transition().delay(1650).remove();
+
+  const nEnter = nSel.enter().append('g')
+    .attr('class', (d) => 'node ' + d.kind)
+    .style('opacity', 0)
+    .call(d3.drag()
+      .on('start', (ev, d) => { if (!ev.active) sim.alphaTarget(0.2).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag', (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
+      .on('end', (ev, d) => { if (!ev.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }))
+    .on('click', (ev, d) => { ev.stopPropagation(); select(d.id); });
+  nEnter.append('circle').attr('class', 'body').attr('r', 0);
+  nEnter.append('text');
+  nEnter.append('g').attr('class', 'badges');
+  nEnter.append('title');
+  const slow = firstScanDone;
+  nEnter.transition().duration(slow ? 1400 : 300).ease(d3.easeCubicOut).style('opacity', 1);
+  nEnter.select('circle.body').transition().duration(slow ? 1100 : 300).ease(d3.easeBackOut.overshoot(1.4)).attr('r', (d) => d.r);
+
+  const all = nEnter.merge(nSel);
+  all.classed('user', (d) => d.kind === 'soul' && isUser(d.soul))
+     .classed('ghost', (d) => !!d.ghost)
+     .classed('enc', (d) => d.kind === 'leaf' && !!(sec(d.soul, d.key) || {}).enc);
+  all.filter((d) => !d.isNew).select('circle.body').attr('r', (d) => d.r);
+  all.select('text')
+    .attr('text-anchor', (d) => d.kind === 'leaf' ? 'start' : 'middle')
+    .attr('x', (d) => d.kind === 'leaf' ? 7 : 0)
+    .attr('y', (d) => d.kind === 'leaf' ? 3.5 : d.r + 14)
+    .text((d) => d.kind === 'leaf' ? d.key + ': ' + short(display(d.soul, d.key, souls.get(d.soul).fields[d.key]), 30) : shortSoul(d.soul));
+  all.select('title').text((d) => d.kind === 'leaf' ? d.soul + ' . ' + d.key : d.soul);
+  all.each(drawBadges);
+  nodes.forEach((n) => { n.isNew = false; });
+
+  // effects: grow-in glow for new things, a flash for changed ones
+  for (const [id, kind] of effects) {
+    const el = gNodes.selectAll('g.node').filter((d) => d.id === id);
+    if (!el.empty()) pulse(el, kind);
+  }
+  effects.clear(); parentHint.clear();
+
+  sim.nodes(nodes);
+  sim.force('link').links(links);
+  sim.alpha(firstScanDone ? 0.35 : 0.9).restart();
+  applySearch();
+  stats();
+  $('empty').style.display = souls.size ? 'none' : '';
+  if (connected && !souls.size) $('empty').textContent = firstScanDone ? 'The server has no data yet. Put something: gundb put hello/world 1' : 'Loading…';
+  refreshDetails();
+}
+
+function pulse(el, kind) {
+  const color = kind === 'born' ? 'var(--new)' : 'var(--upd)';
+  el.classed(kind, true);
+  const d = el.datum();
+  clearTimeout(d['t_' + kind]);
+  d['t_' + kind] = setTimeout(() => el.classed(kind, false), 2600);
+  for (let i = 0; i < 2; i++) {
+    el.insert('circle', ':first-child').attr('class', 'pulse').attr('r', d.r)
+      .style('stroke', color).style('stroke-width', 2.5).style('stroke-opacity', 0.9)
+      .transition().delay(i * 450).duration(1500).ease(d3.easeCubicOut)
+      .attr('r', d.r + (d.kind === 'leaf' ? 12 : 26)).style('stroke-opacity', 0).remove();
+  }
+}
+
+// Badges sit on top of a node's circle: a lock when it holds encrypted
+// data, a check when its signatures verify (red cross if one does not,
+// a grey seal when signed by someone the page cannot check).
+const ICON = {
+  lock: (g) => {
+    g.append('rect').attr('class', 'solid').attr('x', -3.2).attr('y', -0.6).attr('width', 6.4).attr('height', 4.6).attr('rx', 1);
+    g.append('path').attr('d', 'M-1.9,-0.6 V-2.2 A1.9,1.9 0 0 1 1.9,-2.2 V-0.6');
+  },
+  ok: (g) => g.append('path').attr('d', 'M-2.6,0.1 L-0.8,1.9 L2.7,-1.8'),
+  bad: (g) => g.append('path').attr('d', 'M-2,-2 L2,2 M2,-2 L-2,2'),
+  pending: (g) => g.append('path').attr('d', 'M0,-2.4 V0.2 L1.6,1.4'),
+  unknown: (g) => g.append('path').attr('d', 'M-2.4,-0.6 H2.4 M-2.4,1.4 H1.2'),
+};
+const BADGE_COLOR = { lock: 'var(--lock)', ok: 'var(--ok)', bad: 'var(--bad)', pending: 'var(--sig)', unknown: 'var(--sig)' };
+const BADGE_TITLE = {
+  lock: 'encrypted', ok: 'signed, signature verified', bad: 'signature does NOT verify',
+  pending: 'signed, verifying…', unknown: 'signed (signer not known, not verified)',
+};
+function badgesFor(d) {
+  let s;
+  if (d.kind === 'leaf') {
+    const f = sec(d.soul, d.key) || {};
+    s = { enc: f.enc, signed: f.signed, status: f.status };
+  } else s = nodeSec(d.soul);
+  const out = [];
+  if (s.enc) out.push('lock');
+  if (s.signed) out.push(s.status || 'unknown');
+  return out;
+}
+function drawBadges(d) {
+  const list = badgesFor(d);
+  const key = list.join(',');
+  const g = d3.select(this).select('g.badges');
+  if (g.attr('data-k') === key && g.attr('data-r') === String(d.r)) return;
+  g.attr('data-k', key).attr('data-r', d.r).selectAll('*').remove();
+  const size = d.kind === 'leaf' ? 0.72 : 1;
+  const step = 15 * size;
+  list.forEach((b, i) => {
+    const x = (i - (list.length - 1) / 2) * step;
+    const y = -d.r - 7 * size;
+    const bg = g.append('g').attr('class', 'badge').attr('transform', `translate(${x},${y}) scale(${size})`);
+    bg.append('title').text(BADGE_TITLE[b]);
+    bg.append('circle').attr('r', 6.5).style('fill', BADGE_COLOR[b]);
+    ICON[b === 'lock' ? 'lock' : b](bg);
+  });
+}
+
+function tick() {
+  gEdges.selectAll('g.edgewrap').each(function (l) {
+    if (typeof l.source !== 'object') return;
+    const g = d3.select(this);
+    g.select('line').attr('x1', l.source.x).attr('y1', l.source.y).attr('x2', l.target.x).attr('y2', l.target.y);
+    g.select('text').attr('x', (l.source.x + l.target.x) / 2).attr('y', (l.source.y + l.target.y) / 2 - 3);
+  });
+  gNodes.selectAll('g.node').attr('transform', (d) => `translate(${d.x},${d.y})`);
+}
+
+function fit() {
+  if (!nodes.length) return;
+  const r = svg.node().getBoundingClientRect();
+  const xs = nodes.map((n) => n.x), ys = nodes.map((n) => n.y);
+  const x0 = Math.min(...xs) - 60, x1 = Math.max(...xs) + 140, y0 = Math.min(...ys) - 50, y1 = Math.max(...ys) + 50;
+  const k = Math.min(2, 0.95 / Math.max((x1 - x0) / r.width, (y1 - y0) / r.height));
+  svg.transition().duration(700).call(zoom.transform, d3.zoomIdentity.scale(k).translate(-(x0 + x1) / 2, -(y0 + y1) / 2));
+}
+$('fit').onclick = fit;
+$('rescan').onclick = () => scanAll('list every soul (button)');
+$('showValues').onchange = render;
+
+function stats() {
+  let vals = 0, enc = 0, signed = 0;
+  for (const [soul, e] of souls) for (const k in e.fields) {
+    if (gone(e.fields[k])) continue;
+    if (!isLink(unwrap(e.fields[k]))) vals++;
+    const s = sec(soul, k); if (s) { if (s.enc) enc++; if (s.signed) signed++; }
+  }
+  $('stats').textContent = `${souls.size} nodes · ${vals} values · ${signed} signed · ${enc} encrypted`;
+}
+function status() { $('dot').classList.toggle('on', connected > 0); }
+
+// ---------------------------------------------------------------- search & details
+$('search').oninput = applySearch;
+function applySearch() {
+  const q = $('search').value.trim().toLowerCase();
+  gNodes.selectAll('g.node').classed('dim', (d) => {
+    if (!q) return false;
+    return !(d.soul.toLowerCase().includes(q) || (d.key || '').toLowerCase().includes(q));
+  });
+}
+
+function select(id, focus) {
+  if (id && id.startsWith('v:')) id = 's:' + byId.get(id).soul;
+  selected = id;
+  gNodes.selectAll('g.node').classed('selected', (d) => d.id === id);
+  refreshDetails();
+  const n = id && byId.get(id);
+  if (focus && n) {
+    const t = d3.zoomTransform(svg.node());
+    svg.transition().duration(600).call(zoom.translateTo, n.x, n.y);
+  }
+}
+
+function refreshDetails() {
+  const el = $('details');
+  const soul = selected && selected.slice(2);
+  const e = soul && souls.get(soul);
+  if (!e) { el.classList.remove('open'); return; }
+  el.classList.add('open');
+  el.replaceChildren();
+  const h = document.createElement('h2'); h.textContent = soul; el.append(h);
+  const sub = document.createElement('div'); sub.className = 'sub';
+  const ns = nodeSec(soul);
+  const chip = (cls, text) => { const c = document.createElement('span'); c.className = 'chip ' + cls; c.textContent = text; sub.append(c); };
+  if (isUser(soul)) chip('', 'user space');
+  if (ns.enc) chip('lock', '🔒 encrypted');
+  if (ns.signed) chip(ns.status === 'ok' ? 'ok' : ns.status === 'bad' ? 'bad' : 'sig', { ok: '✓ verified', bad: '✕ bad signature', pending: 'verifying…' }[ns.status] || 'signed, not verified');
+  if (!e.loaded) chip('', 'not loaded');
+  el.append(sub);
+  const keys = Object.keys(e.fields).sort();
+  if (!keys.length) { const p = document.createElement('div'); p.className = 'sub'; p.textContent = 'No fields.'; el.append(p); }
+  for (const key of keys) {
+    const v = e.fields[key];
+    const f = document.createElement('div'); f.className = 'field' + (gone(v) ? ' null' : '');
+    const k = document.createElement('div'); k.className = 'k'; k.textContent = key;
+    const s = sec(soul, key);
+    if (s && s.enc) { const c = document.createElement('span'); c.className = 'chip lock'; c.textContent = '🔒'; c.title = 'encrypted'; k.append(c); }
+    if (s && s.signed) { const c = document.createElement('span'); c.className = 'chip ' + (s.status === 'ok' ? 'ok' : s.status === 'bad' ? 'bad' : 'sig'); c.textContent = s.status === 'ok' ? '✓' : s.status === 'bad' ? '✕' : 'signed'; c.title = BADGE_TITLE[s.status || 'unknown']; k.append(c); }
+    const val = document.createElement('div'); val.className = 'v';
+    const lv = unwrap(v);
+    if (isLink(lv)) {
+      const a = document.createElement('a'); a.textContent = '→ ' + lv['#'];
+      a.onclick = () => select('s:' + lv['#'], true);
+      val.append(a);
+    } else if (gone(v)) val.textContent = 'deleted';
+    else {
+      val.textContent = s && s.enc ? 'encrypted: read it with gundb get <path> --dec'
+        : s ? JSON.stringify(s.plain, null, 2) : typeof v === 'string' ? v : JSON.stringify(v, null, 2);
+      if (s) { const raw = document.createElement('div'); raw.className = 't'; raw.textContent = 'stored: ' + short(typeof v === 'string' ? v : JSON.stringify(v), 160); val.append(raw); }
+    }
+    const t = document.createElement('div'); t.className = 't';
+    if (e.states[key] !== undefined) t.textContent = new Date(e.states[key]).toLocaleString();
+    f.append(k, val, t);
+    el.append(f);
+  }
+}
+
+// ---------------------------------------------------------------- legend
+(function legend() {
+  const items = [
+    ['circle', 'var(--accent)', 'node'], ['circle', 'var(--user)', 'user space (~)'], ['leaf', 'var(--leaf)', 'value'],
+    ['lock', null, 'encrypted'], ['ok', null, 'signature verified'], ['unknown', null, 'signed, not verifiable'], ['bad', null, 'bad signature'],
+  ];
+  const lg = d3.select('#legend');
+  for (const [kind, color, text] of items) {
+    const s = lg.append('span');
+    const g = s.append('svg').attr('width', 14).attr('height', 14).append('g').attr('transform', 'translate(7,7)');
+    if (kind === 'circle') g.append('circle').attr('r', 5).style('fill', `color-mix(in srgb, ${color} 25%, var(--panel))`).style('stroke', color).style('stroke-width', 1.5);
+    else if (kind === 'leaf') g.append('circle').attr('r', 3.5).style('fill', color);
+    else { const b = g.append('g').attr('class', 'badge'); b.append('circle').attr('r', 6.5).style('fill', BADGE_COLOR[kind]); ICON[kind](b); }
+    s.append('span').text(text);
+  }
+})();
+
+log('SYS', '', 'connecting to ' + CFG.addr, true);
+setTimeout(() => { if (!connected) $('empty').textContent = 'Cannot reach ' + CFG.addr + ' — is gundb server running? Retrying…'; }, 4000);
+})();
+</script>
+</body>
+</html>
