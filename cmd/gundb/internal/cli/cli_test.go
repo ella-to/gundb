@@ -506,6 +506,7 @@ func TestLinks(t *testing.T) {
 		{[]string{"put", "users", "--link", "users/2", a}, []string{"top-level node", "gundb set users --link users/2"}},
 		{[]string{"put", "users/1/x", "--link", "users/2", "--enc", a}, []string{"--enc does not work with --link"}},
 		{[]string{"unset", "users/1/friends", a}, []string{"unset needs --link"}},
+		{[]string{"unset", "users/1/friends", "--link", "users/2", a}, []string{"users/1/friends does not link to users/2"}},
 		{[]string{"get", "users/1/name", "--links", a}, []string{"is a value, not a node"}},
 	} {
 		_, stderr, err := run(t, "", tc.args...)
@@ -514,6 +515,14 @@ func TestLinks(t *testing.T) {
 			continue
 		}
 		wantOut(t, stderr, tc.want...)
+	}
+
+	// unset also removes the link a path write leaves in the parent
+	// (users.2 from put users/2/name); users/2 then has no path, only its
+	// soul.
+	wantOut(t, must(t, "unset", "users", "--link", "users/2", a), "no longer links to users/2")
+	if out := must(t, "get", "users", "--links", a); strings.Contains(out, `"users/2"`) {
+		t.Errorf("path link not removed: %s", out)
 	}
 }
 

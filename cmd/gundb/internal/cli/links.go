@@ -29,7 +29,7 @@ func linksFlag() ucli.Flag {
 	}
 }
 
-// checkLink rejects the flags that make no sense with --link: a link is
+// checkLink rejects the flags that make no sense with g--link: a link is
 // not a value, so it is not text, encrypted or signed.
 func checkLink(c *ucli.Command) error {
 	for _, f := range []string{"string", "enc", "sign", "to"} {
@@ -98,7 +98,10 @@ set --link. The node itself is left alone.
   gundb set users/1/friends --link users/2     # add
   gundb unset users/1/friends --link users/2   # remove
 
-A link stored with put is removed with null: gundb put users/1/best null`,
+It removes every key of path that links to the node, so it also undoes
+put --link, and the link a write like put users/2/name leaves in users:
+
+  gundb unset users --link users/2              # removes users.2`,
 		Flags:        clientFlags(linkFlag()),
 		OnUsageError: usageError,
 		Action: func(ctx context.Context, c *ucli.Command) error {
@@ -127,9 +130,31 @@ A link stored with put is removed with null: gundb put users/1/best null`,
 			if err != nil {
 				return err
 			}
-			// A set keys each link by its soul.
-			if err := ref.Get(soul).PutAck(ctx, nil); err != nil {
-				return explain(err, "write "+path, cl.timeout)
+			// A set keys a link by its soul, a put by the last segment of
+			// the path (users.2 for users/2), so look for every key that
+			// links there.
+			n, err := ref.Node(ctx)
+			switch {
+			case errors.Is(err, gundb.ErrNotFound):
+				return fail("check the path with gundb get "+path+" --links", "nothing at %s", path)
+			case err != nil && strings.Contains(err.Error(), "not a node"):
+				return fail("unset removes links from a node; a value is removed with gundb put "+path+" null", "%s is a value, not a node", path)
+			case err != nil:
+				return explain(err, "read "+path, cl.timeout)
+			}
+			var keys []string
+			for _, k := range slices.Sorted(maps.Keys(n.Fields)) {
+				if l, ok := n.Fields[k].(gundb.Link); ok && l.Soul == soul {
+					keys = append(keys, k)
+				}
+			}
+			if len(keys) == 0 {
+				return fail("see its links with gundb get "+path+" --links", "%s does not link to %s", path, linkTo(target, soul))
+			}
+			for _, k := range keys {
+				if err := ref.Get(k).PutAck(ctx, nil); err != nil {
+					return explain(err, "write "+path, cl.timeout)
+				}
 			}
 			fmt.Fprintf(c.Root().Writer, "ok  %s no longer links to %s\n", path, linkTo(target, soul))
 			return nil
