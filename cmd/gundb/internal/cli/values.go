@@ -54,7 +54,7 @@ func decFlag() ucli.Flag {
 func verifyFlag() ucli.Flag {
 	return &ucli.BoolFlag{
 		Name:  "verify",
-		Usage: "check signed values: fail unless --from (default: you) signed them",
+		Usage: "check signed values: fail unless --from (default: you) signed them, or they are in that user's own space",
 	}
 }
 func fromFlag() ucli.Flag {
@@ -133,6 +133,8 @@ func (cl *client) seal(ctx context.Context, c *ucli.Command, v any) (any, error)
 // opener verifies and decrypts SEA values on the way out.
 type opener struct {
 	verify bool
+	strict bool   // --verify: an unsigned value fails, unless it is in the signer's own space
+	inside bool   // the path is in the signer's own space, where only they can write
 	pub    string // signer to verify against
 	secret string // to decrypt with; "" = do not decrypt
 	from   string // who pub belongs to, for messages
@@ -140,10 +142,10 @@ type opener struct {
 	sawSigned, sawEncrypted bool // values left as they are
 }
 
-// newOpener sets up --dec, --verify and --from.
-func (cl *client) newOpener(ctx context.Context, c *ucli.Command) (*opener, error) {
+// newOpener sets up --dec, --verify and --from, for reading path.
+func (cl *client) newOpener(ctx context.Context, c *ucli.Command, path string) (*opener, error) {
 	dec, verify := c.Bool("dec"), c.Bool("verify")
-	o := &opener{verify: verify || dec}
+	o := &opener{verify: verify || dec, strict: verify}
 	if c.IsSet("from") && !o.verify {
 		return nil, fail("add --dec or --verify", "--from only works with --dec or --verify")
 	}
@@ -167,6 +169,13 @@ func (cl *client) newOpener(ctx context.Context, c *ucli.Command) (*opener, erro
 		return nil, fail("add --from <user>, or log in to check your own", "--verify needs to know whose signature to check")
 	}
 	o.pub, o.from = from.pub, from.alias
+	if o.strict {
+		space, err := cl.spaceOf(ctx, path)
+		if err != nil {
+			return nil, err
+		}
+		o.inside = space != "" && space == o.pub
+	}
 	if dec {
 		secret, err := sea.Secret(from.epub, cl.user.Pair())
 		if err != nil {
@@ -194,6 +203,9 @@ func (o *opener) walk(v any, path string) (any, error) {
 	switch v := v.(type) {
 	case map[string]any:
 		for _, k := range slices.Sorted(maps.Keys(v)) {
+			if k == "_" {
+				continue // get --links: the node's soul, not data
+			}
 			w, err := o.walk(v[k], path+"/"+k)
 			if err != nil {
 				return nil, err
@@ -204,7 +216,19 @@ func (o *opener) walk(v any, path string) (any, error) {
 	case string:
 		return o.leaf(v, path)
 	}
-	return v, nil
+	return v, o.unsigned(path) // a number, a bool or null: never signed
+}
+
+// unsigned is what --verify makes of a value that carries no signature:
+// fine in the signer's own space, where only they can write (the server
+// checks), and an error anywhere else, where anyone could have written it,
+// replacing a signed value too.
+func (o *opener) unsigned(path string) error {
+	if !o.strict || o.inside {
+		return nil
+	}
+	return fail("anyone can write here; only a value with a signature proves who wrote it",
+		"%s is not signed, so it cannot be from %s", path, o.from)
 }
 
 // leaf opens one value. A decrypted or verified value can itself be
@@ -247,6 +271,11 @@ func (o *opener) leaf(s string, path string) (any, error) {
 			}
 			s = next
 		default:
+			if kind != "signed" {
+				if err := o.unsigned(path); err != nil {
+					return nil, err
+				}
+			}
 			o.sawSigned = o.sawSigned || kind == "signed"
 			o.sawEncrypted = o.sawEncrypted || kind == "encrypted"
 			return s, nil

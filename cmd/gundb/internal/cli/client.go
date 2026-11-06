@@ -284,6 +284,25 @@ func splitPath(path string) ([]string, error) {
 }
 
 // userKeys are a user's public keys.
+// spaceOf returns the public key of the user whose space path is in
+// (~/..., ~@alias/... or ~<pub>/...), or "" if it is in none.
+func (cl *client) spaceOf(ctx context.Context, path string) (string, error) {
+	first, _, _ := strings.Cut(path, "/")
+	switch {
+	case first == "~":
+		if cl.user == nil {
+			return "", nil
+		}
+		return cl.user.Pub(), nil
+	case strings.HasPrefix(first, "~@"):
+		u, err := cl.lookUp(ctx, first)
+		return u.pub, err
+	case strings.HasPrefix(first, "~") && looksLikePub(first[1:]):
+		return first[1:], nil
+	}
+	return "", nil
+}
+
 type userKeys struct {
 	alias     string // as given, for messages
 	pub, epub string

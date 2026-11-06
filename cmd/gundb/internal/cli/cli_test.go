@@ -380,6 +380,21 @@ func TestUsersSignAndEncrypt(t *testing.T) {
 	if _, _, err := run(t, "", "get", "x", "--verify", "--from", "nobody", "--addr", addr); err == nil {
 		t.Error("an unknown user was found")
 	}
+
+	// Anyone can replace a signed value outside a user space with an
+	// unsigned one; --verify must not pass it off as ali's.
+	must(t, "put", "news/1", "forged", "--addr", addr)
+	if _, stderr, err := run(t, "", "get", "news/1", "--verify", "--from", "ali", "--addr", addr); err == nil {
+		t.Error("an unsigned value passed --verify")
+	} else {
+		wantOut(t, stderr, "news/1 is not signed")
+	}
+	// In ali's own space only ali can write, so plain values are hers.
+	must(t, append([]string{"put", "~/profile/name", "Ali"}, ali...)...)
+	wantOut(t, must(t, "get", "~@ali/profile", "--verify", "--from", "ali", "--addr", addr), `"name": "Ali"`)
+	if _, _, err := run(t, "", "get", "~@ali/profile", "--verify", "--from", "bob", "--addr", addr); err == nil {
+		t.Error("ali's space passed as bob's")
+	}
 }
 
 func TestServerPeers(t *testing.T) {

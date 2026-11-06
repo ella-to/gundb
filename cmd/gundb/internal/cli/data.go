@@ -46,7 +46,7 @@ func (a *App) getCommand() *ucli.Command {
 			if err != nil {
 				return err
 			}
-			o, err := cl.newOpener(ctx, c)
+			o, err := cl.newOpener(ctx, c, path)
 			if err != nil {
 				return err
 			}
@@ -293,7 +293,7 @@ changes instead of the whole value.
 			if err != nil {
 				return err
 			}
-			o, err := cl.newOpener(setup, c)
+			o, err := cl.newOpener(setup, c, path)
 			if err != nil {
 				return err
 			}
