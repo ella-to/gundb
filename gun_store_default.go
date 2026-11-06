@@ -9,7 +9,10 @@ import (
 // NewMemoryStore returns the in-memory Store that New uses by default.
 func NewMemoryStore() Store { return &memoryStore{nodes: map[string]*Node{}} }
 
-var _ FieldReader = (*memoryStore)(nil)
+var (
+	_ FieldReader = (*memoryStore)(nil)
+	_ LiveReader  = (*memoryStore)(nil)
+)
 
 type memoryStore struct {
 	mu    sync.RWMutex
@@ -75,4 +78,12 @@ func (s *memoryStore) ListSouls(_ context.Context, prefix string) ([]string, err
 		}
 	}
 	return souls, nil
+}
+
+// HasLive implements LiveReader without copying the node.
+func (s *memoryStore) HasLive(_ context.Context, soul string, skip []string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n, ok := s.nodes[soul]
+	return ok && HasLiveField(n, skip), nil
 }

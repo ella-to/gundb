@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,6 +34,7 @@ func (a *App) serverCommand() *ucli.Command {
   gundb server --addr http://0.0.0.0:8080/gun    # every interface, port 8080
   gundb server --peers http://localhost:8081/gun,http://localhost:8082/gun
   gundb server --store pebble --data ./data      # keep the data on disk
+  gundb server --max-nodes 1000 --max-bytes 10MB # a quota for every user
 
 Browsers connect with Gun(['http://localhost:8765/gun']).`,
 		Flags: []ucli.Flag{
@@ -67,6 +69,16 @@ Browsers connect with Gun(['http://localhost:8765/gun']).`,
 				Value:   "gundb-data",
 				Sources: ucli.EnvVars("GUNDB_DATA"),
 			},
+			&ucli.Int64Flag{
+				Name:    "max-nodes",
+				Usage:   "most nodes each SEA user may keep in their space (~<pub>/...); 0 for no limit",
+				Sources: ucli.EnvVars("GUNDB_MAX_NODES"),
+			},
+			&ucli.StringFlag{
+				Name:    "max-bytes",
+				Usage:   "most data each SEA user may keep, like 512KB, 10MB or 1GB; 0 for no limit",
+				Sources: ucli.EnvVars("GUNDB_MAX_BYTES"),
+			},
 			&ucli.BoolFlag{
 				Name:  "no-sync",
 				Usage: "with --store pebble, skip the fsync after each write: faster, but a crash can lose the last writes",
@@ -98,6 +110,11 @@ func (a *App) serve(ctx context.Context, c *ucli.Command) error {
 	}
 	defer closeStore()
 
+	quota, err := quotaFlags(c, log)
+	if err != nil {
+		return err
+	}
+
 	wait := c.Duration("timeout")
 	if wait == 0 {
 		wait = 24 * time.Hour // "forever": every peer answers or gives up long before
@@ -110,6 +127,7 @@ func (a *App) serve(ctx context.Context, c *ucli.Command) error {
 		Logger:       lib,
 		OnConnect:    func(_ context.Context, p gundb.PeerInfo) { logPeer(log, p, true, false) },
 		OnDisconnect: func(_ context.Context, p gundb.PeerInfo) { logPeer(log, p, false, ctx.Err() != nil) },
+		Quota:        quota,
 	})
 	defer db.Close()
 
@@ -287,4 +305,67 @@ func logPeer(log *slog.Logger, p gundb.PeerInfo, up, stopping bool) {
 	default:
 		log.Info("client disconnected", "remote", p.Remote, "id", p.PeerID[:8])
 	}
+}
+
+// quotaFlags turns --max-nodes and --max-bytes into a quota for every SEA
+// user, or nil when neither is set.
+func quotaFlags(c *ucli.Command, log *slog.Logger) (*gundb.Quota, error) {
+	nodes := c.Int64("max-nodes")
+	bytes, err := parseBytes(c.String("max-bytes"))
+	if err != nil {
+		return nil, err
+	}
+	if nodes < 0 {
+		return nil, fail("use a number of nodes, or 0 for no limit", "--max-nodes must not be negative, got %d", nodes)
+	}
+	if nodes == 0 && bytes == 0 {
+		return nil, nil
+	}
+	limit := gundb.Limit{Nodes: nodes, Bytes: bytes}
+	log.Info("each user may keep", "nodes", limitText(nodes, fmt.Sprint(nodes)), "data", limitText(bytes, formatBytes(bytes)))
+	return &gundb.Quota{Limit: func(string) gundb.Limit { return limit }}, nil
+}
+
+func limitText(n int64, s string) string {
+	if n == 0 {
+		return "no limit"
+	}
+	return s
+}
+
+// parseBytes reads a size like 10MB, 512KB, 1GB or 2048 (bytes). KB, MB
+// and GB are powers of 1024.
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"B", 1}} {
+		if rest, ok := strings.CutSuffix(s, u.suffix); ok {
+			s, mult = strings.TrimSpace(rest), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || n < 0 {
+		return 0, fail("use a size such as 512KB, 10MB or 1GB", "bad --max-bytes %q", s)
+	}
+	return int64(n * float64(mult)), nil
+}
+
+// formatBytes writes n in the largest unit that keeps it readable.
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<30 && n%(1<<30) == 0:
+		return fmt.Sprintf("%dGB", n>>30)
+	case n >= 1<<20 && n%(1<<20) == 0:
+		return fmt.Sprintf("%dMB", n>>20)
+	case n >= 1<<10 && n%(1<<10) == 0:
+		return fmt.Sprintf("%dKB", n>>10)
+	}
+	return fmt.Sprintf("%dB", n)
 }

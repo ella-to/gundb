@@ -48,6 +48,9 @@ func explain(err error, what string, timeout time.Duration) error {
 	case errors.Is(err, gundb.ErrUnverified):
 		return fail("a user's space can only be written by that user: log in with --username and write to ~/...",
 			"the server rejected the write: %s", clean(err))
+	case errors.Is(err, gundb.ErrQuota):
+		return fail("free some space by deleting what you no longer need (gundb put <path> null), or move to a bigger plan",
+			"the server refused to %s: %s", what, clean(err))
 	case errors.Is(err, gundb.ErrNoPeers):
 		return fail("is the server still running?", "no server acknowledged the write to %s", strings.TrimPrefix(what, "write "))
 	case errors.Is(err, context.DeadlineExceeded):

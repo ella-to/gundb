@@ -15,18 +15,30 @@ import (
 // retried when their time comes, like the reference does.
 //
 // skip lists fields that need no SEA check (see checked); nil checks all.
+// The DB's own writes are counted against Options.Quota but never refused;
+// applyFrom refuses a peer's write that would break it.
 func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
+	return db.applyFrom(ctx, g, skip, false)
+}
+
+// applyFrom is apply, with enforce saying whether the quota may refuse the
+// write: true for data from peers that connect to us.
+func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool) (graph, error) {
 	if err := checkSEA(g, skip); err != nil {
 		return nil, err
 	}
 	changed, later := graph{}, graph{}
 	var wake float64
 	machine := db.state.Next()
-	merge := func(soul string, in *Node) (dirty bool, err error) {
-		cur, err := db.current(ctx, soul, in)
+	var deltas []ownerDelta // with a quota: how this write changes each owner
+	// merge applies in to the node with HAM, in memory: the caller writes
+	// cur (or the changed fields) to the store.
+	merge := func(soul string, in *Node) (cur *Node, dirty bool, err error) {
+		cur, err = db.current(ctx, soul, in)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
+		var olds map[string]Value
 		for k, v := range in.Fields {
 			state := in.States[k]
 			curState, ok := cur.States[k]
@@ -35,6 +47,12 @@ func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
 			}
 			switch ham(machine, state, curState, v, cur.Fields[k]) {
 			case hamIncoming:
+				if db.quota != nil {
+					if olds == nil {
+						olds = map[string]Value{}
+					}
+					olds[k] = cur.Fields[k]
+				}
 				cur.Set(k, v, state)
 				changed.node(soul).Set(k, v, state)
 				dirty = true
@@ -43,43 +61,80 @@ func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
 				wake = max(wake, state)
 			}
 		}
-		if dirty && !isFieldStore(db.store) {
-			return true, db.store.Put(ctx, cur)
+		if dirty && db.quota != nil {
+			if owner := db.quota.owner(soul); owner != "" {
+				_, partial := db.store.(FieldReader)
+				d, err := db.usageDelta(ctx, soul, in, cur, olds, !partial)
+				if err != nil {
+					return nil, false, err
+				}
+				deltas = addDelta(deltas, owner, d)
+			}
 		}
-		return dirty, nil
+		return cur, dirty, nil
+	}
+	// store writes one merged node: only its changed fields if it can.
+	store := func(soul string, cur *Node) error {
+		if fs, ok := db.store.(FieldStore); ok {
+			return fs.PutFields(ctx, soul, changed[soul])
+		}
+		return db.store.Put(ctx, cur)
 	}
 
-	if bs, ok := db.store.(BatchStore); ok && len(g) > 1 {
-		// Merge every node, holding all their locks, and commit them at once.
+	bs, batch := db.store.(BatchStore)
+	batch = batch && len(g) > 1
+	if batch || db.quota != nil {
+		// Merge every node, holding all their locks, then check the quota,
+		// then commit: at once if the store can, else children first.
 		unlock := db.lockMerges(g)
-		var nodes []*Node
-		for soul, in := range g {
-			dirty, err := merge(soul, in)
+		order := childrenFirst(g)
+		curs := make(map[string]*Node, len(g))
+		for _, soul := range order {
+			cur, dirty, err := merge(soul, g[soul])
 			if err != nil {
 				unlock()
 				return nil, err
 			}
 			if dirty {
-				nodes = append(nodes, changed[soul])
+				curs[soul] = cur
+			}
+		}
+		if db.quota != nil && len(deltas) > 0 {
+			if err := db.quota.reserve(deltas, enforce); err != nil {
+				unlock()
+				return nil, err
 			}
 		}
 		var err error
-		if len(nodes) > 0 {
+		if batch && len(curs) > 0 {
+			nodes := make([]*Node, 0, len(curs))
+			for _, soul := range order {
+				if curs[soul] != nil {
+					nodes = append(nodes, changed[soul])
+				}
+			}
 			err = bs.PutBatch(ctx, nodes)
+		} else {
+			for _, soul := range order {
+				if cur := curs[soul]; cur != nil && err == nil {
+					err = store(soul, cur)
+				}
+			}
 		}
 		unlock()
 		if err != nil {
+			if db.quota != nil {
+				db.quota.release(deltas)
+			}
 			return nil, err
 		}
 	} else {
 		for _, soul := range childrenFirst(g) {
 			mu := db.mergeLock(soul)
 			mu.Lock()
-			dirty, err := merge(soul, g[soul])
+			cur, dirty, err := merge(soul, g[soul])
 			if err == nil && dirty {
-				if fs, ok := db.store.(FieldStore); ok {
-					err = fs.PutFields(ctx, soul, changed[soul])
-				}
+				err = store(soul, cur)
 			}
 			mu.Unlock()
 			if err != nil {

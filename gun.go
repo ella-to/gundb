@@ -81,6 +81,11 @@ type Options struct {
 	// OnDisconnect always comes after the OnConnect it belongs to.
 	OnConnect    func(ctx context.Context, info PeerInfo)
 	OnDisconnect func(ctx context.Context, info PeerInfo)
+
+	// Quota counts how many nodes and bytes each owner keeps, and refuses
+	// writes from connecting peers that would take an owner past their
+	// plan's limits, with ErrQuota. See Quota. Default: nothing is counted.
+	Quota *Quota
 }
 
 // PeerInfo describes one connection, for Options.OnConnect and
@@ -141,6 +146,7 @@ type DB struct {
 	canWrite     func(ctx context.Context, soul, field string) bool
 	onConnect    func(context.Context, PeerInfo)
 	onDisconnect func(context.Context, PeerInfo)
+	quota        *quota // nil without Options.Quota
 }
 
 // Errors returned by DB and Ref methods.
@@ -210,6 +216,13 @@ func New(opts ...Options) *DB {
 		canWrite:     o.CanWrite,
 		onConnect:    o.OnConnect,
 		onDisconnect: o.OnDisconnect,
+	}
+	if o.Quota != nil {
+		// Count what is already stored before any peer can write.
+		db.quota = newQuota(o.Quota)
+		if err := db.quota.load(ctx, db.store); err != nil {
+			db.log.Warn("gundb: quota: cannot count stored data", "err", err)
+		}
 	}
 	for _, url := range o.Peers {
 		db.Connect(url)

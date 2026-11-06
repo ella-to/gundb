@@ -23,6 +23,7 @@ type Store struct {
 var (
 	_ gundb.SoulStore   = (*Store)(nil)
 	_ gundb.FieldReader = (*Store)(nil)
+	_ gundb.LiveReader  = (*Store)(nil)
 )
 
 // New returns an empty Store.
@@ -79,6 +80,14 @@ func (s *Store) GetFields(_ context.Context, soul string, fields []string) (*gun
 		}
 	}
 	return n, nil
+}
+
+// HasLive implements gundb.LiveReader without copying the node.
+func (s *Store) HasLive(_ context.Context, soul string, skip []string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n, ok := s.nodes[soul]
+	return ok && gundb.HasLiveField(n, skip), nil
 }
 
 // Souls returns the stored souls, sorted.

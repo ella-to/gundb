@@ -25,6 +25,7 @@ go get ella.to/gundb   # needs Go 1.27+
   - [Example: a chat with user names and passwords](#example-a-chat-with-user-names-and-passwords)
   - [A private list](#a-private-list)
   - [Who is online](#who-is-online)
+  - [Quotas: plans and usage](#quotas-plans-and-usage)
 - [9. Users and encryption (SEA)](#9-users-and-encryption-sea)
   - [Encrypted group chat with a shared key](#encrypted-group-chat-with-a-shared-key)
   - [Encrypted group chat with sender keys (a ratchet)](#encrypted-group-chat-with-sender-keys-a-ratchet)
@@ -1456,6 +1457,188 @@ By `OnDisconnect` the context is done, but the values in it are still there.
 - **A vanished peer is noticed within about 40s.** A closed tab or a stopped client is reported straight away. A phone that loses Wi-Fi closes nothing, so gundb pings every peer every 20s and drops one that does not answer within 20s. Browsers and Node answer pings on their own.
 - **The device ID comes from the client.** It labels connections; it proves nothing. Base permissions on the user only.
 
+### Quotas: plans and usage
+
+To sell storage, say a free plan with 1,000 nodes and 10 MB and a pro plan with 10,000 nodes and 100 MB, give the relay an `Options.Quota`. It counts how much each owner keeps and refuses a write that would take them past their plan:
+
+```go
+Quota: &gundb.Quota{
+    Owner: func(soul string) string { ... }, // whose data is this node? "" for nobody's
+    Limit: func(owner string) gundb.Limit {  // their plan
+        return gundb.Limit{Nodes: 1_000, Bytes: 10 << 20}
+    },
+},
+```
+
+`CanWrite` can't do this on its own. It sees a field's name, not its value, and not what the field held before, so it can't tell how much a write adds. The quota runs right after `CanWrite`, where each write is merged, and the old value of every field it touches is already in hand:
+
+- **A node counts while it has at least one field that isn't deleted.** Delete all its fields and the node no longer counts.
+- **Its bytes are the sum of its live fields:** the field name's length plus the value's. A string counts its bytes (a signed or encrypted value counts as stored, signature included), a link its soul, a number 8, a bool 1. Overwriting counts the difference; deleting gives the bytes back.
+- **A write is refused whole**, with `ErrQuota` on the writer's `PutAck`, if it would take any owner past a limit. Nothing of it is stored. A write that doesn't grow an owner's usage always goes through, so a user over the limit (after a downgrade, say) can still delete.
+
+`db.Usage(owner)` returns one owner's `Usage{Nodes, Bytes}`; `db.Usages()` returns everyone's, for a billing job or an admin page.
+
+**Who owns a node** is up to `Owner`, from the node's soul alone. By default it's the SEA user whose space the node is in (`~<pub>` and `~<pub>/...`), which suits SEA apps well: only that user can write there, so nobody can spend another user's quota. Nodes outside users' spaces then belong to nobody and aren't limited, so refuse those writes with `CanWrite`, or give them an owner of your own. With the login of [section 8](#8-permissions-who-can-read-and-write), where `users/<name>/...` is `<name>`'s, `Owner` reads the name out of the soul, as in this example:
+
+<!-- example: examples/quota/main.go -->
+```go
+// Plans and quotas on a relay. Each user keeps their data under
+// users/<name>/..., and their plan says how much: free is 1,000 nodes and
+// 10 MB, pro is 10,000 nodes and 100 MB.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+
+	"ella.to/gundb"
+)
+
+type Note struct {
+	Text string `json:"text"`
+}
+
+var plans = map[string]gundb.Limit{
+	"free": {Nodes: 1_000, Bytes: 10 << 20},
+	"pro":  {Nodes: 10_000, Bytes: 100 << 20},
+}
+
+// accounts knows each user's plan. It stands in for your billing
+// database: load it at start and update it when someone pays, so the
+// quota never waits for I/O.
+type accounts struct {
+	mu   sync.RWMutex
+	plan map[string]string
+}
+
+func (a *accounts) Limit(user string) gundb.Limit {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if p, ok := a.plan[user]; ok {
+		return plans[p]
+	}
+	return plans["free"]
+}
+
+func (a *accounts) SetPlan(user, plan string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.plan[user] = plan
+}
+
+// owner returns whose data a node is: "users/ali/notes/1" -> "ali".
+func owner(soul string) string {
+	rest, ok := strings.CutPrefix(soul, "users/")
+	if !ok {
+		return ""
+	}
+	name, _, _ := strings.Cut(rest, "/")
+	return name
+}
+
+// The login of section 8, in short: the token in the URL names the user.
+type userKey struct{}
+
+func authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := strings.CutPrefix(r.URL.Query().Get("token"), "tok-")
+		if !ok {
+			http.Error(w, "unknown token", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey{}, user)))
+	})
+}
+
+func main() {
+	ctx := context.Background()
+	accts := &accounts{plan: map[string]string{"ali": "free"}}
+
+	relay := gundb.New(gundb.Options{
+		// Everyone writes only their own users/<name>/... CanWrite checks
+		// soul + "/" + field, so the link users.ali is ali's to write too.
+		CanWrite: func(ctx context.Context, soul, field string) bool {
+			user, _ := ctx.Value(userKey{}).(string)
+			return owner(soul+"/"+field) == user
+		},
+		// Every node under users/<name> counts against <name>'s plan.
+		Quota: &gundb.Quota{Owner: owner, Limit: accts.Limit},
+	})
+	defer relay.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	go http.Serve(ln, authenticate(relay))
+
+	ali := gundb.New(gundb.Options{Peers: []string{"ws://" + ln.Addr().String() + "/gun?token=tok-ali"}})
+	defer ali.Close()
+	notes := ali.Get("users").Get("ali").Get("notes")
+
+	// Write notes until the free plan is full.
+	n := 0
+	for ; ; n++ {
+		err := notes.Get(fmt.Sprint(n)).PutAck(ctx, Note{Text: "note"})
+		if errors.Is(err, gundb.ErrQuota) {
+			fmt.Printf("note %d refused: %v\n", n, err)
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	u := relay.Usage("ali")
+	fmt.Printf("ali keeps %d nodes, %d bytes\n", u.Nodes, u.Bytes)
+
+	// Deleting a note frees its node: null its fields, and the link to it.
+	notes.Get("0").Get("text").PutAck(ctx, nil)
+	notes.Get("0").PutAck(ctx, nil)
+	fmt.Printf("after deleting note 0: %d nodes\n", relay.Usage("ali").Nodes)
+	if err := notes.Get(fmt.Sprint(n)).PutAck(ctx, Note{Text: "fits now"}); err != nil {
+		log.Fatal(err)
+	}
+
+	// An upgrade takes effect on the next write.
+	accts.SetPlan("ali", "pro")
+	if err := notes.Get(fmt.Sprint(n+1)).PutAck(ctx, Note{Text: "pro"}); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("on pro: %d nodes, limit %d\n", relay.Usage("ali").Nodes, accts.Limit("ali").Nodes)
+
+	// For billing: everyone's usage.
+	for user, u := range relay.Usages() {
+		fmt.Printf("bill %s: %d nodes, %.1f KB\n", user, u.Nodes, float64(u.Bytes)/1024)
+	}
+}
+```
+
+```
+note 998 refused: gundb: quota exceeded: ali may keep 1000 nodes, this write would make it 1001
+ali keeps 1000 nodes, 29740 bytes
+after deleting note 0: 999 nodes
+on pro: 1001 nodes, limit 10000
+bill ali: 1001 nodes, 29.1 KB
+```
+
+ali's 1,000 nodes are her 998 notes plus `users/ali` and `users/ali/notes`, which hold the links to them.
+
+**How fast is it?** Checking a write is a map lookup and a call to your `Limit`. The totals live in memory, per owner, and every write adds what it changed, so nothing is ever recounted. The only extra read is when a write might create or empty a node: the store is asked whether the node has any other live field, and it stops at the first one (`LiveReader`, which the built-in stores and pebblestore implement). Writing one field of a node with 10,000 fields costs the same as with 10. In the benchmarks a write costs about 10% more with a quota on (`go test -bench Quota`).
+
+Things to know:
+
+- **Keep `Limit` fast and in memory.** It runs on every write that grows usage. Load plans from your billing database at start, and update them when someone pays, as `accounts` does above. A new plan applies from the next write.
+- **The totals are rebuilt at start.** `New` reads every stored node once to count them, before any peer can write. That needs a store that can list souls (the default and pebblestore can). With a large store, startup takes as long as that read.
+- **A node is counted once, however many write to it.** The owner pays, whoever writes. With SEA only the owner can write their space; with your own `Owner`, make sure `CanWrite` agrees with it.
+- **Only peers that connect are refused.** The relay's own writes and data from peers it dials (`Options.Peers`) are counted but never refused. A relay that another relay dials checks that relay's writes like any client's, so give every relay the same quota, or the strictest one decides.
+- **Deleted fields still use disk.** GUN never forgets a field, it keeps a `null` (and pebblestore keeps every version). Usage counts live data, which is what users see and what's fair to bill. Disk use grows with history too.
+- **Lists:** `Set` with a struct makes a node per item, so a list of 500 items is 501 nodes. Plain values added with `Set` are fields of the list node and count only as bytes.
+
 ## 9. Users and encryption (SEA)
 
 SEA is GUN's security layer. A user is a key pair; the part of the graph they own, their *space*, is the node `~<pub>` and every soul under it (`~<pub>/profile`, ...). Everything written there is signed with the user's key, and **every peer checks every signature**, so nobody can write into someone else's space, and no server has to be trusted to enforce it. Accounts are stored exactly like `gun.user()` stores them: a user created in Go can log in from GUN.js with the same alias and password, and the other way around.
@@ -2485,7 +2668,12 @@ gundb --help                 # and gundb <command> --help
 ```sh
 gundb server                                    # http://localhost:8765/gun, in memory
 gundb server --store pebble --data ~/gundb-data # on disk, with full history
+gundb server --max-nodes 1000 --max-bytes 10MB  # a quota for every user
 ```
+
+With `--max-nodes` or `--max-bytes`, every SEA user may keep that much in
+their space (`~/...`), and a write past it fails with `quota exceeded`
+(see [Quotas](#quotas-plans-and-usage); for plans per user, use the Go API).
 
 Every other command connects to `http://localhost:8765/gun`; point it
 elsewhere with `--addr`, or `export GUNDB_ADDR=https://my-relay/gun` once.

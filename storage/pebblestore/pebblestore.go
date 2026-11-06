@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"slices"
 	"sync"
 
 	"ella.to/gundb"
@@ -39,8 +40,8 @@ type Options struct {
 	Pebble *pebble.Options
 }
 
-// Store is a gundb.FieldReader, gundb.BatchStore and gundb.SoulStore
-// backed by Pebble. It is
+// Store is a gundb.FieldReader, gundb.BatchStore, gundb.SoulStore and
+// gundb.LiveReader backed by Pebble. It is
 // safe for concurrent use.
 type Store struct {
 	db    *pebble.DB
@@ -52,6 +53,7 @@ var (
 	_ gundb.FieldReader = (*Store)(nil)
 	_ gundb.BatchStore  = (*Store)(nil)
 	_ gundb.SoulStore   = (*Store)(nil)
+	_ gundb.LiveReader  = (*Store)(nil)
 )
 
 // Version is one past write of a field.
@@ -141,6 +143,27 @@ func (s *Store) GetFields(_ context.Context, soul string, fields []string) (*gun
 		n.Set(field, val, state)
 	}
 	return n, nil
+}
+
+// HasLive implements gundb.LiveReader: it walks the node's latest values
+// and stops at the first one that is not deleted, without decoding any.
+func (s *Store) HasLive(_ context.Context, soul string, skip []string) (bool, error) {
+	prefix := latestPrefix(soul)
+	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upper(prefix)})
+	if err != nil {
+		return false, fmt.Errorf("pebblestore: %w", err)
+	}
+	defer it.Close()
+	for it.First(); it.Valid(); it.Next() {
+		v := it.Value()
+		if len(v) < 9 {
+			return false, fmt.Errorf("pebblestore: corrupt value for %q", soul)
+		}
+		if !deleted(v[8:]) && !slices.Contains(skip, string(it.Key()[len(prefix):])) {
+			return true, nil
+		}
+	}
+	return false, it.Error()
 }
 
 // Put implements gundb.Store: every field of n is written.
@@ -377,6 +400,14 @@ const (
 	tString
 	tLink
 )
+
+// deleted is gundb.IsDeleted for an encoded value: null, or a signed null
+// in a user's space.
+func deleted(enc []byte) bool {
+	return enc[0] == tNull || (enc[0] == tString && bytes.HasPrefix(enc[1:], signedNull))
+}
+
+var signedNull = []byte(`{":":null,"~":`)
 
 func encodeValue(v gundb.Value) ([]byte, error) {
 	switch x := v.(type) {

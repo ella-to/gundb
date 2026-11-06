@@ -44,6 +44,9 @@ program in [`examples/`](examples/).
   own middleware, and `CanRead` / `CanWrite` decide, per field, what each
   connection may read and write from the session in its context, for Go
   and GUN.js clients alike.
+- **Quotas.** `Options.Quota` counts the nodes and bytes each owner (by
+  default, each SEA user) keeps, and refuses writes past their plan's
+  limits, like free at 1,000 nodes and 10 MB, pro at 10,000 and 100 MB.
 - **Offline-first.** Configured peers are re-dialled automatically. Writes
   made while offline are sent on reconnect, even after a restart, and
   subscriptions are restored.
@@ -65,6 +68,7 @@ go install ella.to/gundb/cmd/gundb@latest
 
 gundb server                                   # relay on http://localhost:8765/gun, in memory
 gundb server --store pebble --data ./data --peers http://other:8765/gun
+gundb server --max-nodes 1000 --max-bytes 10MB  # a quota for every user
 
 gundb put users/1/name 'Ali'                   # write, and wait for the server
 gundb get users/1                              # read, as JSON

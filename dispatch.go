@@ -87,7 +87,7 @@ func (db *DB) handleAck(p *peer, m *message) {
 	if len(m.Put) > 0 {
 		if err := m.Put.check(); err != nil {
 			db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
-		} else if _, err := db.apply(db.ctx, m.Put, allChecked); err != nil {
+		} else if _, err := db.applyFrom(db.ctx, m.Put, allChecked, !p.trusted()); err != nil {
 			db.log.Warn("gundb: store failed", "err", err)
 		}
 	}
@@ -112,7 +112,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
-	changed, err := db.apply(db.ctx, m.Put, nil)
+	changed, err := db.applyFrom(db.ctx, m.Put, nil, !p.trusted())
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return

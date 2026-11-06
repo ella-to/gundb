@@ -150,9 +150,9 @@ func (f *fanout) build(db *DB, m *message, raw []byte, kept int) readable {
 }
 
 // remoteError turns an error text received from a peer back into an error
-// that matches ErrForbidden or ErrUnverified.
+// that matches ErrForbidden, ErrUnverified or ErrQuota.
 func remoteError(text string) error {
-	for _, known := range []error{ErrForbidden, ErrUnverified} {
+	for _, known := range []error{ErrForbidden, ErrUnverified, ErrQuota} {
 		if rest, ok := strings.CutPrefix(text, known.Error()); ok {
 			return fmt.Errorf("%w%s", known, rest)
 		}
