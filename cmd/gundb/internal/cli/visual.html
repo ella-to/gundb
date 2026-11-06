@@ -477,10 +477,13 @@ svg.on('click', (ev) => { if (ev.target === svg.node()) select(null); });
 
 const sim = d3.forceSimulation()
   .force('link', d3.forceLink().id((d) => d.id).distance((l) => l.kind === 'val' ? 44 : 100).strength((l) => l.kind === 'val' ? 0.9 : 0.35))
-  .force('charge', d3.forceManyBody().strength((d) => d.kind === 'leaf' ? -35 : -260).distanceMax(600))
+  .force('charge', d3.forceManyBody().strength((d) => d.kind === 'leaf' ? -35 : -260).distanceMax(260))
   .force('collide', d3.forceCollide().radius((d) => d.r + (d.kind === 'leaf' ? 3 : 10)))
-  .force('x', d3.forceX(0).strength(0.025))
-  .force('y', d3.forceY(0).strength(0.025))
+  // Each node is pulled to the centre of its own cluster (see clusters),
+  // so separate clusters keep apart instead of piling up in the middle.
+  // The pull is gentler in big clusters, so they can spread out.
+  .force('x', d3.forceX((d) => d.cx || 0).strength((d) => d.pull || 0.08))
+  .force('y', d3.forceY((d) => d.cy || 0).strength((d) => d.pull || 0.08))
   .alphaDecay(0.025)
   .on('tick', tick);
 
@@ -525,8 +528,41 @@ function build() {
   return { want, wantLinks };
 }
 
+// clusters finds the groups of connected nodes and gives each its own
+// region: a circle sized by how many nodes it holds, packed side by side
+// around the middle, biggest first. Each node gets its cluster's centre as
+// cx, cy.
+function clusters(want, wantLinks) {
+  const up = new Map(want.map((n) => [n.id, n.id]));
+  const find = (x) => { while (up.get(x) !== x) { up.set(x, up.get(up.get(x))); x = up.get(x); } return x; };
+  for (const l of wantLinks) {
+    if (!up.has(l.source) || !up.has(l.target)) continue;
+    const a = find(l.source), b = find(l.target);
+    if (a !== b) up.set(a, b);
+  }
+  const groups = new Map();
+  for (const n of want) {
+    const r = find(n.id);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(n);
+  }
+  const list = [...groups.values()].map((ns) => {
+    const souls = ns.filter((n) => n.kind === 'soul').length;
+    return { ns, souls, first: ns.reduce((m, n) => n.id < m ? n.id : m, ns[0].id),
+      r: 20 + 48 * Math.sqrt(souls) + 12 * Math.sqrt(ns.length - souls) };
+  });
+  // Biggest first, then by name, so the layout stays put between renders.
+  list.sort((a, b) => b.ns.length - a.ns.length || (a.first < b.first ? -1 : 1));
+  const circles = list.map((c) => ({ r: c.r + 30, pull: 0.1 / Math.sqrt(c.souls || 1) }));
+  d3.packSiblings(circles);
+  const at = new Map();
+  list.forEach((c, i) => c.ns.forEach((n) => at.set(n.id, circles[i])));
+  return at;
+}
+
 function render() {
   const { want, wantLinks } = build();
+  const centre = clusters(want, wantLinks);
   // Keep the objects D3 already positions; place new ones at the node
   // they grow from.
   const next = [];
@@ -534,18 +570,20 @@ function render() {
   for (const l of wantLinks) if (!firstLinker.has(l.target)) firstLinker.set(l.target, l.source);
   for (const n of want) {
     let o = byId.get(n.id);
+    const c = centre.get(n.id);
     if (o) { Object.assign(o, { r: n.r, ghost: n.ghost }); }
     else {
       o = n;
       const from = byId.get(parentHint.get(n.id) || firstLinker.get(n.id) || ('s:' + n.soul));
       if (from && from.x !== undefined) {
         o.x = from.x + (Math.random() - 0.5) * 6; o.y = from.y + (Math.random() - 0.5) * 6;
-      } else {
-        const a = Math.random() * Math.PI * 2, d = 40 + Math.random() * 120;
-        o.x = Math.cos(a) * d; o.y = Math.sin(a) * d;
+      } else { // a new cluster: start in its own region
+        const a = Math.random() * Math.PI * 2, d = Math.random() * 30;
+        o.x = c.x + Math.cos(a) * d; o.y = c.y + Math.sin(a) * d;
       }
       o.isNew = true;
     }
+    o.cx = c.x; o.cy = c.y; o.pull = c.pull;
     next.push(o);
   }
   byId.clear(); next.forEach((n) => byId.set(n.id, n));
