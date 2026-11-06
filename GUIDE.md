@@ -20,6 +20,7 @@ go get ella.to/gundb   # needs Go 1.27+
 - [5. Sync between peers](#5-sync-between-peers)
 - [6. Work offline, sync later](#6-work-offline-sync-later)
 - [7. Run a relay](#7-run-a-relay)
+  - [One-way peers: read only, write only](#one-way-peers-read-only-write-only)
 - [8. Permissions: who can read and write](#8-permissions-who-can-read-and-write)
   - [Logging in from a client](#logging-in-from-a-client)
   - [Example: a chat with user names and passwords](#example-a-chat-with-user-names-and-passwords)
@@ -919,6 +920,124 @@ func main() {
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 ```
+
+### One-way peers: read only, write only
+
+A peer in `Options.Peers` syncs both ways: this DB sends it every write and asks it for data. The `gundb_mode` query parameter in its URL makes it one way: `?gundb_mode=read` or `?gundb_mode=write` (`?gundb_mode=both`, or no parameter, is the default). `ReadFrom` and `WriteTo` add it for you:
+
+```go
+gundb.New(gundb.Options{
+    Peers: []string{
+        "wss://a.example.com/gun",                      // both ways (the default)
+        "wss://b.example.com/gun?gundb_mode=read",      // only read from b
+        gundb.WriteTo("wss://c.example.com/gun?token=x"), // only write to c: ...?token=x&gundb_mode=write
+    },
+})
+```
+
+The parameter is taken out before dialling, so the peer never sees it; the URL's other parameters (a token, say) are sent as they are.
+
+| | data to the peer (writes, yours and your clients') | data from the peer (its writes, answers to your gets) | your gets to it |
+|---|---|---|---|
+| no `gundb_mode` parameter, or `?gundb_mode=both` | sent, and queued while it's away | taken | sent |
+| `?gundb_mode=read` (`ReadFrom`) | never; its gets are answered "not found" | taken | sent |
+| `?gundb_mode=write` (`WriteTo`) | sent, and queued while it's away | dropped | never |
+
+Any other value (`?gundb_mode=reed`), or the parameter twice, is an error, and that peer isn't dialled at all: a typo must not turn a peer you meant to only read from into one you write to. `Connect` takes the same URLs, `ParsePeer` splits one into the URL to dial and its `PeerMode` (`PeerBoth`, `PeerRead`, `PeerWrite`), and `OnConnect` gets the mode in `PeerInfo.Mode`. `gundb server --peers` takes the same URLs.
+
+<!-- example: examples/oneway/main.go -->
+```go
+// One-way peers: a read replica that follows a primary without ever
+// writing to it, and a backup that gets every write but is never read.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"time"
+
+	"ella.to/gundb"
+)
+
+// serve makes db a relay on a free port and returns its URL.
+func serve(db *gundb.DB) string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	go http.Serve(l, db)
+	return "ws://" + l.Addr().String() + "/gun"
+}
+
+func main() {
+	ctx := context.Background()
+
+	backup := gundb.New()
+	defer backup.Close()
+
+	// The primary syncs with nobody but the backup, and only writes to it.
+	primary := gundb.New(gundb.Options{Peers: []string{gundb.WriteTo(serve(backup))}})
+	defer primary.Close()
+
+	// The replica follows the primary, and only reads from it.
+	replica := gundb.New(gundb.Options{Peers: []string{gundb.ReadFrom(serve(primary))}})
+	defer replica.Close()
+
+	// A write on the primary reaches the backup, and the replica reads it.
+	if err := primary.Get("prices").Get("milk").PutAck(ctx, 2); err != nil {
+		log.Fatal(err)
+	}
+	milk, err := replica.Get("prices").Get("milk").Once[int](ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("replica reads milk:", milk)
+
+	// The replica's own writes stay on the replica.
+	err = replica.Get("prices").Get("milk").PutAck(ctx, 0)
+	fmt.Println("replica's PutAck:", err) // no peer to write to
+	time.Sleep(100 * time.Millisecond)
+	milk, _ = primary.Get("prices").Get("milk").Once[int](ctx)
+	fmt.Println("primary still has milk:", milk)
+
+	// The backup has everything; what it writes never comes back.
+	milk, _ = backup.Get("prices").Get("milk").Once[int](ctx)
+	fmt.Println("backup has milk:", milk)
+	backup.Get("prices").Get("milk").Put(ctx, 99)
+	time.Sleep(100 * time.Millisecond)
+	milk, _ = primary.Get("prices").Get("milk").Once[int](ctx)
+	fmt.Println("primary after the backup wrote 99:", milk)
+}
+```
+
+```
+replica reads milk: 2
+replica's PutAck: gundb: no peers to acknowledge the write
+primary still has milk: 2
+backup has milk: 2
+primary after the backup wrote 99: 2
+```
+
+**When you'd want it.** One-way peers make a direction of trust explicit: who may change whom.
+
+- **A read replica near your users.** Relays in other regions `ReadFrom` the primary: they answer reads locally and follow every change live, but nothing they hold, or that their clients write, can reach the primary.
+- **Staging on production data.** A staging server that `ReadFrom`s production tests against real data, and whatever the tests write stays in staging.
+- **Dashboards, search indexes, analytics.** A service that only consumes changes (`ReadFrom` plus `Map().On`) can't corrupt what it reads, even with a bug, or when it's compromised.
+- **Backups and archives.** The primary `WriteTo`s a backup with `--store pebble`: every write lands there, with full history. Restoring an old backup, or one an attacker changed, can't push stale or forged data back into the live system.
+- **Audit logs.** `WriteTo` a server only your compliance team reads. Production sends every change there and never reads anything back, so nothing on the audit server can change production.
+- **Edge devices and ingestion.** Shops, sensors or field apps `WriteTo` a central server. They upload what they record without downloading everything everyone else does: less traffic, and no device holds others' data.
+- **Breaking loops.** In a chain or a star of relays, making some links one way gives data a direction (edges up, center down) instead of every relay echoing every write to every other.
+
+Things to know:
+
+- **The mode is per side.** It's set by the DB that dials, about the peer it dials. The other side doesn't know. Peers that connect *to* a DB are always both ways; `CanRead` and `CanWrite` decide what they may do.
+- **A read replica still takes its clients' writes.** `ReadFrom` keeps them from reaching the primary, but the replica stores them, and serves them, until the primary writes that field again. For a strictly read-only replica, also refuse them: `CanWrite: func(context.Context, string, string) bool { return false }`.
+- **A peer you `WriteTo` can still read from you.** It may ask for data, and you answer: peers you dial are trusted, so `CanRead` doesn't apply to them. What it *sends* is dropped, which is what keeps it from changing you.
+- **No peer in the right direction means no waiting.** With only `ReadFrom` peers, `PutAck` returns `ErrNoPeers` (the write is kept locally); with only `WriteTo` peers, a read returns what is stored locally straight away.
+- **This DB's own writes for a `WriteTo` peer that is away are queued**, in memory, like for any peer (up to 10,000 writes), and sent when it reconnects.
 
 ## 8. Permissions: who can read and write
 
@@ -2750,7 +2869,14 @@ gundb --help                 # and gundb <command> --help
 gundb server                                    # http://localhost:8765/gun, in memory
 gundb server --store pebble --data ~/gundb-data # on disk, with full history
 gundb server --max-nodes 1000 --max-bytes 10MB  # a quota for every user
+gundb server --peers 'https://primary/gun?gundb_mode=read'  # a read replica of primary
+gundb server --peers 'https://backup/gun?gundb_mode=write'  # send every write to a backup
 ```
+
+`--peers` syncs both ways; `?gundb_mode=read` in a peer's URL only reads from
+it and `?gundb_mode=write` only writes to it (see
+[one-way peers](#one-way-peers-read-only-write-only)). Quote such URLs:
+`?` and `&` mean something to your shell.
 
 With `--max-nodes` or `--max-bytes`, every SEA user may keep that much in
 their space (`~/...`), and a write past it fails with `quota exceeded`

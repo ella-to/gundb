@@ -35,6 +35,7 @@ type peer struct {
 // outbound is a peer we dial and keep re-dialling. Guarded by db.peersMu.
 type outbound struct {
 	url    string
+	mode   PeerMode // which way data flows; set by Connect, never changed
 	trying bool     // first dial attempt still in progress
 	self   bool     // the URL turned out to be ourselves: stop dialling
 	live   *peer    // current connection, if any
@@ -118,7 +119,7 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 func (p *peer) info() PeerInfo {
 	info := PeerInfo{PeerID: p.id, Remote: p.conn.RemoteAddr()}
 	if p.origin != nil {
-		info.URL = p.origin.url
+		info.URL, info.Mode = p.origin.url, p.origin.mode
 	}
 	return info
 }
@@ -338,13 +339,14 @@ func (db *DB) unsubscribe(p *peer) {
 }
 
 // recipients returns the peers that get changes to the souls in g: those
-// that asked for one of them, plus our upstream peers. The cost depends on
-// the number of subscribers, not on the number of connected peers.
+// that asked for one of them, plus our upstream peers we write to. The
+// cost depends on the number of subscribers, not on the number of
+// connected peers.
 func (db *DB) recipients(g graph) []*peer {
 	var upstream []*peer
 	db.peersMu.Lock()
 	for _, o := range db.outbound {
-		if o.live != nil {
+		if o.live != nil && o.flows(PeerWrite) {
 			upstream = append(upstream, o.live)
 		}
 	}
@@ -391,19 +393,19 @@ func has(s map[*peer]struct{}, p *peer) bool {
 	return ok
 }
 
-func (db *DB) livePeers() []*peer {
-	db.peersMu.Lock()
-	defer db.peersMu.Unlock()
-	return slices.Collect(maps.Keys(db.peers))
-}
-
-// sendOwn sends a message we created to every peer (only what each may
-// read), and queues it for configured peers that are currently disconnected.
+// sendOwn sends a message we created to every peer we write to (only what
+// each may read), and queues it for configured peers we write to that are
+// currently disconnected.
 func (db *DB) sendOwn(m *message, raw []byte) {
 	db.peersMu.Lock()
-	peers := slices.Collect(maps.Keys(db.peers))
+	peers := make([]*peer, 0, len(db.peers))
+	for p := range db.peers {
+		if p.writes() {
+			peers = append(peers, p)
+		}
+	}
 	for _, o := range db.outbound {
-		if o.live == nil && len(o.queue) < maxQueue {
+		if o.live == nil && o.flows(PeerWrite) && len(o.queue) < maxQueue {
 			o.queue = append(o.queue, raw)
 		}
 	}

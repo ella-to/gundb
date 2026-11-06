@@ -76,6 +76,9 @@ func (db *DB) handleDam(p *peer, m *message) {
 }
 
 func (db *DB) handleAck(p *peer, m *message) {
+	if len(m.Put) > 0 && !p.reads() {
+		m.Put = nil // a peer we only write to: its data never comes in
+	}
 	if len(m.Put) > 0 {
 		// Data answering a get counts as a write by whoever sent it, and is
 		// dropped, not relayed, if SEA rejects it.
@@ -104,6 +107,12 @@ func (db *DB) handleAck(p *peer, m *message) {
 }
 
 func (db *DB) handlePut(p *peer, m *message) {
+	if !p.reads() {
+		// A peer we only write to: its data never comes in. No ack
+		// either: one relayed from another peer must not look refused.
+		db.log.Debug("gundb: dropped a put from a write-only peer", "peer", p.conn.RemoteAddr())
+		return
+	}
 	if err := m.Put.check(); err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
@@ -131,6 +140,10 @@ func (db *DB) handlePut(p *peer, m *message) {
 }
 
 func (db *DB) handleGet(p *peer, m *message) {
+	if !p.writes() {
+		db.reply(p, &message{Ack: m.ID}) // a peer we only read from gets nothing
+		return
+	}
 	q := m.Get
 	if q.SoulLex != nil {
 		db.handleSoulLex(p, m)
@@ -241,7 +254,7 @@ func deref(s *string) string {
 // once they have all answered or Options.Wait has passed.
 func (db *DB) relayGet(p *peer, m *message) {
 	var others []*peer
-	for _, o := range db.livePeers() {
+	for _, o := range db.peersFor(PeerRead) {
 		if o != p && !m.sentTo(o.getPID()) {
 			others = append(others, o)
 		}

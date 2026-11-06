@@ -237,7 +237,7 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 	if _, err := db.apply(ctx, g, signed); err != nil {
 		return err
 	}
-	if db.alone() { // nobody to send it to, now or later
+	if db.alone(PeerWrite) { // nobody to send it to, now or later
 		if ack {
 			return ErrNoPeers
 		}
@@ -255,7 +255,7 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 	if !ack {
 		return nil
 	}
-	if !db.connected(ctx) {
+	if !db.connected(ctx, PeerWrite) {
 		return ErrNoPeers
 	}
 	select {
@@ -268,12 +268,22 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 	}
 }
 
-// alone reports whether there is no peer at all: none connected, and none
-// configured to dial (whose writes would be queued for later).
-func (db *DB) alone() bool {
+// alone reports whether no peer takes part in way: none connected, and
+// none configured to dial (whose writes would be queued for later).
+func (db *DB) alone(way PeerMode) bool {
 	db.peersMu.Lock()
 	defer db.peersMu.Unlock()
-	return len(db.peers) == 0 && len(db.outbound) == 0
+	for p := range db.peers {
+		if p.flows(way) {
+			return false
+		}
+	}
+	for _, o := range db.outbound {
+		if o.flows(way) {
+			return false
+		}
+	}
+	return true
 }
 
 // request tracks the replies to one get or put we sent.
@@ -381,15 +391,15 @@ func (db *DB) ask(soul string) { db.query(db.ctx, &getQuery{Soul: soul}) }
 func (db *DB) query(ctx context.Context, q *getQuery) {
 	ctx, cancel := context.WithTimeout(ctx, db.wait)
 	defer cancel()
-	if !db.connected(ctx) {
+	if !db.connected(ctx, PeerRead) {
 		return // for souls of interest, resubscribe asks once a peer connects
 	}
 	id := randomID(9)
 	db.dup.track(id, nil)
-	peers := db.livePeers()
 	if q.Soul != "" {
-		db.offer(q.Soul, peers)
+		db.offer(q.Soul, db.peersFor(PeerWrite))
 	}
+	peers := db.peersFor(PeerRead)
 	r := db.newRequest(id, false, peers)
 	defer db.endRequest(id)
 	raw := db.encode(&message{ID: id, Get: q})
@@ -413,10 +423,14 @@ func (db *DB) resubscribe(p *peer) {
 	}
 	db.interestMu.Unlock()
 	for _, soul := range souls {
-		db.offer(soul, []*peer{p})
-		m := &message{ID: randomID(9), Get: &getQuery{Soul: soul}}
-		db.dup.track(m.ID, nil)
-		p.send(db.encode(m))
+		if p.writes() {
+			db.offer(soul, []*peer{p})
+		}
+		if p.reads() {
+			m := &message{ID: randomID(9), Get: &getQuery{Soul: soul}}
+			db.dup.track(m.ID, nil)
+			p.send(db.encode(m))
+		}
 	}
 }
 

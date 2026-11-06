@@ -41,8 +41,10 @@ underneath, see [GUIDE.md](GUIDE.md), section 14 for the CLI.
 - **Part 4: Running servers**
   - [24. Keep data on disk](#24-keep-data-on-disk)
   - [25. Two relays in sync](#25-two-relays-in-sync)
-  - [26. Quotas](#26-quotas)
-  - [27. See the graph](#27-see-the-graph)
+  - [26. A read replica](#26-a-read-replica)
+  - [27. A write-only backup](#27-a-write-only-backup)
+  - [28. Quotas](#28-quotas)
+  - [29. See the graph](#29-see-the-graph)
 - [When something goes wrong](#when-something-goes-wrong)
 - [Start over](#start-over)
 
@@ -82,7 +84,7 @@ Two habits that save trouble:
   is an extra argument.
 
 Optionally, open **terminal 3** with `gundb visual` (see
-[27](#27-see-the-graph)) and watch the graph change as you go.
+[29](#29-see-the-graph)) and watch the graph change as you go.
 
 ---
 
@@ -997,7 +999,7 @@ $ gundb server
 # terminal 3
 $ gundb server --addr http://localhost:8766/gun --peers http://localhost:8765/gun
 07:29:08 INFO  gundb server is running  addr=http://localhost:8766/gun
-07:29:08 INFO  syncing with peers  peers=http://localhost:8765/gun
+07:29:08 INFO  syncing with peer  peer=http://localhost:8765/gun
 07:29:08 INFO  connected to peer  peer=http://localhost:8765/gun
 ```
 
@@ -1025,7 +1027,130 @@ stops. (What it never reads isn't copied over on reconnect; run every
 relay with `--store pebble` and the same `--peers` to keep them all
 complete.)
 
-## 26. Quotas
+## 26. A read replica
+
+`?gundb_mode=read` on a URL in `--peers` follows that server without ever
+writing to it.
+Think of a relay near your users that serves reads from a primary, or a
+staging server on production data. Stop the servers from 25, then:
+
+```sh
+# terminal 1: the primary
+$ gundb server
+
+# terminal 3: the replica
+$ gundb server --addr http://localhost:8766/gun --peers 'http://localhost:8765/gun?gundb_mode=read'
+08:59:24 INFO  gundb server is running  addr=http://localhost:8766/gun
+08:59:24 INFO  reading from peer, never writing to it  peer=http://localhost:8765/gun
+08:59:24 INFO  connected to peer  peer=http://localhost:8765/gun
+```
+
+The replica reads the primary's data, and follows its changes live:
+
+```sh
+$ gundb put prices/milk 2                                  # on the primary
+ok  prices/milk = 2
+
+$ gundb get prices -a http://localhost:8766/gun            # on the replica
+{
+  "milk": 2
+}
+
+$ gundb sub prices/milk -a http://localhost:8766/gun       # terminal 4, on the replica
+08:59:26  2
+```
+
+```sh
+$ gundb put prices/milk 3                                  # on the primary
+```
+
+```
+08:59:27  3
+```
+
+Now write to the replica:
+
+```sh
+$ gundb put prices/milk 0 -a http://localhost:8766/gun
+ok  prices/milk = 0
+
+$ gundb get prices/milk                                    # the primary: unchanged
+3
+
+$ gundb get prices/milk -a http://localhost:8766/gun       # the replica: its own value
+0
+```
+
+**Discussion:** the write never reached the primary, which is the point.
+But the replica stored it and serves it to its own clients until the
+primary changes `milk` again. For a strictly read-only replica, refuse
+client writes on it too: in Go, `CanWrite` returning `false` (see
+GUIDE.md, "One-way peers"). The primary, for its part, gets nothing from
+the replica: its gets to the replica are answered "not found".
+
+## 27. A write-only backup
+
+`?gundb_mode=write` sends every write to a server and never takes anything
+from it. Here, a backup that keeps everything on disk. Even a restored
+or tampered backup can't push data back into the live server.
+
+```sh
+# terminal 1: the backup
+$ gundb server --addr http://localhost:8766/gun --store pebble --data ./backup
+
+# terminal 3: the live server
+$ gundb server --peers 'http://localhost:8766/gun?gundb_mode=write'
+08:59:25 INFO  gundb server is running  addr=http://localhost:8765/gun
+08:59:25 INFO  writing to peer, never reading from it  peer=http://localhost:8766/gun
+08:59:25 INFO  connected to peer  peer=http://localhost:8766/gun
+```
+
+Every write to the live server lands on the backup:
+
+```sh
+$ gundb put orders/1 '{"item":"milk","qty":2}'
+ok  orders/1 = {"item":"milk","qty":2}
+
+$ gundb get orders/1 -a http://localhost:8766/gun          # on the backup
+{
+  "item": "milk",
+  "qty": 2
+}
+```
+
+What the backup holds or writes never comes back:
+
+```sh
+$ gundb put orders/1/qty 999 -a http://localhost:8766/gun  # someone changes the backup
+ok  orders/1/qty = 999
+
+$ gundb get orders/1/qty                                   # live: unchanged
+2
+
+$ gundb put notes/x 'only on the backup' -a http://localhost:8766/gun
+$ gundb get notes/x                                        # live never asks the backup
+error: nothing at notes/x
+```
+
+Quote URLs with `?` or `&`. Unquoted, zsh treats `?` as a wildcard and
+fails before gundb even runs (bash passes it through, but `&` would end
+the command):
+
+```sh
+$ gundb server --peers http://localhost:8766/gun?gundb_mode=write
+zsh: no matches found: http://localhost:8766/gun?gundb_mode=write
+```
+
+A typo in the mode is caught before anything is dialled, instead of
+quietly syncing both ways:
+
+```sh
+$ gundb server --peers 'http://localhost:8766/gun?gundb_mode=reed'
+error: bad --peers: peer "http://localhost:8766/gun?gundb_mode=reed": gundb_mode=reed is not read, write or both
+hint:  add ?gundb_mode=read to only read from a peer, ?gundb_mode=write to only write to it, or leave it out for both ways
+```
+
+## 28. Quotas
 
 `--max-nodes` and `--max-bytes` give every SEA user the same quota for
 their space. A tiny one, to hit it quickly:
@@ -1086,7 +1211,7 @@ GUIDE.md: "Quotas: plans and usage" and "Billing with quotas".
 
 Unset the variables when you're done: `unset GUNDB_USERNAME GUNDB_PASSWORD`.
 
-## 27. See the graph
+## 29. See the graph
 
 `gundb visual` opens a page in your browser that draws everything on the
 server as a live graph:

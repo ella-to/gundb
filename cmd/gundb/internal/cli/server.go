@@ -33,10 +33,14 @@ func (a *App) serverCommand() *ucli.Command {
   gundb server                                   # http://localhost:8765/gun, in memory
   gundb server --addr http://0.0.0.0:8080/gun    # every interface, port 8080
   gundb server --peers http://localhost:8081/gun,http://localhost:8082/gun
+  gundb server --peers 'https://primary/gun?gundb_mode=read'  # a read replica: never writes back
+  gundb server --peers 'https://backup/gun?gundb_mode=write'  # a backup: never read from
   gundb server --store pebble --data ./data      # keep the data on disk
   gundb server --max-nodes 1000 --max-bytes 10MB # a quota for every user
 
-Browsers connect with Gun(['http://localhost:8765/gun']).`,
+Each peer syncs both ways; ?gundb_mode=read in its URL only reads from it,
+?gundb_mode=write only writes to it (quote the URL: ? and & mean something to
+the shell). Browsers connect with Gun(['http://localhost:8765/gun']).`,
 		Flags: []ucli.Flag{
 			&ucli.StringFlag{
 				Name:    "addr",
@@ -47,7 +51,7 @@ Browsers connect with Gun(['http://localhost:8765/gun']).`,
 			},
 			&ucli.StringSliceFlag{
 				Name:    "peers",
-				Usage:   "other relays to sync with, as comma-separated `URLs`; repeat it for more",
+				Usage:   "other relays to sync with, as comma-separated `URLs`; add ?gundb_mode=read to only read from one, ?gundb_mode=write to only write to it; repeat it for more",
 				Sources: ucli.EnvVars("GUNDB_PEERS"),
 			},
 			&ucli.DurationFlag{
@@ -152,8 +156,13 @@ func (a *App) serve(ctx context.Context, c *ucli.Command) error {
 
 	addr := publicAddr(c.String("addr"), ln.Addr().(*net.TCPAddr), path)
 	log.Info("gundb server is running", "addr", addr)
-	if len(peers) > 0 {
-		log.Info("syncing with peers", "peers", strings.Join(peers, ","))
+	for _, p := range peers {
+		url, mode, _ := gundb.ParsePeer(p) // checked by peerList
+		log.Info(map[gundb.PeerMode]string{
+			gundb.PeerBoth:  "syncing with peer",
+			gundb.PeerRead:  "reading from peer, never writing to it",
+			gundb.PeerWrite: "writing to peer, never reading from it",
+		}[mode], "peer", url)
 	}
 	if a.onListen != nil {
 		a.onListen(addr)
@@ -227,7 +236,8 @@ func explainListen(host string, err error) error {
 	return fmt.Errorf("cannot listen on %s: %w", host, err)
 }
 
-// peerList reads --peers: comma-separated, and the flag repeated.
+// peerList reads --peers: comma-separated, and the flag repeated. Each
+// is a URL, with ?gundb_mode=read or ?gundb_mode=write to make it one way.
 func peerList(values []string) ([]string, error) {
 	var peers []string
 	for _, v := range values {
@@ -235,7 +245,12 @@ func peerList(values []string) ([]string, error) {
 			if p = strings.TrimSpace(p); p == "" {
 				continue
 			}
-			if err := checkPeerURL("--peers", p); err != nil {
+			url, _, err := gundb.ParsePeer(p)
+			if err != nil {
+				return nil, fail("add ?gundb_mode=read to only read from a peer, ?gundb_mode=write to only write to it, or leave it out for both ways",
+					"bad --peers: %s", clean(err))
+			}
+			if err := checkPeerURL("--peers", url); err != nil {
 				return nil, err
 			}
 			peers = append(peers, p)

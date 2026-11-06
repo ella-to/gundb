@@ -19,6 +19,14 @@ type Options struct {
 	// http:// and https:// URLs work out of the box. Peers are re-dialled
 	// every 2s when the connection drops, and writes made while
 	// disconnected are sent once the connection is back.
+	//
+	// Data flows both ways by default. The gundb_mode query parameter makes a
+	// peer one way: ?gundb_mode=read only reads from it (a mirror of a primary
+	// that never writes back to it), ?gundb_mode=write only writes to it (a
+	// backup that is never read from). ReadFrom and WriteTo add it for
+	// you. It is taken out before dialling.
+	//
+	//	Peers: []string{"wss://a/gun", "wss://b/gun?gundb_mode=read", gundb.WriteTo("wss://c/gun")}
 	Peers []string
 
 	// Store persists nodes. Default: NewMemoryStore().
@@ -91,9 +99,10 @@ type Options struct {
 // PeerInfo describes one connection, for Options.OnConnect and
 // Options.OnDisconnect. Who is behind it is in the connection's context.
 type PeerInfo struct {
-	PeerID string // unique to this connection, chosen by gundb
-	URL    string // the configured peer's URL, if this DB dialled it
-	Remote string // the remote address
+	PeerID string   // unique to this connection, chosen by gundb
+	URL    string   // the configured peer's URL, if this DB dialled it
+	Mode   PeerMode // which way data flows with a peer this DB dialled
+	Remote string   // the remote address
 }
 
 // DB is a GUN peer: a local graph that syncs with other peers in real time.
@@ -263,9 +272,18 @@ func (db *DB) Close() error {
 }
 
 // Connect adds a peer by URL and keeps it connected until Close, exactly
-// like the Peers option. It returns immediately.
+// like the Peers option, ?gundb_mode=read and ?gundb_mode=write included (see
+// ParsePeer). A URL with a bad mode is not dialled; the error is logged.
+// It returns immediately.
 func (db *DB) Connect(url string) {
-	o := &outbound{url: url, trying: true}
+	url, mode, err := ParsePeer(url)
+	if err != nil {
+		// Not dialled at all: a typo must not make a peer meant to be
+		// read only one we write to.
+		db.log.Error("gundb: not connecting to a peer with a bad mode", "err", err)
+		return
+	}
+	o := &outbound{url: url, mode: mode, trying: true}
 	db.peersMu.Lock()
 	db.outbound = append(db.outbound, o)
 	db.peersMu.Unlock()
@@ -350,13 +368,18 @@ func (db *DB) signalLocked() {
 // connected waits until at least one peer is connected. It returns false
 // straight away when there is no peer to wait for, i.e. nothing connected
 // and no configured peer still on its first dial attempt.
-func (db *DB) connected(ctx context.Context) bool {
+func (db *DB) connected(ctx context.Context, way PeerMode) bool {
 	for {
 		db.peersMu.Lock()
-		n, ch := len(db.peers), db.changed
+		n, ch := 0, db.changed
+		for p := range db.peers {
+			if p.flows(way) {
+				n++
+			}
+		}
 		trying := false
 		for _, o := range db.outbound {
-			trying = trying || o.trying
+			trying = trying || (o.trying && o.flows(way))
 		}
 		db.peersMu.Unlock()
 		if n > 0 {

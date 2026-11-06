@@ -636,3 +636,38 @@ func waitFor(t *testing.T, b *buffer, want string) {
 	}
 	t.Fatalf("no %q in %q", want, b.String())
 }
+
+func TestServerPeerModes(t *testing.T) {
+	primary := startServer(t)
+	replica := startServer(t, "--peers", primary+"?gundb_mode=read")
+	backup := startServer(t)
+	edge := startServer(t, "--peers", backup+"?gundb_mode=write")
+
+	// The replica reads the primary, and never writes back.
+	must(t, "put", "prices/milk", "2", "--addr", primary)
+	wantOut(t, must(t, "get", "prices/milk", "--addr", replica), "2")
+	must(t, "put", "drafts/x", "only here", "--addr", replica)
+	if _, stderr, err := run(t, "", "get", "drafts/x", "--addr", primary); err == nil {
+		t.Error("the replica wrote to the primary")
+	} else {
+		wantOut(t, stderr, "nothing at drafts/x")
+	}
+
+	// The edge writes to the backup, and never reads from it.
+	must(t, "put", "orders/1/qty", "3", "--addr", edge)
+	eventually(t, func() bool {
+		out, _, err := run(t, "", "get", "orders/1/qty", "--addr", backup)
+		return err == nil && strings.Contains(out, "3")
+	})
+	must(t, "put", "injected/x", "from the backup", "--addr", backup)
+	if _, _, err := run(t, "", "get", "injected/x", "--addr", edge); err == nil {
+		t.Error("the edge read from the backup")
+	}
+
+	// A typo in the mode is caught, not dialled.
+	_, stderr, err := run(t, "", "server", "--addr", "http://127.0.0.1:0/gun", "--peers", primary+"?gundb_mode=reed")
+	if err == nil {
+		t.Fatal("a server started with a bad peer mode")
+	}
+	wantOut(t, stderr, "gundb_mode=reed is not read, write or both", "?gundb_mode=read")
+}
