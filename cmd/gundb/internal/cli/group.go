@@ -496,10 +496,19 @@ func (g *groupRun) pull(ctx context.Context, gs *groupState) ([]logLine, error) 
 	}
 	var fresh []logLine
 	waiting := map[string]int{}
+	if gs.Read == nil { // a device file from before Read: work it out from the log
+		gs.Read = map[string]string{}
+		for _, l := range gs.Log {
+			if l.ID > gs.Read[l.From] {
+				gs.Read[l.From] = l.ID
+			}
+		}
+	}
 	for _, pub := range pubs {
 		if pub == g.me.Pub() {
 			continue
 		}
+		var noKey []string // this member's messages whose key hasn't come
 		links, err := g.node(pub).Get("messages").Links(ctx)
 		if errors.Is(err, gundb.ErrNotFound) {
 			continue
@@ -518,16 +527,29 @@ func (g *groupRun) pull(ctx context.Context, gs *groupState) ([]logLine, error) 
 			}
 			text, at, err := g.decrypt(ctx, gs, pub, msg)
 			if errors.Is(err, errNoKeyYet) {
-				waiting[g.name(ctx, pub)]++
-				continue // the key may come later: try again next time
+				noKey = append(noKey, id) // the key may come later: try again next time
+				continue
 			}
 			gs.Seen[seen] = true
 			if err != nil {
 				continue // from before I joined, or not for me
 			}
+			if id > gs.Read[pub] {
+				gs.Read[pub] = id
+			}
 			l := logLine{ID: id, From: pub, At: at, Text: text}
 			gs.Log = append(gs.Log, l)
 			fresh = append(fresh, l)
+		}
+		// A key that never came for a message older than one this device
+		// read never will: it was sent before this device was given the
+		// member's chain (before joining, say). Only later ones still wait.
+		for _, id := range noKey {
+			if id < gs.Read[pub] {
+				gs.Seen[pub+"/"+id] = true
+			} else {
+				waiting[g.name(ctx, pub)]++
+			}
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(waiting)) {

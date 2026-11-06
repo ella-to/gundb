@@ -582,6 +582,17 @@ func TestGroupChat(t *testing.T) {
 	if strings.Contains(out, "hi team") {
 		t.Errorf("dave read the history: %s", out)
 	}
+	// Bob's message from before dave joined never becomes readable. Once
+	// dave reads a later one from bob, he is no longer told to wait for it.
+	must(t, as("bob", "group", "send", "alice/team", "hi dave")...)
+	out, stderr, err = run(t, "", as("dave", "group", "read", "alice/team")...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut(t, out, "bob: hi dave")
+	if strings.Contains(out, "hello alice") || strings.Contains(stderr, "wait for their key") {
+		t.Errorf("dave's read of what came before he joined:\n%s%s", out, stderr)
+	}
 
 	// Carol watches; she sees new messages as they arrive.
 	ctx, cancel := context.WithCancel(t.Context())

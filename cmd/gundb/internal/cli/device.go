@@ -62,7 +62,12 @@ type groupState struct {
 	SharedWith map[string]string              `json:"shared_with"`
 	Chains     map[string]*senderkey.Receiver `json:"chains"` // other members' chains, by ID
 	Seen       map[string]bool                `json:"seen"`   // "<pub>/<message id>" handled
-	Log        []logLine                      `json:"log"`    // what was said: a message decrypts once
+	// Read maps each member to the ID of the latest of their messages
+	// this device decrypted. IDs sort in the order they were sent, and a
+	// member only ever shares their current chain, so an earlier message
+	// whose key never came was sent before this device could read them.
+	Read map[string]string `json:"read,omitempty"`
+	Log  []logLine         `json:"log"` // what was said: a message decrypts once
 }
 
 type logLine struct {
