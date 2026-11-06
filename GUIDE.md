@@ -1638,6 +1638,7 @@ Things to know:
 - **A node is counted once, however many write to it.** The owner pays, whoever writes. With SEA only the owner can write their space; with your own `Owner`, make sure `CanWrite` agrees with it.
 - **Only peers that connect are refused.** The relay's own writes and data from peers it dials (`Options.Peers`) are counted but never refused. A relay that another relay dials checks that relay's writes like any client's, so give every relay the same quota, or the strictest one decides.
 - **Deleted fields still use disk.** GUN never forgets a field, it keeps a `null` (and pebblestore keeps every version). Usage counts live data, which is what users see and what's fair to bill. Disk use grows with history too.
+- **SEA data is bigger than it looks.** In a user's space every value carries its signature, about 100 bytes, and a new account takes about 900 bytes before the user writes anything (its keys, stored encrypted). Size byte limits for that: 10 KB holds the account and a few dozen short values, not 10 KB of text.
 - **Lists:** `Set` with a struct makes a node per item, so a list of 500 items is 501 nodes. Plain values added with `Set` are fields of the list node and count only as bytes.
 
 ### Billing with quotas

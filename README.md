@@ -91,7 +91,8 @@ gundb group send team 'hi' -u ali -p secret123
 gundb group sub ali/team -u bob -p …           # as bob
 ```
 
-The [guide](GUIDE.md#14-the-gundb-command) walks through all of it.
+The [guide](GUIDE.md#14-the-gundb-command) walks through all of it, and
+[SCENARIOS.md](SCENARIOS.md) has step-by-step scenarios to try it out.
 
 `--addr` (or `GUNDB_ADDR`) picks the server, and `--timeout` bounds each
 command (default 2s; 0 waits forever). Run `gundb <command> --help` for
