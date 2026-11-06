@@ -26,6 +26,7 @@ go get ella.to/gundb   # needs Go 1.27+
   - [A private list](#a-private-list)
   - [Who is online](#who-is-online)
   - [Quotas: plans and usage](#quotas-plans-and-usage)
+  - [Billing with quotas](#billing-with-quotas)
 - [9. Users and encryption (SEA)](#9-users-and-encryption-sea)
   - [Encrypted group chat with a shared key](#encrypted-group-chat-with-a-shared-key)
   - [Encrypted group chat with sender keys (a ratchet)](#encrypted-group-chat-with-sender-keys-a-ratchet)
@@ -1638,6 +1639,85 @@ Things to know:
 - **Only peers that connect are refused.** The relay's own writes and data from peers it dials (`Options.Peers`) are counted but never refused. A relay that another relay dials checks that relay's writes like any client's, so give every relay the same quota, or the strictest one decides.
 - **Deleted fields still use disk.** GUN never forgets a field, it keeps a `null` (and pebblestore keeps every version). Usage counts live data, which is what users see and what's fair to bill. Disk use grows with history too.
 - **Lists:** `Set` with a struct makes a node per item, so a list of 500 items is 501 nodes. Plain values added with `Set` are fields of the list node and count only as bytes.
+
+### Billing with quotas
+
+The quota counts and refuses; billing is up to you. Before you charge for it, check these, roughly in order of how much they cost you if you get them wrong.
+
+**1. Refuse what nobody owns.** With the default owner, only data in users' spaces is counted. Anything else (`gun.get('chat').put(...)`) belongs to nobody and is free and unlimited, for anyone. In a SEA app, allow only users' spaces:
+
+```go
+CanWrite: func(ctx context.Context, soul, field string) bool {
+    return strings.HasPrefix(soul, "~") // ~<pub>/... and the ~@alias nodes sign-up writes
+},
+```
+
+`~@alias` nodes are nobody's too, but SEA only lets them hold one link per account, so they stay small. With your own `Owner`, make `CanWrite` refuse every soul your `Owner` returns `""` for, unless you mean to give it away.
+
+**2. Never return a zero `Limit` by accident.** Zero means no limit. An owner your `Limit` doesn't know (a new sign-up, a typo, a cache that hasn't loaded yet) should get the smallest plan, not an empty `Limit{}`:
+
+```go
+func (a *accounts) Limit(owner string) gundb.Limit {
+    a.mu.RLock()
+    defer a.mu.RUnlock()
+    if p, ok := a.plan[owner]; ok {
+        return plans[p]
+    }
+    return plans["free"] // or a tiny "unverified" plan, see 3
+}
+```
+
+**3. Free sign-ups are free storage.** Anyone can make SEA keys, and every new key is a new owner with a free plan. 1,000 throwaway accounts are 1,000 free plans. Make the free plan something you only give to accounts you know: return a tiny plan (`Limit{Nodes: 5, Bytes: 4 << 10}`, enough for the account and a profile) until the user has signed up with you (a verified email, a payment card), and the real free plan after. Rate-limit sign-ups per IP in the HTTP middleware.
+
+**4. Keep plans in memory, and update them when payments happen.** `Limit` runs on every write that grows usage, so it must not touch a database. Load every account's plan at start, and update the map from your payment provider's webhook (`accts.SetPlan` in the example). The next write sees the new plan; nothing needs restarting.
+
+**5. Bill from snapshots, not from the moment you look.** Usage goes up and down as users write and delete. Record it regularly and bill on what you recorded, the peak or the average of the month, so deleting everything on the 30th doesn't make a month free:
+
+```go
+go func() {
+    t := time.NewTicker(time.Hour)
+    defer t.Stop()
+    for now := range t.C {
+        for owner, u := range relay.Usages() {
+            saveUsage(owner, now, u) // your billing database; bill the peak of the month
+        }
+    }
+}()
+```
+
+The snapshots also keep the history `Usages` doesn't: it only knows the present, and starts again from the store on restart.
+
+**6. Show users their usage, and warn them before the limit.** A refused write is a bad way to find out. Serve each user their own numbers behind the same middleware as the relay:
+
+```go
+http.Handle("/usage", authenticate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    owner := ownerOf(r.Context()) // the owner your session maps to: a name, or a SEA pub
+    u, l := relay.Usage(owner), accts.Limit(owner)
+    json.NewEncoder(w).Encode(map[string]int64{
+        "nodes": u.Nodes, "maxNodes": l.Nodes, "bytes": u.Bytes, "maxBytes": l.Bytes,
+    })
+})))
+```
+
+Draw a usage bar from it, and e-mail users from the snapshot job when they pass 80%.
+
+**7. Handle `ErrQuota` in the client.** Every write past the limit fails the same way. In Go, `errors.Is(err, gundb.ErrQuota)` on `PutAck`. In GUN.js, the ack's error starts with `gundb: quota exceeded`:
+
+```js
+user.get('notes').get(id).put(note, (ack) => {
+  if (ack.err && ack.err.startsWith('gundb: quota exceeded')) showUpgrade();
+});
+```
+
+GUN.js applies a write locally before the relay answers, so the refused note stays in that tab until it reloads. Remove it from the UI when the ack says no. `put` without a callback never finds out.
+
+**8. Decide what a downgrade means.** A user who drops from pro to free keeps all their data and can still read, edit and delete it, but can't grow until they're under the free limits. That's usually the right default: nothing is deleted behind their back. If you want something else (archive after 30 days, say), do it from the snapshot job, writing through the relay: its own writes are never refused.
+
+**9. Bill live data, and watch the disk yourself.** Usage counts what users can see. Disk holds more: GUN keeps a `null` for every deleted field, and pebblestore keeps every version of every field. A user who rewrites one 1 MB value a thousand times uses 1 MB of quota and about 1 GB of disk. Watch disk per server, and charge for write volume separately if your users rewrite a lot.
+
+**10. With several relays, bill from one.** Each relay counts its own store. Relays that sync hold the same data, so their counts end up the same, but not at the same instant. Give them all the same `Quota` and plans, and take snapshots from one of them.
+
+**11. Time your restarts.** `New` reads every node once to rebuild the totals before it serves anyone. Measure how long that takes on a copy of your data, and plan restarts around it as the data grows.
 
 ## 9. Users and encryption (SEA)
 
