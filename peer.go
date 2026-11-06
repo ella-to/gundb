@@ -393,6 +393,19 @@ func has(s map[*peer]struct{}, p *peer) bool {
 	return ok
 }
 
+// queueForAway keeps raw, a write we relay, for the configured peers we
+// write to that are disconnected, so they get it when they are back, as
+// they get our own writes. A backup that restarts misses nothing.
+func (db *DB) queueForAway(raw []byte) {
+	db.peersMu.Lock()
+	defer db.peersMu.Unlock()
+	for _, o := range db.outbound {
+		if o.live == nil && !o.self && o.flows(PeerWrite) && len(o.queue) < maxQueue {
+			o.queue = append(o.queue, raw)
+		}
+	}
+}
+
 // sendOwn sends a message we created to every peer we write to (only what
 // each may read), and queues it for configured peers we write to that are
 // currently disconnected.

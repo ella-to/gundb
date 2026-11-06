@@ -18,7 +18,8 @@ type Options struct {
 	// Peers to connect to, like Gun({peers: [...]}) in JS. ws://, wss://,
 	// http:// and https:// URLs work out of the box. Peers are re-dialled
 	// every 2s when the connection drops, and writes made while
-	// disconnected are sent once the connection is back.
+	// disconnected, this DB's own and those it relays from its clients,
+	// are sent once the connection is back.
 	//
 	// Data flows both ways by default. The gundb_mode query parameter makes a
 	// peer one way: ?gundb_mode=read only reads from it (a mirror of a primary

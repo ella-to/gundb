@@ -1037,7 +1037,7 @@ Things to know:
 - **A read replica still takes its clients' writes.** `ReadFrom` keeps them from reaching the primary, but the replica stores them, and serves them, until the primary writes that field again. For a strictly read-only replica, also refuse them: `CanWrite: func(context.Context, string, string) bool { return false }`.
 - **A peer you `WriteTo` can still read from you.** It may ask for data, and you answer: peers you dial are trusted, so `CanRead` doesn't apply to them. What it *sends* is dropped, which is what keeps it from changing you.
 - **No peer in the right direction means no waiting.** With only `ReadFrom` peers, `PutAck` returns `ErrNoPeers` (the write is kept locally); with only `WriteTo` peers, a read returns what is stored locally straight away.
-- **This DB's own writes for a `WriteTo` peer that is away are queued**, in memory, like for any peer (up to 10,000 writes), and sent when it reconnects.
+- **Writes for a peer that is away are queued**, `WriteTo` or both ways: this DB's own and those it relays from its clients, in memory (up to 10,000), and sent when the peer reconnects. A backup that restarts misses nothing written meanwhile, unless this DB restarts too.
 
 ## 8. Permissions: who can read and write
 

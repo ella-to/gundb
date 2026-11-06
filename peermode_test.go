@@ -221,3 +221,19 @@ func TestPeerInfoHasTheMode(t *testing.T) {
 	}
 }
 
+// TestRelayedWritesWaitForAPeerAway checks that a relay keeps its clients'
+// writes for a peer it writes to while that peer is down, not only its own.
+func TestRelayedWritesWaitForAPeerAway(t *testing.T) {
+	ctx := t.Context()
+	backup := newDB(t)
+	srv := httptest.NewUnstartedServer(backup)
+	relay := New(Options{Peers: []string{WriteTo("ws://" + srv.Listener.Addr().String() + "/gun")}})
+	defer relay.Close()
+	client := dialer(t, relay, serve(t, relay))
+	if err := client.Get("orders").Get("2").PutAck(ctx, map[string]int{"qty": 5}); err != nil {
+		t.Fatal(err)
+	}
+	srv.Start() // the backup comes up after the write
+	defer srv.Close()
+	eventually(t, func() bool { return stored(t, backup, "orders/2") })
+}

@@ -1020,12 +1020,11 @@ $ gundb get city/oslo/temp                                 # from 8765
 ```
 
 **Check:** stop the first relay, write `city/oslo/temp 9` to the second,
-and start the first again. The second reconnects within 2s. Reading from
-the first then returns `9`: a relay asks its peers for what it doesn't
-have, and keeps what they send, so it still has `9` after the second
-stops. (What it never reads isn't copied over on reconnect; run every
-relay with `--store pebble` and the same `--peers` to keep them all
-complete.)
+and start the first again. The second reconnects within 2s and sends the
+write it kept for it. Stop the second too: the first still answers `9`.
+Only the side that dials (the one with `--peers`) keeps writes for a
+peer that's away; give each relay `--peers` pointing at the other if
+either may go down.
 
 ## 26. A read replica
 
@@ -1131,6 +1130,10 @@ $ gundb put notes/x 'only on the backup' -a http://localhost:8766/gun
 $ gundb get notes/x                                        # live never asks the backup
 error: nothing at notes/x
 ```
+
+**Check:** stop the backup, write a few orders to the live server, start
+the backup again: the writes made while it was away arrive once it
+reconnects. They were queued for it.
 
 Quote URLs with `?` or `&`. Unquoted, zsh treats `?` as a wildcard and
 fails before gundb even runs (bash passes it through, but `&` would end

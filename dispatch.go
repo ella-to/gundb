@@ -137,6 +137,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 			db.sendTo(q, m, raw, memo)
 		}
 	}
+	db.queueForAway(raw)
 }
 
 func (db *DB) handleGet(p *peer, m *message) {
