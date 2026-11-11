@@ -230,7 +230,7 @@ func (cl *client) guardScope(ctx context.Context, path string) error {
 	if _, found, err := cl.readGrant(ctx, cl.me(), keys[1]); err != nil || !found {
 		return err
 	}
-	return fail("add --obf: gundb ... "+path+" --obf", "~/%s is obfuscated: without --obf its names would be stored in clear", keys[1])
+	return fail("run it again with --obf", "~/%s is obfuscated: without --obf its names would be stored in clear", keys[1])
 }
 
 // grant gives the users in --to (comma-separated) a grant for the scope
@@ -413,7 +413,7 @@ func (cl *client) rotate(ctx context.Context, path, to string) (string, error) {
 		if err := cl.writeGrant(ctx, u, nil, s.label); err != nil {
 			return "", err
 		}
-		dropped = append(dropped, abbrev(pub))
+		dropped = append(dropped, cl.aliasOf(ctx, pub))
 	}
 	for pub, u := range keep {
 		reader := g
@@ -516,8 +516,12 @@ func (cl *client) deleteTree(ctx context.Context, soul string) (int, error) {
 	return cleared, nil
 }
 
-// abbrev shortens a public key for messages.
-func abbrev(pub string) string {
+// aliasOf returns the alias of the user with key pub, for messages, or
+// the start of the key if it is not found.
+func (cl *client) aliasOf(ctx context.Context, pub string) string {
+	if alias, err := cl.db.User(pub).Get("alias").Once[string](ctx); err == nil && alias != "" {
+		return alias
+	}
 	if len(pub) > 12 {
 		return pub[:12] + "..."
 	}

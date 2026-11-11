@@ -147,12 +147,13 @@ type opener struct {
 	from   string // who pub belongs to, for messages
 
 	sawSigned, sawEncrypted bool // values left as they are
+	obf                     bool // --obf: the scope's key, the owner in the path
 }
 
 // newOpener sets up --dec, --verify and --from, for reading path.
 func (cl *client) newOpener(ctx context.Context, c *ucli.Command, path string) (*opener, error) {
 	dec, verify := c.Bool("dec"), c.Bool("verify")
-	o := &opener{verify: verify || dec, strict: verify}
+	o := &opener{verify: verify || dec, strict: verify, obf: cl.obf}
 	if c.IsSet("from") && !o.verify {
 		return nil, fail("add --dec or --verify", "--from only works with --dec or --verify")
 	}
@@ -324,6 +325,8 @@ func seaKind(s string) string {
 // note tells the person about sealed values they did not open.
 func (o *opener) note(w io.Writer) {
 	switch {
+	case o.sawEncrypted && o.obf:
+		fmt.Fprintln(w, "note:  some values are encrypted; read them with --dec")
 	case o.sawEncrypted:
 		fmt.Fprintln(w, "note:  some values are encrypted; read them with --dec (and --from <user> if someone else wrote them)")
 	case o.sawSigned:
