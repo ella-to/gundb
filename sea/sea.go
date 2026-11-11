@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"ella.to/gundb/internal/js"
 )
@@ -314,13 +315,9 @@ func sign(data string, pair *Pair) (string, error) {
 }
 
 func verify(data, sig, pub string) error {
-	xy, err := decodeXY(pub)
+	pk, err := publicKey(pub)
 	if err != nil {
 		return err
-	}
-	pk, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), xy)
-	if err != nil {
-		return fmt.Errorf("sea: bad pub: %w", err)
 	}
 	raw, err := b64std(sig)
 	if err != nil || len(raw) != 64 {
@@ -332,6 +329,40 @@ func verify(data, sig, pub string) error {
 		return ErrSignature
 	}
 	return nil
+}
+
+// keys caches parsed public keys: a relay verifies many signatures by few
+// users, and parsing a key is a large part of verifying one signature.
+var keys = struct {
+	sync.Mutex
+	m map[string]*ecdsa.PublicKey
+}{m: map[string]*ecdsa.PublicKey{}}
+
+// maxKeys bounds the cache; it is emptied when full.
+const maxKeys = 10_000
+
+// publicKey returns the parsed key pub ("x.y").
+func publicKey(pub string) (*ecdsa.PublicKey, error) {
+	keys.Lock()
+	pk := keys.m[pub]
+	keys.Unlock()
+	if pk != nil {
+		return pk, nil
+	}
+	xy, err := decodeXY(pub)
+	if err != nil {
+		return nil, err
+	}
+	if pk, err = ecdsa.ParseUncompressedPublicKey(elliptic.P256(), xy); err != nil {
+		return nil, fmt.Errorf("sea: bad pub: %w", err)
+	}
+	keys.Lock()
+	if len(keys.m) >= maxKeys {
+		clear(keys.m)
+	}
+	keys.m[pub] = pk
+	keys.Unlock()
+	return pk, nil
 }
 
 // sigDigest is what SEA's ECDSA signatures cover: SEA hashes the data and

@@ -18,15 +18,51 @@ import (
 // The DB's own writes are counted against Options.Quota but never refused;
 // applyFrom refuses a peer's write that would break it.
 func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
-	return db.applyFrom(ctx, g, skip, false)
+	changed, _, err := db.applyFrom(ctx, g, skip, false)
+	return changed, err
 }
 
 // applyFrom is apply, with enforce saying whether the quota may refuse the
 // write: true for data from peers that connect to us.
-func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool) (graph, error) {
-	if err := checkSEA(g, skip); err != nil {
-		return nil, err
+//
+// Signatures are verified only for fields that can be stored: those newer
+// than what the store holds. A field equal to the stored one was verified
+// when it was stored, and an older one is dropped by HAM anyway, so a peer
+// offering a node we already have costs no verification at all. stale
+// reports that g had such signed fields: they were neither verified nor
+// stored, so g must not be passed on as it is (pass on changed instead).
+func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool) (changed graph, stale bool, err error) {
+	sigs, err := checkUnsigned(g, skip)
+	if err != nil {
+		return nil, false, err
 	}
+	// pending holds the signed fields not verified yet. Verify those that
+	// can win now, outside the merge locks, in parallel. One that wins only
+	// because the store changed meanwhile is verified during the merge.
+	var pending map[string]map[string]soulKind
+	if len(sigs) > 0 {
+		pending = make(map[string]map[string]soulKind)
+		for _, f := range sigs {
+			if pending[f.soul] == nil {
+				pending[f.soul] = map[string]soulKind{}
+			}
+			pending[f.soul][f.field] = f.kind
+		}
+		wins := db.mayWin(ctx, g, sigs, db.state.Next())
+		if err := verifyAll(wins); err != nil {
+			return nil, false, err
+		}
+		for _, f := range wins {
+			delete(pending[f.soul], f.field)
+		}
+		for soul, fields := range pending {
+			if len(fields) == 0 {
+				delete(pending, soul)
+			}
+		}
+		stale = len(pending) > 0
+	}
+
 	changed, later := graph{}, graph{}
 	var wake float64
 	machine := db.state.Next()
@@ -39,14 +75,24 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 			return nil, false, err
 		}
 		var olds map[string]Value
+		var late []fieldRef // signed fields that won but were not verified
+		unverified := pending[soul]
 		for k, v := range in.Fields {
 			state := in.States[k]
 			curState, ok := cur.States[k]
 			if !ok {
 				curState = math.Inf(-1)
 			}
-			switch ham(machine, state, curState, v, cur.Fields[k]) {
-			case hamIncoming:
+			switch r := ham(machine, state, curState, v, cur.Fields[k]); r {
+			case hamIncoming, hamDefer:
+				if kind, ok := unverified[k]; ok {
+					late = append(late, fieldRef{soul, k, v, state, kind})
+				}
+				if r == hamDefer {
+					later.node(soul).Set(k, v, state)
+					wake = max(wake, state)
+					continue
+				}
 				if db.quota != nil {
 					if olds == nil {
 						olds = map[string]Value{}
@@ -56,10 +102,10 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 				cur.Set(k, v, state)
 				changed.node(soul).Set(k, v, state)
 				dirty = true
-			case hamDefer:
-				later.node(soul).Set(k, v, state)
-				wake = max(wake, state)
 			}
+		}
+		if err := verifyAll(late); err != nil {
+			return nil, false, err
 		}
 		if dirty && db.quota != nil {
 			if owner := db.quota.owner(soul); owner != "" {
@@ -83,7 +129,9 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 
 	bs, batch := db.store.(BatchStore)
 	batch = batch && len(g) > 1
-	if batch || db.quota != nil {
+	// A merge can fail on a late signature: merge every node before
+	// storing any when g has several, so a failure stores nothing.
+	if batch || db.quota != nil || (len(g) > 1 && len(pending) > 0) {
 		// Merge every node, holding all their locks, then check the quota,
 		// then commit: at once if the store can, else children first.
 		unlock := db.lockMerges(g)
@@ -93,7 +141,7 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 			cur, dirty, err := merge(soul, g[soul])
 			if err != nil {
 				unlock()
-				return nil, err
+				return nil, false, err
 			}
 			if dirty {
 				curs[soul] = cur
@@ -102,7 +150,7 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 		if db.quota != nil && len(deltas) > 0 {
 			if err := db.quota.reserve(deltas, enforce); err != nil {
 				unlock()
-				return nil, err
+				return nil, false, err
 			}
 		}
 		var err error
@@ -126,7 +174,7 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 			if db.quota != nil {
 				db.quota.release(deltas)
 			}
-			return nil, err
+			return nil, false, err
 		}
 	} else {
 		for _, soul := range childrenFirst(g) {
@@ -138,7 +186,7 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 			}
 			mu.Unlock()
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 	}
@@ -152,7 +200,34 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 		})
 	}
 	db.notify(changed)
-	return changed, nil
+	return changed, stale, nil
+}
+
+// mayWin returns the signed fields in sigs that can win HAM against what
+// the store holds now, at machine: those that would be written or held for
+// later. The rest are equal to or older than the stored ones. If the store
+// cannot be read, all of them are returned.
+func (db *DB) mayWin(ctx context.Context, g graph, sigs []fieldRef, machine float64) []fieldRef {
+	curs := make(map[string]*Node)
+	wins := sigs[:0:0]
+	for _, f := range sigs {
+		cur, ok := curs[f.soul]
+		if !ok {
+			var err error
+			if cur, err = db.current(ctx, f.soul, g[f.soul]); err != nil {
+				return sigs
+			}
+			curs[f.soul] = cur
+		}
+		curState, ok := cur.States[f.field]
+		if !ok {
+			curState = math.Inf(-1)
+		}
+		if r := ham(machine, f.state, curState, f.v, cur.Fields[f.field]); r == hamIncoming || r == hamDefer {
+			wins = append(wins, f)
+		}
+	}
+	return wins
 }
 
 // childrenFirst orders the souls of g so that a node comes after the nodes

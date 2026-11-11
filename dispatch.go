@@ -81,17 +81,26 @@ func (db *DB) handleAck(p *peer, m *message) {
 	}
 	if len(m.Put) > 0 {
 		// Data answering a get counts as a write by whoever sent it, and is
-		// dropped, not relayed, if SEA rejects it.
-		if err := errors.Join(db.allowWrite(p, m.Put), checkSEA(m.Put, nil)); err != nil {
+		// dropped, not relayed, if SEA rejects it. Data we pass on is
+		// verified whole; data for us only where it is newer than ours
+		// (see applyFrom).
+		skip := checked(nil)
+		err := db.allowWrite(p, m.Put)
+		if err == nil && db.relaysReply(p, m) {
+			err, skip = checkSEA(m.Put, nil), allChecked
+		}
+		if err == nil {
+			if err = m.Put.check(); err != nil {
+				db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
+				err = nil // answered as found, like the reference, but not stored
+			} else if _, _, err = db.applyFrom(db.ctx, m.Put, skip, !p.trusted()); err != nil && !errors.Is(err, ErrUnverified) {
+				db.log.Warn("gundb: store failed", "err", err)
+				err = nil
+			}
+		}
+		if err != nil {
 			db.log.Debug("gundb: dropped reply", "peer", p.conn.RemoteAddr(), "err", err)
 			m.Put = nil
-		}
-	}
-	if len(m.Put) > 0 {
-		if err := m.Put.check(); err != nil {
-			db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
-		} else if _, err := db.applyFrom(db.ctx, m.Put, allChecked, !p.trusted()); err != nil {
-			db.log.Warn("gundb: store failed", "err", err)
 		}
 	}
 	if r := db.answer(p, m); r != nil {
@@ -121,7 +130,7 @@ func (db *DB) handlePut(p *peer, m *message) {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
-	changed, err := db.applyFrom(db.ctx, m.Put, nil, !p.trusted())
+	changed, stale, err := db.applyFrom(db.ctx, m.Put, nil, !p.trusted())
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
@@ -129,6 +138,13 @@ func (db *DB) handlePut(p *peer, m *message) {
 	db.reply(p, &message{Ack: m.ID, OK: okAck})
 	if len(changed) == 0 {
 		return
+	}
+	if stale {
+		// Some signed fields lost HAM unverified: pass on only what won,
+		// which was verified, never data that might be forged.
+		cp := *m
+		cp.Put, cp.Hash = changed, nil
+		m = &cp
 	}
 	raw := db.encode(m)
 	memo := &fanout{}
@@ -286,6 +302,19 @@ func (db *DB) relayGet(p *peer, m *message) {
 			db.reply(p, &message{Ack: m.ID})
 		}
 	}()
+}
+
+// relaysReply reports whether the reply m from p will be passed on: it
+// answers a get we relayed for someone else.
+func (db *DB) relaysReply(p *peer, m *message) bool {
+	db.reqMu.Lock()
+	r := db.pending[m.Ack]
+	db.reqMu.Unlock()
+	if r != nil {
+		return r.to != nil
+	}
+	to := db.dup.via(m.Ack)
+	return to != nil && to != p
 }
 
 // reply sends a new message (with a fresh ID) to p.

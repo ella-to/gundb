@@ -34,24 +34,39 @@ func allChecked(string, string) bool { return true }
 // Fields skip says were checked are left alone.
 //
 // The cheap checks run first. Signatures, which cost far more, are then
-// verified in parallel when there are several.
+// verified in parallel when there are several. applyFrom does the same in
+// two steps, to verify only the signatures of fields that can be stored.
 func checkSEA(g graph, skip checked) error {
+	sigs, err := checkUnsigned(g, skip)
+	if err != nil {
+		return err
+	}
+	return verifyAll(sigs)
+}
+
+// checkUnsigned runs every check but signatures, and returns the signed
+// fields whose signatures are still to be verified.
+func checkUnsigned(g graph, skip checked) ([]fieldRef, error) {
 	var sigs []fieldRef
 	for soul, n := range g {
+		k := kindOf(soul)
+		if k == plainSoul {
+			continue // nothing to check
+		}
 		for field, v := range n.Fields {
 			if skip != nil && skip(soul, field) {
 				continue
 			}
-			if signedField(soul, field) {
-				sigs = append(sigs, fieldRef{soul, field, v, n.States[field]})
+			if k.signed(soul, field) {
+				sigs = append(sigs, fieldRef{soul, field, v, n.States[field], k})
 				continue
 			}
-			if err := checkField(soul, field, v, n.States[field]); err != nil {
-				return fmt.Errorf("%w: %s.%s: %v", ErrUnverified, soul, field, err)
+			if err := k.check(soul, field, v, n.States[field]); err != nil {
+				return nil, fmt.Errorf("%w: %s.%s: %v", ErrUnverified, soul, field, err)
 			}
 		}
 	}
-	return verifyAll(sigs)
+	return sigs, nil
 }
 
 // fieldRef is one field of a graph.
@@ -59,24 +74,62 @@ type fieldRef struct {
 	soul, field string
 	v           Value
 	state       float64
+	kind        soulKind
+}
+
+// soulKind is what SEA checks a soul's fields for, worked out once per
+// node instead of once per field.
+type soulKind struct {
+	kind byte   // one of the constants below
+	pub  string // the owner, for userSoul
+}
+
+const (
+	plainKind  byte = iota // checked for nothing
+	aliasList              // "~@": the list of aliases
+	aliasSoul              // "~@alias": the keys that took an alias
+	userSoul               // "~pub" and "~pub/...": signed by pub
+	hashedSoul             // contains "#": content addressed
+)
+
+var plainSoul = soulKind{}
+
+func kindOf(soul string) soulKind {
+	switch {
+	case soul == "~@":
+		return soulKind{kind: aliasList}
+	case strings.HasPrefix(soul, "~@"):
+		return soulKind{kind: aliasSoul}
+	}
+	if pub := sea.PubOf(soul); pub != "" {
+		return soulKind{kind: userSoul, pub: pub}
+	}
+	if strings.Contains(soul, "#") {
+		return soulKind{kind: hashedSoul}
+	}
+	return plainSoul
+}
+
+// signed reports whether field of soul must carry its owner's signature:
+// everything in a user's space but the account's own key.
+func (k soulKind) signed(soul, field string) bool {
+	return k.kind == userSoul && !k.isAccountKey(soul, field)
+}
+
+func (k soulKind) isAccountKey(soul, field string) bool {
+	return field == "pub" && len(soul) == len(k.pub)+1 && soul[0] == '~' && soul[1:] == k.pub
 }
 
 // signedField reports whether field of soul must carry its owner's
-// signature: everything in a user's space but the account's own key.
-func signedField(soul, field string) bool {
-	if strings.HasPrefix(soul, "~@") {
-		return false
-	}
-	pub := sea.PubOf(soul)
-	return pub != "" && !(field == "pub" && soul == "~"+pub)
-}
+// signature.
+func signedField(soul, field string) bool { return kindOf(soul).signed(soul, field) }
 
 // verifyAll checks the signatures of fields, spread over the CPUs.
 func verifyAll(fields []fieldRef) error {
 	workers := min(len(fields), runtime.GOMAXPROCS(0))
 	if workers <= 1 {
 		for _, f := range fields {
-			if err := checkField(f.soul, f.field, f.v, f.state); err != nil {
+			if err := f.kind.check(f.soul, f.field, f.v, f.state); err != nil {
 				return fmt.Errorf("%w: %s.%s: %v", ErrUnverified, f.soul, f.field, err)
 			}
 		}
@@ -95,7 +148,7 @@ func verifyAll(fields []fieldRef) error {
 					return
 				}
 				f := fields[i]
-				if err := checkField(f.soul, f.field, f.v, f.state); err != nil {
+				if err := f.kind.check(f.soul, f.field, f.v, f.state); err != nil {
 					err = fmt.Errorf("%w: %s.%s: %v", ErrUnverified, f.soul, f.field, err)
 					failed.CompareAndSwap(nil, &err)
 					return
@@ -111,19 +164,22 @@ func verifyAll(fields []fieldRef) error {
 }
 
 func checkField(soul, field string, v Value, state float64) error {
-	switch {
-	case soul == "~@": // the list of aliases: {"~@alice": {"#": "~@alice"}}
+	return kindOf(soul).check(soul, field, v, state)
+}
+
+func (k soulKind) check(soul, field string, v Value, state float64) error {
+	switch k.kind {
+	case aliasList: // the list of aliases: {"~@alice": {"#": "~@alice"}}
 		if l, ok := v.(Link); !ok || l.Soul != "~@"+field {
 			return errors.New("alias not same")
 		}
-	case strings.HasPrefix(soul, "~@"): // an alias's keys: {"~pub": {"#": "~pub"}}
+	case aliasSoul: // an alias's keys: {"~pub": {"#": "~pub"}}
 		if l, ok := v.(Link); !ok || l.Soul != field {
 			return errors.New("alias not same")
 		}
-	case sea.PubOf(soul) != "":
-		pub := sea.PubOf(soul)
-		if field == "pub" && soul == "~"+pub { // the account's own key, unsigned
-			if v != String(pub) {
+	case userSoul:
+		if k.isAccountKey(soul, field) { // the account's own key, unsigned
+			if v != String(k.pub) {
 				return errors.New("account not same")
 			}
 			return nil
@@ -132,10 +188,10 @@ func checkField(soul, field string, v Value, state float64) error {
 		if !ok {
 			return errors.New("unsigned data")
 		}
-		if _, err := sea.VerifyField(soul, field, string(s), state, pub); err != nil {
+		if _, err := sea.VerifyField(soul, field, string(s), state, k.pub); err != nil {
 			return err
 		}
-	case strings.Contains(soul, "#"): // content addressed: the key is the hash
+	case hashedSoul: // content addressed: the key is the hash
 		want := field[strings.LastIndexByte(field, '#')+1:]
 		var data any = json.RawMessage(lexical(v))
 		if s, ok := v.(String); ok {
