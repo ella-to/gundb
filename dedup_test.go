@@ -69,7 +69,7 @@ func TestDupGenerations(t *testing.T) {
 	d.track("y", nil)
 	now = now.Add(time.Second)
 	d.track("z", nil) // two rotations later only recent IDs are held
-	if held := len(d.cur) + len(d.prev); held != 3 {
+	if held := d.held(); held != 3 {
 		t.Fatalf("holding %d IDs, want 3 (x, y, z)", held)
 	}
 }
