@@ -115,7 +115,11 @@ func keysOf[V any](m map[string]V, sorted bool) []string {
 // appendJSON appends the GUN wire form of n, with fields sorted if sorted
 // is set.
 func (n *Node) appendJSON(b []byte, sorted bool) ([]byte, error) {
-	keys := keysOf(n.Fields, sorted)
+	return n.appendKeysJSON(b, keysOf(n.Fields, sorted))
+}
+
+// appendKeysJSON appends the GUN wire form of n with only the fields keys.
+func (n *Node) appendKeysJSON(b []byte, keys []string) ([]byte, error) {
 	b = append(b, `{"_":{"#":`...)
 	b = js.AppendQuote(b, n.Soul)
 	b = append(b, `,">":{`...)

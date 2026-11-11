@@ -88,3 +88,35 @@ func TestPutManyNestedKeepsLinks(t *testing.T) {
 		}
 	}
 }
+
+// A node larger than one message is sent in chunks, also through a relay
+// that passes on what it does not have, and is read back whole.
+func TestLargeNodeInChunks(t *testing.T) {
+	ctx := t.Context()
+	origin := newDB(t)
+	fields := map[string]any{}
+	for i := range 2500 {
+		fields["k"+strconv.Itoa(i)] = i
+	}
+	if err := origin.Get("big").Put(ctx, fields); err != nil {
+		t.Fatal(err)
+	}
+	clear(origin.interest)
+
+	direct := newDB(t)
+	link(t, origin, direct)
+	got, err := direct.Get("big").Once[map[string]int](ctx)
+	if err != nil || len(got) != 2500 || got["k2499"] != 2499 {
+		t.Fatalf("read %d fields directly, %v", len(got), err)
+	}
+
+	relay := newDB(t)
+	link(t, origin, relay) // the relay dials origin
+	clear(relay.interest)
+	client := newDB(t)
+	link(t, relay, client)
+	got, err = client.Get("big").Once[map[string]int](ctx)
+	if err != nil || len(got) != 2500 || got["k0"] != 0 {
+		t.Fatalf("read %d fields through a relay, %v", len(got), err)
+	}
+}

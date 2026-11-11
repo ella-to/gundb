@@ -539,6 +539,12 @@ reading a list of 1,000 asks peers for 1,001 nodes, sends all of them over the
 network and keeps all of them in the local store, even if you only show 10.
 The cost grows with the size of the list, not with what you use.
 
+A path into the list, such as `db.Get("todos").Get(id).Get("title")`, reads
+only the fields on the way: one field of the list node, from the store and
+from peers, however long the list. A peer that sends a whole node of more than
+1,000 fields splits it into messages of 1,000, so a long list never travels as
+one huge frame.
+
 `Links` reads only the list node and returns its links, key -> soul. That one
 read is enough to:
 

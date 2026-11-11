@@ -9,6 +9,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"ella.to/gundb/internal/js"
 )
 
 // okAck is the "ok" body of our acks, as sent by gun/src/root.js.
@@ -223,12 +225,64 @@ func (db *DB) handleGet(p *peer, m *message) {
 			}
 		}
 		db.readableNode(p, n)
+		if len(n.Fields) > nodeChunk {
+			db.replyChunks(p, m.ID, n)
+			return
+		}
 		if len(n.Fields) > 0 {
 			db.reply(p, &message{Ack: m.ID, Put: graph{q.Soul: n}})
 			return
 		}
 	}
 	db.relayGet(p, m)
+}
+
+// nodeChunk is how many fields of a node one message carries at most: a
+// list of 100,000 items is sent in 100 messages, not one frame of many
+// megabytes that the reader must hold whole.
+const nodeChunk = 1000
+
+// replyChunks answers the get ack with n in chunks of nodeChunk fields,
+// all but the last marked "%", each written straight from n.
+func (db *DB) replyChunks(p *peer, ack string, n *Node) {
+	keys := keysOf(n.Fields, false)
+	for i := 0; i < len(keys); i += nodeChunk {
+		part := keys[i:min(i+nodeChunk, len(keys))]
+		id := randomID(9)
+		db.dup.track(id, nil)
+		b := append(make([]byte, 0, 64+len(part)*48), `{"#":`...)
+		b = append(js.AppendQuote(b, id), `,"@":`...)
+		b = append(js.AppendQuote(b, ack), `,"put":{`...)
+		b = append(js.AppendQuote(b, n.Soul), ':')
+		b, err := n.appendKeysJSON(b, part)
+		if err != nil {
+			db.log.Error("gundb: encode failed", "err", err)
+			return
+		}
+		b = append(b, '}')
+		if i+nodeChunk < len(keys) {
+			b = append(b, `,"%":1`...)
+		}
+		p.send(append(b, '}'))
+	}
+}
+
+// chunkNode splits n into nodes of at most size fields each. A node that
+// fits is returned as it is.
+func chunkNode(n *Node, size int) []*Node {
+	if len(n.Fields) <= size {
+		return []*Node{n}
+	}
+	parts := make([]*Node, 0, (len(n.Fields)+size-1)/size)
+	var cur *Node
+	for k, v := range n.Fields {
+		if cur == nil || len(cur.Fields) == size {
+			cur = &Node{Soul: n.Soul, Fields: make(map[string]Value, size), States: make(map[string]float64, size)}
+			parts = append(parts, cur)
+		}
+		cur.Fields[k], cur.States[k] = v, n.States[k]
+	}
+	return parts
 }
 
 // lexChunk is how many nodes go in one reply to a LEX query over souls.

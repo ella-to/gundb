@@ -734,6 +734,14 @@ func (db *DB) offerBatch(keys []interestKey, p *peer) {
 		if n == nil {
 			continue
 		}
+		if len(n.Fields) > nodeChunk { // a large node goes on its own, in chunks
+			for _, part := range chunkNode(n, nodeChunk) {
+				send()
+				g[k.soul] = part
+			}
+			send()
+			continue
+		}
 		if cur := g[k.soul]; cur != nil {
 			for f, v := range n.Fields {
 				cur.Set(f, v, n.States[f])
@@ -764,12 +772,14 @@ func (db *DB) offer(k interestKey, peers []*peer) {
 	if n == nil {
 		return
 	}
-	m := &message{ID: randomID(9), Put: graph{k.soul: n}}
-	db.dup.track(m.ID, nil)
-	raw := db.encode(m)
-	memo := &fanout{}
-	for _, p := range peers {
-		db.sendTo(p, m, raw, memo)
+	for _, part := range chunkNode(n, nodeChunk) {
+		m := &message{ID: randomID(9), Put: graph{k.soul: part}}
+		db.dup.track(m.ID, nil)
+		raw := db.encode(m)
+		memo := &fanout{}
+		for _, p := range peers {
+			db.sendTo(p, m, raw, memo)
+		}
 	}
 }
 

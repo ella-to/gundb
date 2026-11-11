@@ -240,6 +240,25 @@ func TestJSClientsWithCompressingGoRelay(t *testing.T) {
 	assertJSON(t, runJS(t, peer, "once", "mark", "pet", "name"), `"Fluffy"`)
 }
 
+// A GUN.js client reads a node larger than one message from a Go relay,
+// which sends it in chunks.
+func TestJSReadsLargeNode(t *testing.T) {
+	requireNode(t)
+	ctx := t.Context()
+	relay := gundb.New()
+	defer relay.Close()
+	srv := httptest.NewServer(relay)
+	defer srv.Close()
+	fields := map[string]any{}
+	for i := range 2500 {
+		fields[fmt.Sprintf("k%d", i)] = i
+	}
+	if err := relay.Get("big").Put(ctx, fields); err != nil {
+		t.Fatal(err)
+	}
+	assertJSON(t, runJS(t, srv.URL+"/gun", "keys", "big"), `2500`)
+}
+
 // GUN.js browser clients logging in to a Go relay with write rules. The
 // token rides in the peer URL, as browsers cannot set WebSocket headers.
 func TestJSClientsWithAuthRelay(t *testing.T) {

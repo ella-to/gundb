@@ -2,6 +2,7 @@
 // Prints "RESULT <json>" and exits.
 //
 //   node client.js <peer> once <soul> [key...]       read a node or field
+//   node client.js <peer> keys <soul>                once, and print how many keys the node has
 //   node client.js <peer> put <soul> <json>          put and wait for an ack
 //   node client.js <peer> set <soul> <json>          set and wait for an ack
 //   node client.js <peer> watch <soul> <key> <want>  .on() until the value equals want
@@ -21,6 +22,9 @@ switch (cmd) {
   case 'once':
     args.forEach((k) => { ref = ref.get(k); });
     ref.once((v) => done(strip(v)));
+    break;
+  case 'keys':
+    ref.once((v) => done(Object.keys(strip(v) || {}).length));
     break;
   case 'put':
     ref.put(JSON.parse(args[0]), (ack) => done(ack.err ? { err: ack.err } : { ok: true }));
