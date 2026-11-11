@@ -37,6 +37,12 @@ type reader struct {
 	// souls to start (true) or stop (false) watching.
 	changed map[string]bool
 	delta   map[string]bool
+
+	// tree, if set, keeps the JSON of the nodes objectJSON writes, for the
+	// next run of the same subscription (see treeCache). cuts counts the
+	// links written as links because of the path they were reached by.
+	tree *treeCache
+	cuts int
 }
 
 func (r *reader) node(soul string) (*Node, error) {
@@ -108,10 +114,22 @@ func (r *reader) treeJSON(b []byte, v Value, path map[string]bool) ([]byte, bool
 }
 
 func (r *reader) objectJSON(b []byte, soul string, path map[string]bool) ([]byte, bool, error) {
+	cache := r.tree
+	if r.net {
+		cache = nil // a cache only knows what is stored here
+	}
+	if cache != nil {
+		if f := cache.frags[soul]; f != nil {
+			cache.seen(r, soul)
+			return append(b, f.json...), true, nil
+		}
+	}
 	n, err := r.node(soul)
 	if err != nil || n == nil {
 		return b, false, err
 	}
+	start, cuts := len(b), r.cuts
+	var children []string
 	if r.net { // fetch all children in parallel before walking them
 		var wg sync.WaitGroup
 		for _, v := range n.Fields {
@@ -135,19 +153,107 @@ func (r *reader) objectJSON(b []byte, soul string, path map[string]bool) ([]byte
 		}
 		first = false
 		b = append(js.AppendQuote(b, k), ':')
-		if l, ok := v.(Link); ok && !path[l.Soul] && len(path) < maxDepth {
-			var found bool
-			if b, found, err = r.objectJSON(b, l.Soul, path); err != nil {
-				return nil, false, err
+		if l, ok := v.(Link); ok {
+			if cache != nil {
+				children = append(children, l.Soul)
 			}
-			if found {
-				continue
+			if !path[l.Soul] && len(path) < maxDepth {
+				var found bool
+				if b, found, err = r.objectJSON(b, l.Soul, path); err != nil {
+					return nil, false, err
+				}
+				if found {
+					continue
+				}
+				// The node isn't here (b is unchanged): write the link itself.
+			} else {
+				r.cuts++ // a cycle or too deep: depends on the path
 			}
-			// The node isn't here (b is unchanged): write the link itself.
 		}
 		b = appendPlain(b, v)
 	}
-	return append(b, '}'), true, nil
+	b = append(b, '}')
+	if cache != nil && r.cuts == cuts {
+		cache.put(soul, b[start:], children)
+	}
+	return b, true, nil
+}
+
+// treeCache keeps, for one Ref.On subscription, the JSON objectJSON wrote
+// for each node, so that a change re-renders only the nodes it touched and
+// the nodes that embed them; the rest is copied. A node whose JSON depends
+// on the path it was reached by (a link cut because of a cycle or the
+// depth limit) is not kept. It is used only by the subscription's own
+// goroutine.
+type treeCache struct {
+	frags   map[string]*frag
+	parents map[string]map[string]bool // soul -> kept nodes that link to it
+	visited map[string]bool            // souls seen has marked in this run
+}
+
+type frag struct {
+	json     []byte
+	children []string // the souls the node links to
+}
+
+func newTreeCache() *treeCache {
+	return &treeCache{frags: map[string]*frag{}, parents: map[string]map[string]bool{}, visited: map[string]bool{}}
+}
+
+// update starts a run: it drops what changed souls invalidate. nil means
+// everything.
+func (c *treeCache) update(changed map[string]bool) {
+	clear(c.visited)
+	if changed == nil {
+		clear(c.frags)
+		clear(c.parents)
+		return
+	}
+	for soul := range changed {
+		c.drop(soul)
+	}
+}
+
+// drop forgets soul and every kept node that embeds it.
+func (c *treeCache) drop(soul string) {
+	if f, ok := c.frags[soul]; ok {
+		delete(c.frags, soul)
+		for _, child := range f.children {
+			if ps := c.parents[child]; ps != nil {
+				if delete(ps, soul); len(ps) == 0 {
+					delete(c.parents, child)
+				}
+			}
+		}
+	}
+	for p := range c.parents[soul] {
+		c.drop(p) // also removes p from c.parents[soul]
+	}
+}
+
+func (c *treeCache) put(soul string, json []byte, children []string) {
+	c.frags[soul] = &frag{json: bytes.Clone(json), children: children}
+	for _, child := range children {
+		if c.parents[child] == nil {
+			c.parents[child] = map[string]bool{}
+		}
+		c.parents[child][soul] = true
+	}
+}
+
+// seen marks soul and everything its kept JSON was read from as read by r,
+// so the watcher keeps watching them.
+func (c *treeCache) seen(r *reader, soul string) {
+	if r.seen == nil || c.visited[soul] {
+		return
+	}
+	c.visited[soul] = true
+	r.seen[soul] = true
+	if f := c.frags[soul]; f != nil {
+		for _, child := range f.children {
+			c.seen(r, child)
+		}
+	}
 }
 
 // appendPlain appends the JSON of one value; a link as {"#": soul}.

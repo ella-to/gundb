@@ -227,7 +227,10 @@ func (r *Ref) Links(ctx context.Context) (map[string]string, error) {
 //	defer off()
 func (r *Ref) On[T any](fn func(T)) (off func()) {
 	var last []byte
+	tree := newTreeCache() // only what changed is read again
 	return r.db.watch(func(rd *reader) func() {
+		tree.update(rd.changed)
+		rd.tree = tree
 		v, err := rd.at(r.path)
 		if err != nil || v == nil {
 			return nil
