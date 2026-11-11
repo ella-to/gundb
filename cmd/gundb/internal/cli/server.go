@@ -87,6 +87,10 @@ the shell). Browsers connect with Gun(['http://localhost:8765/gun']).`,
 				Name:  "no-sync",
 				Usage: "with --store pebble, skip the fsync after each write: faster, but a crash can lose the last writes",
 			},
+			&ucli.BoolFlag{
+				Name:  "ask-every-peer",
+				Usage: "ask every connected client for data this server does not have, like a GUN.js relay; by default only --peers and the clients that asked for the same node are asked",
+			},
 		},
 		OnUsageError: usageError,
 		Action:       a.serve,
@@ -132,6 +136,9 @@ func (a *App) serve(ctx context.Context, c *ucli.Command) error {
 		OnConnect:    func(_ context.Context, p gundb.PeerInfo) { logPeer(log, p, true, false) },
 		OnDisconnect: func(_ context.Context, p gundb.PeerInfo) { logPeer(log, p, false, ctx.Err() != nil) },
 		Quota:        quota,
+		// Clients (browsers, the gundb cli) keep no data others need:
+		// don't ask each of them for what the server does not have.
+		RouteByInterest: !c.Bool("ask-every-peer"),
 	})
 	defer db.Close()
 

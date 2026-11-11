@@ -95,6 +95,19 @@ type Options struct {
 	// writes from connecting peers that would take an owner past their
 	// plan's limits, with ErrQuota. See Quota. Default: nothing is counted.
 	Quota *Quota
+
+	// RouteByInterest sends what this DB cannot answer, and its own
+	// writes, only to the peers that want them, the way it always passes
+	// on other peers' writes: a get for a node it does not have goes to
+	// the peers it dialled (Peers) and to the peers that asked for the same
+	// node, and a write it makes goes to the peers it dialled and to the
+	// peers that asked for the nodes written. Default: both go to every
+	// connected peer, like a GUN.js relay.
+	//
+	// Turn it on for a relay in front of many clients that keep no data
+	// others need, such as browsers: one read of a node nobody has then
+	// costs a message per upstream peer, not one per client.
+	RouteByInterest bool
 }
 
 // PeerInfo describes one connection, for Options.OnConnect and
@@ -157,6 +170,8 @@ type DB struct {
 	onConnect    func(context.Context, PeerInfo)
 	onDisconnect func(context.Context, PeerInfo)
 	quota        *quota // nil without Options.Quota
+
+	routeByInterest bool
 }
 
 // Errors returned by DB and Ref methods.
@@ -226,6 +241,8 @@ func New(opts ...Options) *DB {
 		canWrite:     o.CanWrite,
 		onConnect:    o.OnConnect,
 		onDisconnect: o.OnDisconnect,
+
+		routeByInterest: o.RouteByInterest,
 	}
 	if o.Quota != nil {
 		// Count what is already stored before any peer can write.

@@ -20,6 +20,7 @@ go get ella.to/gundb   # needs Go 1.27+
 - [5. Sync between peers](#5-sync-between-peers)
 - [6. Work offline, sync later](#6-work-offline-sync-later)
 - [7. Run a relay](#7-run-a-relay)
+  - [A relay in front of many clients](#a-relay-in-front-of-many-clients)
   - [One-way peers: read only, write only](#one-way-peers-read-only-write-only)
 - [8. Permissions: who can read and write](#8-permissions-who-can-read-and-write)
   - [Logging in from a client](#logging-in-from-a-client)
@@ -920,6 +921,18 @@ func main() {
 	log.Fatal(http.ListenAndServe(*addr, nil))
 }
 ```
+
+### A relay in front of many clients
+
+By default a relay works like a GUN.js one: when a client asks for a node the relay does not have, it asks every other connected peer, and a write the relay makes itself (through its own `db.Get(...).Put`) goes to every connected peer. With thousands of browsers connected, one read of a node nobody has turns into thousands of messages, and as many answers.
+
+Browsers and other clients rarely hold data the others need. Tell the relay so:
+
+```go
+db := gundb.New(gundb.Options{RouteByInterest: true})
+```
+
+A get it cannot answer then goes only to the peers it dialled (`Options.Peers`) and to the clients that asked for the same node; its own writes go to the peers it dialled and to the clients that asked for the nodes written, the way it always passes on clients' writes. Writes made offline by a client still reach the relay: clients offer their copy of what they read when they connect. `gundb server` works this way unless you pass `--ask-every-peer`.
 
 ### One-way peers: read only, write only
 
@@ -2890,6 +2903,11 @@ gundb server --peers 'https://backup/gun?gundb_mode=write'  # send every write t
 it and `?gundb_mode=write` only writes to it (see
 [one-way peers](#one-way-peers-read-only-write-only)). Quote such URLs:
 `?` and `&` mean something to your shell.
+
+The server asks only `--peers`, and the clients that asked for the same
+node, for data it does not have (see
+[a relay in front of many clients](#a-relay-in-front-of-many-clients));
+`--ask-every-peer` asks every connected client, like a GUN.js relay.
 
 With `--max-nodes` or `--max-bytes`, every SEA user may keep that much in
 their space (`~/...`), and a write past it fails with `quota exceeded`

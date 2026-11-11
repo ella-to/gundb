@@ -169,8 +169,13 @@ func BenchmarkOnPutNested(b *testing.B) {
 
 // BenchmarkGetMiss is a relay with 1,000 connected clients answering a get
 // for a node it does not have (optimization 6).
-func BenchmarkGetMiss(b *testing.B) {
-	db := New()
+func BenchmarkGetMiss(b *testing.B) { benchGetMiss(b, Options{}) }
+
+// BenchmarkGetMissRouted is BenchmarkGetMiss with RouteByInterest.
+func BenchmarkGetMissRouted(b *testing.B) { benchGetMiss(b, Options{RouteByInterest: true}) }
+
+func benchGetMiss(b *testing.B, o Options) {
+	db := New(o)
 	defer db.Close()
 	for range 1000 {
 		benchPeer(b, db, true)
@@ -190,8 +195,16 @@ func BenchmarkGetMiss(b *testing.B) {
 
 // BenchmarkPutLocalManyPeers is a server with 1,000 connected clients that
 // writes a node none of them asked for (optimizations 6 and 10).
-func BenchmarkPutLocalManyPeers(b *testing.B) {
-	db := New()
+func BenchmarkPutLocalManyPeers(b *testing.B) { benchPutLocalManyPeers(b, Options{}) }
+
+// BenchmarkPutLocalManyPeersRouted is BenchmarkPutLocalManyPeers with
+// RouteByInterest.
+func BenchmarkPutLocalManyPeersRouted(b *testing.B) {
+	benchPutLocalManyPeers(b, Options{RouteByInterest: true})
+}
+
+func benchPutLocalManyPeers(b *testing.B, o Options) {
+	db := New(o)
 	defer db.Close()
 	for range 1000 {
 		benchPeer(b, db, true)

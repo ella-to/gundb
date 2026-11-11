@@ -1,10 +1,12 @@
 package gundb
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -292,9 +294,12 @@ func deref(s *string) string {
 // relayGet asks our other peers for data we don't have. Their data is passed
 // back to p as it arrives; if nobody has any, p gets a single "not found"
 // once they have all answered or Options.Wait has passed.
+//
+// With Options.RouteByInterest only the peers we dialled, and those that
+// asked for the same node, are asked; otherwise every peer we read from.
 func (db *DB) relayGet(p *peer, m *message) {
 	var others []*peer
-	for _, o := range db.peersFor(PeerRead) {
+	for _, o := range db.askFor(m.Get) {
 		if o != p && !m.sentTo(o.getPID()) {
 			others = append(others, o)
 		}
@@ -305,26 +310,57 @@ func (db *DB) relayGet(p *peer, m *message) {
 	}
 	r := db.newRequest(m.ID, false, others)
 	r.to = p
+	// No goroutine waits for the answers: whichever comes first of the
+	// last answer, the timeout and Close finishes the request.
+	var once sync.Once
+	var timer *time.Timer
+	var stop func() bool
+	finish := func() {
+		once.Do(func() {
+			db.reqMu.Lock() // timer and stop are set under it
+			t, cancel := timer, stop
+			db.reqMu.Unlock()
+			t.Stop()
+			cancel()
+			db.endRequest(m.ID)
+			db.reqMu.Lock()
+			found := r.found
+			db.reqMu.Unlock()
+			if !found {
+				db.reply(p, &message{Ack: m.ID})
+			}
+		})
+	}
+	db.reqMu.Lock()
+	r.finish = finish
+	timer = time.AfterFunc(db.wait, finish)
+	stop = context.AfterFunc(db.ctx, finish)
+	db.reqMu.Unlock()
 	raw := db.encode(m)
 	for _, o := range others {
 		o.send(raw)
 	}
-	go func() {
-		t := time.NewTimer(db.wait)
-		defer t.Stop()
-		select {
-		case <-r.done:
-		case <-t.C:
-		case <-db.ctx.Done():
+}
+
+// askFor returns the peers to pass on a get we cannot answer: every peer
+// we read from or, with Options.RouteByInterest, the peers we dialled and
+// read from, and those that asked for the same node.
+func (db *DB) askFor(q *getQuery) []*peer {
+	if !db.routeByInterest {
+		return db.peersFor(PeerRead)
+	}
+	out := db.upstream(PeerRead)
+	if q.Soul == "" {
+		return out
+	}
+	db.subsMu.Lock()
+	defer db.subsMu.Unlock()
+	for s := range db.subs[q.Soul] {
+		if s.origin == nil && !slices.Contains(out, s) { // dialled peers are in out already
+			out = append(out, s)
 		}
-		db.endRequest(m.ID)
-		db.reqMu.Lock()
-		found := r.found
-		db.reqMu.Unlock()
-		if !found {
-			db.reply(p, &message{Ack: m.ID})
-		}
-	}()
+	}
+	return out
 }
 
 // relaysReply reports whether the reply m from p will be passed on: it

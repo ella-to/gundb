@@ -345,14 +345,7 @@ func (db *DB) unsubscribe(p *peer) {
 // cost depends on the number of subscribers, not on the number of
 // connected peers.
 func (db *DB) recipients(g graph) []*peer {
-	var upstream []*peer
-	db.peersMu.Lock()
-	for _, o := range db.outbound {
-		if o.live != nil && o.flows(PeerWrite) {
-			upstream = append(upstream, o.live)
-		}
-	}
-	db.peersMu.Unlock()
+	upstream := db.upstream(PeerWrite)
 
 	db.subsMu.Lock()
 	defer db.subsMu.Unlock()
@@ -390,6 +383,20 @@ func (db *DB) recipients(g graph) []*peer {
 	return slices.Collect(maps.Keys(set))
 }
 
+// upstream returns the connected peers this DB dialled that take part in
+// way.
+func (db *DB) upstream(way PeerMode) []*peer {
+	db.peersMu.Lock()
+	defer db.peersMu.Unlock()
+	var out []*peer
+	for _, o := range db.outbound {
+		if o.live != nil && o.flows(way) {
+			out = append(out, o.live)
+		}
+	}
+	return out
+}
+
 func has(s map[*peer]struct{}, p *peer) bool {
 	_, ok := s[p]
 	return ok
@@ -410,13 +417,21 @@ func (db *DB) queueForAway(raw []byte) {
 
 // sendOwn sends a message we created to every peer we write to (only what
 // each may read), and queues it for configured peers we write to that are
-// currently disconnected.
+// currently disconnected. With Options.RouteByInterest it goes only to the
+// peers we dialled and those that asked for its nodes, like the writes we
+// pass on for other peers.
 func (db *DB) sendOwn(m *message, raw []byte) {
+	var peers []*peer
+	if db.routeByInterest {
+		peers = db.recipients(m.Put)
+	}
 	db.peersMu.Lock()
-	peers := make([]*peer, 0, len(db.peers))
-	for p := range db.peers {
-		if p.writes() {
-			peers = append(peers, p)
+	if !db.routeByInterest {
+		peers = make([]*peer, 0, len(db.peers))
+		for p := range db.peers {
+			if p.writes() {
+				peers = append(peers, p)
+			}
 		}
 	}
 	for _, o := range db.outbound {

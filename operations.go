@@ -411,12 +411,13 @@ func (db *DB) alone(way PeerMode) bool {
 
 // request tracks the replies to one get or put we sent.
 type request struct {
-	put   bool
-	to    *peer          // set when relaying someone else's get
-	wait  map[*peer]bool // peers still expected to answer a get
-	found bool
-	err   error
-	done  chan struct{}
+	put    bool
+	to     *peer          // set when relaying someone else's get
+	wait   map[*peer]bool // peers still expected to answer a get
+	found  bool
+	err    error
+	done   chan struct{}
+	finish func() // if set, called once done is closed, without reqMu held
 }
 
 func (db *DB) newRequest(id string, put bool, peers []*peer) *request {
@@ -442,13 +443,14 @@ func (db *DB) endRequest(id string) {
 // peer has answered.
 func (db *DB) answer(p *peer, m *message) *request {
 	db.reqMu.Lock()
-	defer db.reqMu.Unlock()
 	r := db.pending[m.Ack]
 	if r == nil {
+		db.reqMu.Unlock()
 		return nil
 	}
 	select {
 	case <-r.done:
+		db.reqMu.Unlock()
 		return r
 	default:
 	}
@@ -460,23 +462,35 @@ func (db *DB) answer(p *peer, m *message) *request {
 		delete(r.wait, p)
 	}
 	r.found = r.found || len(m.Put) > 0
-	if r.put || (r.found && last) || len(r.wait) == 0 {
+	done := r.put || (r.found && last) || len(r.wait) == 0
+	if done {
 		close(r.done)
+	}
+	db.reqMu.Unlock()
+	if done && r.finish != nil {
+		r.finish()
 	}
 	return r
 }
 
 // peerGone stops requests from waiting on a peer that disconnected.
 func (db *DB) peerGone(p *peer) {
+	var finished []func()
 	db.reqMu.Lock()
-	defer db.reqMu.Unlock()
 	for _, r := range db.pending {
 		if r.wait[p] {
 			delete(r.wait, p)
 			if len(r.wait) == 0 && !r.put {
 				close(r.done)
+				if r.finish != nil {
+					finished = append(finished, r.finish)
+				}
 			}
 		}
+	}
+	db.reqMu.Unlock()
+	for _, f := range finished {
+		f()
 	}
 }
 
