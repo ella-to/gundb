@@ -40,6 +40,9 @@ program in [`examples/`](examples/).
   spaces that every peer verifies, and package `sea` for signing and
   encryption, byte-compatible with GUN.js. Package `sea/senderkey` adds
   encrypted group chat with Signal-style sender keys.
+- **Hidden names.** `Ref.Sealed` with package `sea/pathmap` stores a part of
+  a user's space under tokens the relay cannot read or guess, and shares the
+  key with chosen readers; `gundb ... --obf` does it from the command line.
 - **Permissions.** A relay is an `http.Handler`: authenticate with your
   own middleware, and `CanRead` / `CanWrite` decide, per field, what each
   connection may read and write from the session in its context, for Go
@@ -87,6 +90,8 @@ gundb user create -u ali -p secret123          # SEA user with its own key pair
 gundb put '~/notes/1' 'secret' --enc -u ali -p secret123
 gundb get '~/notes' --dec -u ali -p secret123
 gundb put '~/shared/bob/wifi' 'hunter2' --enc --to bob -u ali -p secret123
+gundb put '~/vault/bank' 'IBAN …' --obf --enc -u ali -p secret123   # names hidden too
+gundb put '~/vault' --obf --to bob -u ali -p secret123             # bob reads ~@ali/vault
 
 gundb group init -u ali -p secret123           # encrypted group chat (a ratchet)
 gundb group create team -u ali -p secret123
@@ -111,6 +116,7 @@ the rest.
 | `transport/ws/`    | WebSocket adapter (default)                           |
 | `sea/`             | SEA crypto: key pairs, sign, verify, encrypt, ECDH    |
 | `sea/senderkey`    | group encryption with sender keys (a ratchet)         |
+| `sea/pathmap`      | sealed names and their grants, for `Ref.Sealed`       |
 | `storage/memstore` | in-memory store that can list its souls               |
 | `storage/pebblestore` | on-disk store with full history (Pebble)           |
 | `storage/idbstore` | IndexedDB store for browsers (js/wasm only)           |
