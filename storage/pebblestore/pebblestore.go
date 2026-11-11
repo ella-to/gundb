@@ -13,7 +13,8 @@
 //	H <soul> <field> <state> -> value          every version, newest first
 //
 // History holds the writes that won HAM, deletions (null) included. It grows
-// without bound; nothing is pruned.
+// without bound unless pruned with PruneHistory, or turned off with
+// Options.NoHistory.
 package pebblestore
 
 import (
@@ -25,10 +26,12 @@ import (
 	"iter"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 
 	"ella.to/gundb"
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 )
 
 // Options tunes a Store. The zero value is a good default.
@@ -36,17 +39,29 @@ type Options struct {
 	// NoSync skips the fsync after each write. Writes are much faster, but
 	// the last ones can be lost in a crash (not corrupted).
 	NoSync bool
-	// Pebble overrides the engine options.
+	// NoHistory keeps only the latest version of each field: History and
+	// GetAt find nothing, and every write stores half the keys. For relays
+	// that never read history.
+	NoHistory bool
+	// CacheSize is the most memory Pebble's block cache may use. Default:
+	// 64 MB. It is only taken as blocks are read.
+	CacheSize int64
+	// Pebble overrides the engine options; CacheSize and the Bloom filters
+	// Open sets by default are then left to it.
 	Pebble *pebble.Options
 }
+
+// DefaultCacheSize is Options.CacheSize when it is not set.
+const DefaultCacheSize = 64 << 20
 
 // Store is a gundb.FieldReader, gundb.BatchStore, gundb.SoulStore and
 // gundb.LiveReader backed by Pebble. It is
 // safe for concurrent use.
 type Store struct {
-	db    *pebble.DB
-	sync  *pebble.WriteOptions
-	close func() error
+	db        *pebble.DB
+	sync      *pebble.WriteOptions
+	noHistory bool
+	close     func() error
 }
 
 var (
@@ -70,17 +85,31 @@ func Open(path string, opts ...Options) (*Store, error) {
 	}
 	po := o.Pebble
 	if po == nil {
-		po = &pebble.Options{Logger: quiet{}}
+		po = defaultOptions(o.CacheSize)
 	}
 	db, err := pebble.Open(path, po)
 	if err != nil {
 		return nil, fmt.Errorf("pebblestore: %w", err)
 	}
-	s := &Store{db: db, sync: pebble.Sync, close: sync.OnceValue(db.Close)}
+	s := &Store{db: db, sync: pebble.Sync, noHistory: o.NoHistory, close: sync.OnceValue(db.Close)}
 	if o.NoSync {
 		s.sync = pebble.NoSync
 	}
 	return s, nil
+}
+
+// defaultOptions are the engine options Open uses. Every merge looks up
+// the fields it writes, most of which are new, and a Bloom filter answers
+// most lookups of a key that is not there without reading a table.
+func defaultOptions(cacheSize int64) *pebble.Options {
+	if cacheSize <= 0 {
+		cacheSize = DefaultCacheSize
+	}
+	po := &pebble.Options{Logger: quiet{}, CacheSize: cacheSize}
+	for i := range po.Levels {
+		po.Levels[i].FilterPolicy = bloom.FilterPolicy(10)
+	}
+	return po
 }
 
 // Close flushes and closes the store. Calling it again does nothing.
@@ -179,8 +208,9 @@ func (s *Store) PutFields(_ context.Context, soul string, changed *gundb.Node) e
 func (s *Store) PutBatch(_ context.Context, changed []*gundb.Node) error {
 	b := s.db.NewBatch()
 	defer b.Close()
+	var bufs keyBufs
 	for _, n := range changed {
-		if err := add(b, n.Soul, n); err != nil {
+		if err := bufs.add(b, n.Soul, n, s.noHistory); err != nil {
 			return err
 		}
 	}
@@ -190,26 +220,70 @@ func (s *Store) PutBatch(_ context.Context, changed []*gundb.Node) error {
 func (s *Store) write(soul string, n *gundb.Node) error {
 	b := s.db.NewBatch()
 	defer b.Close()
-	if err := add(b, soul, n); err != nil {
+	var bufs keyBufs
+	if err := bufs.add(b, soul, n, s.noHistory); err != nil {
 		return err
 	}
 	return commit(b, s.sync)
 }
 
-// add puts the fields of n, the latest version and history, in b.
-func add(b *pebble.Batch, soul string, n *gundb.Node) error {
-	lp, hp := latestPrefix(soul), historyPrefix(soul)
-	var buf []byte
+// keyBufs are the buffers add builds keys and values in. Batch.Set copies
+// what it is given, so one set of buffers serves every field of a batch.
+type keyBufs struct{ lkey, hkey, val []byte }
+
+// grow makes room for the keys and values of n, in one allocation.
+func (k *keyBufs) grow(soul string, n *gundb.Node) {
+	maxField, maxVal := 0, 0
+	for field, v := range n.Fields {
+		maxField = max(maxField, escapedLen(field))
+		maxVal = max(maxVal, valueLen(v))
+	}
+	l := 1 + escapedLen(soul) + maxField
+	h := l + 8 // the history key also ends the field with 0x00 0x01, then the state
+	v := 8 + maxVal
+	if cap(k.lkey) >= l && cap(k.hkey) >= h && cap(k.val) >= v {
+		return
+	}
+	buf := make([]byte, l+h+v)
+	k.lkey, k.hkey, k.val = buf[:0:l], buf[l:l:l+h], buf[l+h:l+h:l+h+v]
+}
+
+func escapedLen(s string) int { return len(s) + strings.Count(s, "\x00") + 2 }
+
+func valueLen(v gundb.Value) int {
+	switch x := v.(type) {
+	case gundb.Number:
+		return 9
+	case gundb.String:
+		return 1 + len(x)
+	case gundb.Link:
+		return 1 + len(x.Soul)
+	}
+	return 1
+}
+
+// add puts the fields of n, the latest version and (unless noHistory)
+// history, in b.
+func (k *keyBufs) add(b *pebble.Batch, soul string, n *gundb.Node, noHistory bool) error {
+	k.grow(soul, n)
+	k.lkey = appendEscaped(append(k.lkey[:0], 'L'), soul)
+	lp := len(k.lkey)
+	k.hkey = append(k.hkey[:0], 'H')
+	k.hkey = append(k.hkey, k.lkey[1:]...)
+	hp := len(k.hkey)
 	for field, v := range n.Fields {
 		state := n.States[field]
-		enc, err := encodeValue(v)
-		if err != nil {
+		k.val = binary.BigEndian.AppendUint64(k.val[:0], math.Float64bits(state))
+		var err error
+		if k.val, err = appendValue(k.val, v); err != nil {
 			return fmt.Errorf("pebblestore: %q.%q: %w", soul, field, err)
 		}
-		buf = binary.BigEndian.AppendUint64(buf[:0], math.Float64bits(state))
-		buf = append(buf, enc...)
-		b.Set(append(lp[:len(lp):len(lp)], field...), buf, nil)
-		b.Set(historyKey(hp, field, state), enc, nil)
+		k.lkey = append(k.lkey[:lp], field...)
+		b.Set(k.lkey, k.val, nil)
+		if !noHistory {
+			k.hkey = binary.BigEndian.AppendUint64(appendEscaped(k.hkey[:hp], field), descending(state))
+			b.Set(k.hkey, k.val[8:], nil)
+		}
 	}
 	return nil
 }
@@ -305,13 +379,76 @@ func (s *Store) GetAt(_ context.Context, soul string, t float64) (*gundb.Node, e
 	return n, it.Error()
 }
 
+// Prune says which past versions PruneHistory deletes. The latest version
+// of a field is always kept.
+type Prune struct {
+	// Keep is how many versions of each field to keep, the latest
+	// included. Zero keeps any number.
+	Keep int
+	// Before deletes the versions with an older state (milliseconds since
+	// the Unix epoch, like every HAM state). Zero deletes none by age.
+	Before float64
+}
+
+// PruneHistory deletes the past versions of every field that p selects,
+// and returns how many it deleted. It reads the whole history once; run it
+// from time to time, not on every write. The latest values are untouched.
+func (s *Store) PruneHistory(ctx context.Context, p Prune) (int, error) {
+	if p.Keep <= 0 && p.Before <= 0 {
+		return 0, nil
+	}
+	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: []byte{'H'}, UpperBound: []byte{'H' + 1}})
+	if err != nil {
+		return 0, fmt.Errorf("pebblestore: %w", err)
+	}
+	defer it.Close()
+	b := s.db.NewBatch()
+	defer func() { b.Close() }()
+	deleted, nth := 0, 0
+	var field []byte // the soul and field of the versions being counted
+	for it.First(); it.Valid(); it.Next() {
+		key := it.Key()
+		if len(key) < 9 {
+			return deleted, errors.New("pebblestore: corrupt history key")
+		}
+		if f := key[:len(key)-8]; !bytes.Equal(f, field) {
+			field, nth = append(field[:0], f...), 0
+		}
+		nth++
+		state := ascending(binary.BigEndian.Uint64(key[len(key)-8:]))
+		if nth == 1 || (p.Keep <= 0 || nth <= p.Keep) && (p.Before <= 0 || state >= p.Before) {
+			continue // newest first: the rest of this field is older still
+		}
+		if err := b.Delete(key, nil); err != nil {
+			return deleted, fmt.Errorf("pebblestore: %w", err)
+		}
+		deleted++
+		if b.Count() >= 10_000 {
+			if err := commit(b, s.sync); err != nil {
+				return deleted, err
+			}
+			b.Close()
+			b = s.db.NewBatch()
+			if err := ctx.Err(); err != nil {
+				return deleted, err
+			}
+		}
+	}
+	if err := it.Error(); err != nil {
+		return deleted, fmt.Errorf("pebblestore: %w", err)
+	}
+	return deleted, commit(b, s.sync)
+}
+
 // ---- keys ----
 //
 // Souls and fields are escaped so they can be followed by more key bytes and
 // still sort correctly: 0x00 becomes 0x00 0xff, and 0x00 0x01 ends them.
 
-func escape(s string) []byte {
-	b := make([]byte, 0, len(s)+2)
+func escape(s string) []byte { return appendEscaped(make([]byte, 0, len(s)+2), s) }
+
+// appendEscaped appends s, escaped and terminated, to b.
+func appendEscaped(b []byte, s string) []byte {
 	for i := 0; i < len(s); i++ {
 		b = append(b, s[i])
 		if s[i] == 0 {
@@ -409,21 +546,24 @@ func deleted(enc []byte) bool {
 
 var signedNull = []byte(`{":":null,"~":`)
 
-func encodeValue(v gundb.Value) ([]byte, error) {
+func encodeValue(v gundb.Value) ([]byte, error) { return appendValue(nil, v) }
+
+// appendValue appends the encoding of v to b.
+func appendValue(b []byte, v gundb.Value) ([]byte, error) {
 	switch x := v.(type) {
 	case gundb.Null:
-		return []byte{tNull}, nil
+		return append(b, tNull), nil
 	case gundb.Bool:
 		if x {
-			return []byte{tTrue}, nil
+			return append(b, tTrue), nil
 		}
-		return []byte{tFalse}, nil
+		return append(b, tFalse), nil
 	case gundb.Number:
-		return binary.BigEndian.AppendUint64([]byte{tNumber}, math.Float64bits(float64(x))), nil
+		return binary.BigEndian.AppendUint64(append(b, tNumber), math.Float64bits(float64(x))), nil
 	case gundb.String:
-		return append([]byte{tString}, x...), nil
+		return append(append(b, tString), x...), nil
 	case gundb.Link:
-		return append([]byte{tLink}, x.Soul...), nil
+		return append(append(b, tLink), x.Soul...), nil
 	}
 	return nil, fmt.Errorf("cannot store %T", v)
 }

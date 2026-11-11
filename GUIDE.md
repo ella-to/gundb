@@ -2691,6 +2691,11 @@ func check(err error) {
 
 Close the store after the DB (defer it first). By default every write is synced to disk before it is accepted; `pebblestore.Options{NoSync: true}` is much faster, but a crash can lose the last few writes.
 
+Other `pebblestore.Options`:
+
+- `CacheSize` caps the memory Pebble may use to cache what it read from disk. The default is 64 MB, taken only as data is read; give a busy relay more.
+- `NoHistory: true` keeps only the latest version of each field. Every write stores half as much, and `History` and `GetAt` (next section) find nothing. Use it for a relay that never reads history.
+
 ## 12. Read history
 
 `pebblestore` keeps every write that won HAM, deletions (`null`) included. The DB always reads the latest version; for older ones, ask the store:
@@ -2769,7 +2774,15 @@ func check(err error) {
 
 History is addressed by soul. For `db.Get(key)` the soul is `key`. A nested node such as `db.Get("users").Get("alice")` gets the soul `users/alice` when a `Put` creates it, unless the field already links to another node, as it does after a `Set` or after putting a `*Ref`. Values in `History` and `GetAt` are `gundb.Value`s: `gundb.String`, `gundb.Number`, `gundb.Bool`, `gundb.Null` (deleted) or `gundb.Link` (a reference to another node).
 
-History is kept only by peers whose store is a `pebblestore`, and it is never pruned.
+History is kept only by peers whose store is a `pebblestore`, and it grows with every write. To bound it, prune it from time to time; the latest version of every field is always kept:
+
+```go
+// Keep the last 10 versions of each field, and none older than 30 days.
+cutoff := float64(time.Now().AddDate(0, 0, -30).UnixMilli())
+deleted, err := store.PruneHistory(ctx, pebblestore.Prune{Keep: 10, Before: cutoff})
+```
+
+`PruneHistory` reads the whole history once, so run it on a schedule (once a day, say), not after every write. A relay that never reads history can skip it altogether with `Options{NoHistory: true}`.
 
 ## 13. Write your own Store
 

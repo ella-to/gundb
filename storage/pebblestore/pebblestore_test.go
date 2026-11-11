@@ -343,3 +343,85 @@ func TestPutBatch(t *testing.T) {
 		}
 	}
 }
+
+func TestNoHistory(t *testing.T) {
+	ctx := t.Context()
+	s, err := Open(t.TempDir(), Options{NoSync: true, NoHistory: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for state := 1.0; state <= 3; state++ {
+		n := gundb.NewNode("a")
+		n.Set("x", gundb.Number(state), state)
+		if err := s.PutFields(ctx, "a", n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.Get(ctx, "a")
+	if err != nil || got.Fields["x"] != gundb.Number(3) {
+		t.Fatalf("latest: %+v %v", got, err)
+	}
+	for _, err := range s.History(ctx, "a", "x") {
+		t.Fatalf("history kept a version (err %v)", err)
+	}
+}
+
+func TestPruneHistory(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, t.TempDir())
+	write := func(soul, field string, states ...float64) {
+		for _, st := range states {
+			n := gundb.NewNode(soul)
+			n.Set(field, gundb.Number(st), st)
+			if err := s.PutFields(ctx, soul, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	versions := func(soul, field string) []float64 {
+		var out []float64
+		for v, err := range s.History(ctx, soul, field) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, v.State)
+		}
+		return out
+	}
+	write("a", "x", 1, 2, 3, 4, 5)
+	write("a", "y", 10, 20)
+	write("b\x00c", "x", 1, 2, 3)
+
+	n, err := s.PruneHistory(ctx, Prune{Keep: 2})
+	if err != nil || n != 4 {
+		t.Fatalf("keep 2: deleted %d, %v", n, err)
+	}
+	if got := versions("a", "x"); !slices.Equal(got, []float64{5, 4}) {
+		t.Fatalf("a.x: %v", got)
+	}
+	if got := versions("a", "y"); !slices.Equal(got, []float64{20, 10}) {
+		t.Fatalf("a.y: %v", got)
+	}
+	if got := versions("b\x00c", "x"); !slices.Equal(got, []float64{3, 2}) {
+		t.Fatalf("b.x: %v", got)
+	}
+
+	// By age: the latest version stays even when it is old.
+	n, err = s.PruneHistory(ctx, Prune{Before: 15})
+	if err != nil || n != 3 {
+		t.Fatalf("before 15: deleted %d, %v", n, err)
+	}
+	if got := versions("a", "x"); !slices.Equal(got, []float64{5}) {
+		t.Fatalf("a.x: %v", got)
+	}
+	if got := versions("a", "y"); !slices.Equal(got, []float64{20}) {
+		t.Fatalf("a.y: %v", got)
+	}
+	if got := versions("b\x00c", "x"); !slices.Equal(got, []float64{3}) {
+		t.Fatalf("b.x: %v", got)
+	}
+	if got, _ := s.Get(ctx, "a"); got.Fields["x"] != gundb.Number(5) || got.Fields["y"] != gundb.Number(20) {
+		t.Fatalf("latest values changed: %+v", got)
+	}
+}

@@ -237,3 +237,21 @@ func BenchmarkQuotaLoad(b *testing.B) {
 		db.Close()
 	}
 }
+
+// BenchmarkPutFieldsNoHistory is BenchmarkPutFields on a store that keeps
+// no history (optimization 3).
+func BenchmarkPutFieldsNoHistory(b *testing.B) {
+	const nodes = 100000
+	s := flushedStore(b, nodes, Options{NoSync: true, NoHistory: true})
+	r := rand.New(rand.NewPCG(1, 1))
+	state := 2.0
+	b.ReportAllocs()
+	for b.Loop() {
+		n := gundb.NewNode(fmt.Sprintf("users/user%06d", r.IntN(nodes)))
+		n.Set("field0", gundb.String("changed"), state)
+		if err := s.PutFields(b.Context(), n.Soul, n); err != nil {
+			b.Fatal(err)
+		}
+		state++
+	}
+}
