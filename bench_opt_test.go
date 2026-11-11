@@ -226,7 +226,13 @@ func benchPutLocalManyPeers(b *testing.B, o Options) {
 
 // BenchmarkResubscribe is a client that has read n souls connecting to a
 // peer: it asks for them again and offers its copies (optimization 7).
-func BenchmarkResubscribe(b *testing.B) {
+func BenchmarkResubscribe(b *testing.B) { benchResubscribe(b, false) }
+
+// BenchmarkResubscribeBack is BenchmarkResubscribe for a peer that comes
+// back an hour after it left, with nothing changed meanwhile.
+func BenchmarkResubscribeBack(b *testing.B) { benchResubscribe(b, true) }
+
+func benchResubscribe(b *testing.B, back bool) {
 	for _, n := range []int{1000, 10000} {
 		b.Run("souls="+strconv.Itoa(n), func(b *testing.B) {
 			db := New()
@@ -241,10 +247,14 @@ func BenchmarkResubscribe(b *testing.B) {
 				close(done)
 				db.interest[interestKey{soul: soul}] = &interest{done: done}
 			}
+			if back {
+				db.left["peer"] = time.Now().Add(-time.Hour)
+			}
 			b.ReportAllocs()
 			for b.Loop() {
 				b.StopTimer()
 				p := benchPeer(b, db, false)
+				p.setPID("peer")
 				b.StartTimer()
 				db.resubscribe(p)
 				b.StopTimer()

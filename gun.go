@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ella.to/gundb/transport"
@@ -156,8 +157,11 @@ type DB struct {
 	reqMu   sync.Mutex
 	pending map[string]*request
 
-	interestMu sync.Mutex
-	interest   map[interestKey]*interest
+	interestMu    sync.Mutex
+	interest      map[interestKey]*interest
+	fieldInterest map[string]int       // soul -> how many of its fields are of interest
+	left          map[string]time.Time // PID -> when our last connection with it ended
+	sweeps        atomic.Int64         // sweeps of idle interest so far
 
 	watchMu  sync.Mutex
 	watchers map[string]map[*watcher]struct{}
@@ -218,24 +222,27 @@ func New(opts ...Options) *DB {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	db := &DB{
-		pid:       o.PID,
-		store:     o.Store,
-		dialer:    o.Dialer,
-		wait:      o.Wait,
-		beat:      heartbeatEvery,
-		pong:      pongWait,
-		log:       o.Logger,
-		state:     newStateGen(),
-		dup:       newDup(0),
-		ctx:       ctx,
-		cancel:    cancel,
-		peers:     map[*peer]struct{}{},
-		changed:   make(chan struct{}),
-		pending:   map[string]*request{},
-		interest:  map[interestKey]*interest{},
-		watchers:  map[string]map[*watcher]struct{}{},
-		mergeSeed: maphash.MakeSeed(),
-		subs:      map[string]map[*peer]struct{}{},
+		pid:      o.PID,
+		store:    o.Store,
+		dialer:   o.Dialer,
+		wait:     o.Wait,
+		beat:     heartbeatEvery,
+		pong:     pongWait,
+		log:      o.Logger,
+		state:    newStateGen(),
+		dup:      newDup(0),
+		ctx:      ctx,
+		cancel:   cancel,
+		peers:    map[*peer]struct{}{},
+		changed:  make(chan struct{}),
+		pending:  map[string]*request{},
+		interest: map[interestKey]*interest{},
+		left:     map[string]time.Time{},
+
+		fieldInterest: map[string]int{},
+		watchers:      map[string]map[*watcher]struct{}{},
+		mergeSeed:     maphash.MakeSeed(),
+		subs:          map[string]map[*peer]struct{}{},
 
 		canRead:      o.CanRead,
 		canWrite:     o.CanWrite,
@@ -251,6 +258,7 @@ func New(opts ...Options) *DB {
 			db.log.Warn("gundb: quota: cannot count stored data", "err", err)
 		}
 	}
+	db.wg.Go(db.sweepInterest)
 	for _, url := range o.Peers {
 		db.Connect(url)
 	}

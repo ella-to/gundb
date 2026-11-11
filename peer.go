@@ -27,9 +27,10 @@ type peer struct {
 	outWake chan struct{} // capacity 1: something is queued
 	outRoom chan struct{} // closed when a full queue gets room again
 
-	mu    sync.Mutex
-	pid   string
-	wants map[string]bool // souls the remote asked us for
+	mu        sync.Mutex
+	pid       string
+	handshake chan struct{}   // closed once pid is known; nil if not tracked
+	wants     map[string]bool // souls the remote asked us for
 }
 
 // outbound is a peer we dial and keep re-dialling. Guarded by db.peersMu.
@@ -66,7 +67,8 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 	}
 	ctx, cancel := context.WithCancel(db.ctx)
 	defer context.AfterFunc(rules, cancel)()
-	p := &peer{db: db, conn: conn, origin: o, rules: rules, id: randomID(16), outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, wants: map[string]bool{}}
+	p := &peer{db: db, conn: conn, origin: o, rules: rules, id: randomID(16), outWake: make(chan struct{}, 1), ctx: ctx, cancel: cancel,
+		handshake: make(chan struct{}), wants: map[string]bool{}}
 
 	db.peersMu.Lock()
 	if db.ctx.Err() != nil {
@@ -97,10 +99,18 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 	for _, raw := range queued {
 		p.send(raw)
 	}
-	db.resubscribe(p)
+	db.wg.Go(func() { db.resubscribe(p) })
 	p.readLoop()
 
 	p.close()
+	if pid := p.getPID(); pid != "" {
+		db.interestMu.Lock()
+		if len(db.left) >= maxLeft {
+			clear(db.left)
+		}
+		db.left[pid] = time.Now()
+		db.interestMu.Unlock()
+	}
 	db.peersMu.Lock()
 	delete(db.peers, p)
 	if o != nil && o.live == p {
@@ -297,7 +307,25 @@ func (p *peer) setPID(pid string) {
 	defer p.mu.Unlock()
 	if p.pid == "" {
 		p.pid = pid
+		if p.handshake != nil {
+			close(p.handshake)
+		}
 	}
+}
+
+// waitPID returns the remote's PID once the handshake gives it, or "" if it
+// does not within d.
+func (p *peer) waitPID(d time.Duration) string {
+	if p.handshake != nil {
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-p.handshake:
+		case <-t.C:
+		case <-p.ctx.Done():
+		}
+	}
+	return p.getPID()
 }
 
 func (p *peer) getPID() string {

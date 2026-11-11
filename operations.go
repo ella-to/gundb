@@ -248,6 +248,7 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 		})
 	}
 	db.notify(changed)
+	db.touchInterest(changed)
 	return changed, stale, nil
 }
 
@@ -498,7 +499,105 @@ func (db *DB) peerGone(p *peer) {
 // for. Peers remember who asked for what and push every later change, so
 // after the first answer the local copy stays current without asking
 // again.
-type interest struct{ done chan struct{} }
+//
+// used and changed are guarded by db.interestMu.
+type interest struct {
+	done    chan struct{}
+	used    int64     // db.sweeps at the last read
+	changed time.Time // last write to it, ours or a peer's
+}
+
+// interestIdle is how long an interest nobody watches is kept after its
+// last read, and sweepEvery how often idle ones are dropped. A dropped one
+// is asked for again on the next read.
+var (
+	interestIdle = 10 * time.Minute
+	sweepEvery   = time.Minute
+)
+
+// offerMargin is how long before a peer left the writes are that it is
+// offered again when it comes back: those may have been lost on the way
+// as the connection went down.
+const offerMargin = 2 * time.Minute
+
+// handshakeWait is how long resubscribe waits for a new peer's PID before
+// offering it everything.
+var handshakeWait = 2 * time.Second
+
+// maxLeft bounds db.left.
+const maxLeft = 10_000
+
+// sweepInterest drops every sweepEvery the interests nobody watches that
+// were not read for interestIdle, so the list follows what is in use, not
+// everything ever read.
+func (db *DB) sweepInterest() {
+	t := time.NewTicker(sweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-db.ctx.Done():
+			return
+		case <-t.C:
+		}
+		db.watchMu.Lock()
+		watched := make(map[string]bool, len(db.watchers))
+		for soul := range db.watchers {
+			watched[soul] = true
+		}
+		db.watchMu.Unlock()
+		// Reads stamp an interest with the number of sweeps so far, which
+		// is cheaper than reading the clock on every read.
+		cutoff := db.sweeps.Add(1) - int64(interestIdle/sweepEvery)
+		db.interestMu.Lock()
+		for k, in := range db.interest {
+			select {
+			case <-in.done:
+			default:
+				continue // still asking
+			}
+			if !watched[k.soul] && in.used < cutoff {
+				delete(db.interest, k)
+				if k.key != "" {
+					if db.fieldInterest[k.soul]--; db.fieldInterest[k.soul] <= 0 {
+						delete(db.fieldInterest, k.soul)
+					}
+				}
+			}
+		}
+		db.interestMu.Unlock()
+	}
+}
+
+// touchInterest records that changed was written, for resubscribe.
+func (db *DB) touchInterest(changed graph) {
+	if len(changed) == 0 {
+		return
+	}
+	var now time.Time
+	touch := func(in *interest) {
+		if now.IsZero() {
+			now = time.Now()
+		}
+		in.changed = now
+	}
+	db.interestMu.Lock()
+	defer db.interestMu.Unlock()
+	if len(db.interest) == 0 {
+		return
+	}
+	for soul, n := range changed {
+		if in := db.interest[interestKey{soul: soul}]; in != nil {
+			touch(in)
+		}
+		if db.fieldInterest[soul] > 0 {
+			for k := range n.Fields {
+				if in := db.interest[interestKey{soul, k}]; in != nil {
+					touch(in)
+				}
+			}
+		}
+	}
+}
 
 // interestKey names an interest: a whole node (key "") or one field.
 type interestKey struct{ soul, key string }
@@ -514,6 +613,7 @@ func (db *DB) syncField(ctx context.Context, soul, key string) {
 }
 
 func (db *DB) syncKey(ctx context.Context, k interestKey) {
+	now := db.sweeps.Load()
 	db.interestMu.Lock()
 	in, ok := db.interest[k]
 	if !ok && k.key != "" {
@@ -522,11 +622,15 @@ func (db *DB) syncKey(ctx context.Context, k interestKey) {
 	if !ok {
 		in = &interest{done: make(chan struct{})}
 		db.interest[k] = in
+		if k.key != "" {
+			db.fieldInterest[k.soul]++
+		}
 		go func() {
 			defer close(in.done)
 			db.ask(k)
 		}()
 	}
+	in.used = now
 	db.interestMu.Unlock()
 	select {
 	case <-in.done:
@@ -566,7 +670,12 @@ func (db *DB) query(ctx context.Context, q *getQuery) {
 
 // resubscribe re-sends a get for every soul (or field) of interest to a new
 // peer, like the reference does on "hi", so it pushes us their changes
-// too. It offers our copy of each as well.
+// too. It runs on its own goroutine, so the peer is read meanwhile.
+//
+// It also offers the peer our copy of each (see offer), in batches. A peer
+// we were connected to a moment ago, recognized by its PID once the
+// handshake gives it, is offered only what changed since it left; a new
+// or restarted one, which has a new PID, everything.
 func (db *DB) resubscribe(p *peer) {
 	db.interestMu.Lock()
 	keys := make([]interestKey, 0, len(db.interest))
@@ -574,17 +683,75 @@ func (db *DB) resubscribe(p *peer) {
 		keys = append(keys, k)
 	}
 	db.interestMu.Unlock()
-	for _, k := range keys {
-		if p.writes() {
-			db.offer(k, []*peer{p})
-		}
-		if p.reads() {
+	if len(keys) == 0 {
+		return
+	}
+	if p.reads() {
+		for _, k := range keys {
+			if p.ctx.Err() != nil {
+				return
+			}
 			m := &message{ID: randomID(9), Get: &getQuery{Soul: k.soul, Key: k.key}}
 			db.dup.track(m.ID, nil)
 			p.send(db.encode(m))
 		}
 	}
+	if !p.writes() {
+		return
+	}
+	pid := p.waitPID(handshakeWait)
+	db.interestMu.Lock()
+	since, back := db.left[pid]
+	if back {
+		since = since.Add(-offerMargin)
+		offer := keys[:0]
+		for _, k := range keys {
+			if in := db.interest[k]; in != nil && in.changed.After(since) {
+				offer = append(offer, k)
+			}
+		}
+		keys = offer
+	}
+	db.interestMu.Unlock()
+	db.offerBatch(keys, p)
 }
+
+// offerBatch offers p our copies of keys, up to offerChunk nodes per put.
+func (db *DB) offerBatch(keys []interestKey, p *peer) {
+	g := graph{}
+	send := func() {
+		if len(g) == 0 {
+			return
+		}
+		m := &message{ID: randomID(9), Put: g}
+		db.dup.track(m.ID, nil)
+		db.sendTo(p, m, db.encode(m), nil)
+		g = graph{}
+	}
+	for _, k := range keys {
+		if p.ctx.Err() != nil {
+			return
+		}
+		n := db.offered(k)
+		if n == nil {
+			continue
+		}
+		if cur := g[k.soul]; cur != nil {
+			for f, v := range n.Fields {
+				cur.Set(f, v, n.States[f])
+			}
+		} else {
+			g[k.soul] = n
+		}
+		if len(g) >= offerChunk {
+			send()
+		}
+	}
+	send()
+}
+
+// offerChunk is how many nodes one put of offerBatch holds.
+const offerChunk = 100
 
 // offer sends peers our copy of a node, or of one field of it. They
 // already have most of it, and HAM drops what they have, but it delivers
@@ -595,6 +762,21 @@ func (db *DB) offer(k interestKey, peers []*peer) {
 	if len(peers) == 0 {
 		return
 	}
+	n := db.offered(k)
+	if n == nil {
+		return
+	}
+	m := &message{ID: randomID(9), Put: graph{k.soul: n}}
+	db.dup.track(m.ID, nil)
+	raw := db.encode(m)
+	memo := &fanout{}
+	for _, p := range peers {
+		db.sendTo(p, m, raw, memo)
+	}
+}
+
+// offered returns our copy of the node or field k names, or nil.
+func (db *DB) offered(k interestKey) *Node {
 	var n *Node
 	var err error
 	if fr, ok := db.store.(FieldReader); ok && k.key != "" {
@@ -603,7 +785,7 @@ func (db *DB) offer(k interestKey, peers []*peer) {
 		n, err = db.store.Get(db.ctx, k.soul)
 	}
 	if err != nil || n == nil || len(n.Fields) == 0 {
-		return
+		return nil
 	}
 	if k.key != "" {
 		for f := range n.Fields {
@@ -613,16 +795,10 @@ func (db *DB) offer(k interestKey, peers []*peer) {
 			}
 		}
 		if len(n.Fields) == 0 {
-			return
+			return nil
 		}
 	}
-	m := &message{ID: randomID(9), Put: graph{k.soul: n}}
-	db.dup.track(m.ID, nil)
-	raw := db.encode(m)
-	memo := &fanout{}
-	for _, p := range peers {
-		db.sendTo(p, m, raw, memo)
-	}
+	return n
 }
 
 // watcher re-runs a computation whenever any node it read changes.
