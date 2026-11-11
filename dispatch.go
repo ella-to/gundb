@@ -21,6 +21,14 @@ var okAck = json.RawMessage(`{"":1}`)
 //     souls that changed (and to our upstream peers);
 //   - gets are answered from the store; misses are forwarded to other peers.
 func (db *DB) handle(p *peer, m *message) {
+	var f frameSync
+	db.handleIn(p, m, &f)
+	db.flush(&f)
+}
+
+// handleIn is handle for one message of a frame: what waits for the
+// frame's writes to be durable is added to f (see frameSync).
+func (db *DB) handleIn(p *peer, m *message, f *frameSync) {
 	if m.empty() {
 		return
 	}
@@ -46,10 +54,10 @@ func (db *DB) handle(p *peer, m *message) {
 	case m.Dam != "":
 		db.handleDam(p, m)
 	case m.Ack != "":
-		db.handleAck(p, m)
+		db.handleAck(p, m, f)
 	default:
 		if m.Put != nil {
-			db.handlePut(p, m)
+			db.handlePut(p, m, f)
 		}
 		if m.Get != nil {
 			db.handleGet(p, m)
@@ -75,7 +83,7 @@ func (db *DB) handleDam(p *peer, m *message) {
 	db.reply(p, &message{Dam: "?", PID: db.pid, Ack: m.ID})
 }
 
-func (db *DB) handleAck(p *peer, m *message) {
+func (db *DB) handleAck(p *peer, m *message, f *frameSync) {
 	if len(m.Put) > 0 && !p.reads() {
 		m.Put = nil // a peer we only write to: its data never comes in
 	}
@@ -93,7 +101,7 @@ func (db *DB) handleAck(p *peer, m *message) {
 			if err = m.Put.check(); err != nil {
 				db.log.Debug("gundb: bad reply", "peer", p.conn.RemoteAddr(), "err", err)
 				err = nil // answered as found, like the reference, but not stored
-			} else if _, _, err = db.applyFrom(db.ctx, m.Put, skip, !p.trusted()); err != nil && !errors.Is(err, ErrUnverified) {
+			} else if _, _, err = db.applyFrom(db.ctx, m.Put, skip, !p.trusted(), f); err != nil && !errors.Is(err, ErrUnverified) {
 				db.log.Warn("gundb: store failed", "err", err)
 				err = nil
 			}
@@ -115,7 +123,7 @@ func (db *DB) handleAck(p *peer, m *message) {
 	}
 }
 
-func (db *DB) handlePut(p *peer, m *message) {
+func (db *DB) handlePut(p *peer, m *message, f *frameSync) {
 	if !p.reads() {
 		// A peer we only write to: its data never comes in. No ack
 		// either: one relayed from another peer must not look refused.
@@ -130,7 +138,22 @@ func (db *DB) handlePut(p *peer, m *message) {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
-	changed, stale, err := db.applyFrom(db.ctx, m.Put, nil, !p.trusted())
+	changed, stale, err := db.applyFrom(db.ctx, m.Put, nil, !p.trusted(), f)
+	if err != nil {
+		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
+		return
+	}
+	// The ack, and passing the write on, wait until it is durable.
+	if f.need {
+		f.after = append(f.after, func(err error) { db.putDone(p, m, changed, stale, err) })
+		return
+	}
+	db.putDone(p, m, changed, stale, nil)
+}
+
+// putDone acks the put m from p, once it is durable, and passes on what
+// it changed.
+func (db *DB) putDone(p *peer, m *message, changed graph, stale bool, err error) {
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return

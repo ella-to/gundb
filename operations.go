@@ -18,12 +18,39 @@ import (
 // The DB's own writes are counted against Options.Quota but never refused;
 // applyFrom refuses a peer's write that would break it.
 func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
-	changed, _, err := db.applyFrom(ctx, g, skip, false)
+	changed, _, err := db.applyFrom(ctx, g, skip, false, nil)
 	return changed, err
 }
 
+// frameSync holds back what must wait until the writes of one frame are
+// durable, so the frame needs a single SyncStore.Sync. Its zero value is
+// ready to use.
+type frameSync struct {
+	need  bool              // a write still has to be synced
+	after []func(err error) // run after the sync, with its error
+}
+
+// flush syncs the writes of a frame and runs what waited for it.
+func (db *DB) flush(f *frameSync) {
+	var err error
+	if f.need {
+		if ss, ok := db.store.(SyncStore); ok {
+			if err = ss.Sync(db.ctx); err != nil {
+				db.log.Warn("gundb: sync failed", "err", err)
+			}
+		}
+		f.need = false
+	}
+	for _, fn := range f.after {
+		fn(err)
+	}
+	f.after = f.after[:0]
+}
+
 // applyFrom is apply, with enforce saying whether the quota may refuse the
-// write: true for data from peers that connect to us.
+// write: true for data from peers that connect to us. With a SyncStore the
+// write is durable when applyFrom returns, unless f is given: f.need then
+// says that the caller still has to sync (see frameSync).
 //
 // Signatures are verified only for fields that can be stored: those newer
 // than what the store holds. A field equal to the stored one was verified
@@ -31,7 +58,7 @@ func (db *DB) apply(ctx context.Context, g graph, skip checked) (graph, error) {
 // offering a node we already have costs no verification at all. stale
 // reports that g had such signed fields: they were neither verified nor
 // stored, so g must not be passed on as it is (pass on changed instead).
-func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool) (changed graph, stale bool, err error) {
+func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool, f *frameSync) (changed graph, stale bool, err error) {
 	sigs, err := checkUnsigned(g, skip)
 	if err != nil {
 		return nil, false, err
@@ -119,8 +146,16 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 		}
 		return cur, dirty, nil
 	}
+	// With a SyncStore, writes go to memory under the merge locks, and are
+	// synced after (see SyncStore).
+	ss, syncs := db.store.(SyncStore)
+	unsynced := false
 	// store writes one merged node: only its changed fields if it can.
 	store := func(soul string, cur *Node) error {
+		if syncs {
+			unsynced = true
+			return ss.PutBatchUnsynced(ctx, []*Node{changed[soul]})
+		}
 		if fs, ok := db.store.(FieldStore); ok {
 			return fs.PutFields(ctx, soul, changed[soul])
 		}
@@ -161,7 +196,12 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 					nodes = append(nodes, changed[soul])
 				}
 			}
-			err = bs.PutBatch(ctx, nodes)
+			if syncs {
+				unsynced = true
+				err = ss.PutBatchUnsynced(ctx, nodes)
+			} else {
+				err = bs.PutBatch(ctx, nodes)
+			}
 		} else {
 			for _, soul := range order {
 				if cur := curs[soul]; cur != nil && err == nil {
@@ -188,6 +228,14 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 			if err != nil {
 				return nil, false, err
 			}
+		}
+	}
+
+	if unsynced {
+		if f != nil {
+			f.need = true
+		} else if err := ss.Sync(ctx); err != nil {
+			return nil, false, err
 		}
 	}
 

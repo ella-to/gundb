@@ -54,6 +54,25 @@ type BatchStore interface {
 	PutBatch(ctx context.Context, changed []*Node) error
 }
 
+// SyncStore is an optional extension of BatchStore for stores that make
+// writes durable with a sync, such as an fsync of a write-ahead log.
+//
+// The DB writes with PutBatchUnsynced while it holds the merge locks of
+// the nodes, and calls Sync once it has let go of them. Writers to one
+// node then wait for each other only while their write goes to memory,
+// and their syncs can be shared. The puts of one frame from a peer share
+// a single Sync, and are acknowledged once it returns, so an ack still
+// means the write is durable.
+type SyncStore interface {
+	BatchStore
+	// PutBatchUnsynced is PutBatch, without waiting for the write to be
+	// durable: readers see it at once, and it is durable once a later Sync
+	// returns.
+	PutBatchUnsynced(ctx context.Context, changed []*Node) error
+	// Sync returns once every write made before it is durable.
+	Sync(ctx context.Context) error
+}
+
 // SoulStore is an optional extension of Store that lists souls. A DB needs
 // it to answer LEX queries over souls, like {"#": {"*": "chat/"}} from GUN.js
 // or DB.Souls; without it such gets are passed on to other peers.

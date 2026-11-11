@@ -54,9 +54,8 @@ type Options struct {
 // DefaultCacheSize is Options.CacheSize when it is not set.
 const DefaultCacheSize = 64 << 20
 
-// Store is a gundb.FieldReader, gundb.BatchStore, gundb.SoulStore and
-// gundb.LiveReader backed by Pebble. It is
-// safe for concurrent use.
+// Store is a gundb.FieldReader, gundb.SyncStore, gundb.SoulStore and
+// gundb.LiveReader backed by Pebble. It is safe for concurrent use.
 type Store struct {
 	db        *pebble.DB
 	sync      *pebble.WriteOptions
@@ -66,7 +65,7 @@ type Store struct {
 
 var (
 	_ gundb.FieldReader = (*Store)(nil)
-	_ gundb.BatchStore  = (*Store)(nil)
+	_ gundb.SyncStore   = (*Store)(nil)
 	_ gundb.SoulStore   = (*Store)(nil)
 	_ gundb.LiveReader  = (*Store)(nil)
 )
@@ -215,6 +214,33 @@ func (s *Store) PutBatch(_ context.Context, changed []*gundb.Node) error {
 		}
 	}
 	return commit(b, s.sync)
+}
+
+// PutBatchUnsynced implements gundb.SyncStore: PutBatch without waiting
+// for the disk.
+func (s *Store) PutBatchUnsynced(_ context.Context, changed []*gundb.Node) error {
+	b := s.db.NewBatch()
+	defer b.Close()
+	var bufs keyBufs
+	for _, n := range changed {
+		if err := bufs.add(b, n.Soul, n, s.noHistory); err != nil {
+			return err
+		}
+	}
+	return commit(b, pebble.NoSync)
+}
+
+// Sync implements gundb.SyncStore: it syncs the write-ahead log, which
+// makes every write before it durable. With Options.NoSync it does
+// nothing. Concurrent calls share one sync.
+func (s *Store) Sync(context.Context) error {
+	if s.sync == pebble.NoSync {
+		return nil
+	}
+	if err := s.db.LogData(nil, pebble.Sync); err != nil {
+		return fmt.Errorf("pebblestore: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) write(soul string, n *gundb.Node) error {

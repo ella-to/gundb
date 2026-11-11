@@ -164,9 +164,11 @@ func (p *peer) readLoop() {
 		if err != nil {
 			p.db.log.Debug("gundb: bad frame", "peer", p.conn.RemoteAddr(), "err", err)
 		}
+		var f frameSync // the puts of a frame share one sync
 		for i := range msgs {
-			p.db.handle(p, &msgs[i])
+			p.db.handleIn(p, &msgs[i], &f)
 		}
+		p.db.flush(&f)
 	}
 }
 
