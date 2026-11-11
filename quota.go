@@ -202,27 +202,13 @@ func (q *quota) addLocked(owner string, d Usage) {
 	q.usage[owner] = u
 }
 
-// load counts what store already holds: every node, read once.
+// load counts what store already holds: every node, read once, in one
+// pass if the store can (ScanStore).
 func (q *quota) load(ctx context.Context, store Store) error {
-	ss, ok := store.(SoulStore)
-	if !ok {
-		return errors.New("gundb: the store cannot list souls, so quota usage starts from zero")
-	}
-	souls, err := ss.ListSouls(ctx, "")
-	if err != nil {
-		return err
-	}
-	for _, soul := range souls {
-		owner := q.owner(soul)
+	count := func(n *Node) {
+		owner := q.owner(n.Soul)
 		if owner == "" {
-			continue
-		}
-		n, err := store.Get(ctx, soul)
-		if err != nil {
-			return err
-		}
-		if n == nil {
-			continue
+			return
 		}
 		var u Usage
 		for k, v := range n.Fields {
@@ -234,6 +220,35 @@ func (q *quota) load(ctx context.Context, store Store) error {
 		q.mu.Lock()
 		q.addLocked(owner, u)
 		q.mu.Unlock()
+	}
+	if sc, ok := store.(ScanStore); ok {
+		for n, err := range sc.Scan(ctx) {
+			if err != nil {
+				return err
+			}
+			count(n)
+		}
+		return nil
+	}
+	ss, ok := store.(SoulStore)
+	if !ok {
+		return errors.New("gundb: the store cannot list souls, so quota usage starts from zero")
+	}
+	souls, err := ss.ListSouls(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, soul := range souls {
+		if q.owner(soul) == "" {
+			continue
+		}
+		n, err := store.Get(ctx, soul)
+		if err != nil {
+			return err
+		}
+		if n != nil {
+			count(n)
+		}
 	}
 	return nil
 }

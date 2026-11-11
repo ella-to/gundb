@@ -6,25 +6,62 @@ package memstore
 
 import (
 	"context"
+	"iter"
 	"maps"
 	"slices"
 	"strings"
 	"sync"
 
 	"ella.to/gundb"
+	"ella.to/gundb/internal/soulindex"
 )
 
-// Store is an in-memory gundb.SoulStore and gundb.FieldReader.
+// Store is an in-memory gundb.SoulRangeStore and gundb.FieldReader.
 type Store struct {
 	mu    sync.RWMutex
 	nodes map[string]*gundb.Node
+
+	idxMu sync.Mutex // taken inside mu, never the other way round
+	idx   soulindex.Index
 }
 
 var (
-	_ gundb.SoulStore   = (*Store)(nil)
-	_ gundb.FieldReader = (*Store)(nil)
-	_ gundb.LiveReader  = (*Store)(nil)
+	_ gundb.SoulRangeStore = (*Store)(nil)
+	_ gundb.FieldReader    = (*Store)(nil)
+	_ gundb.LiveReader     = (*Store)(nil)
+	_ gundb.ScanStore      = (*Store)(nil)
 )
+
+// added records a new soul in the index. Callers hold mu for writing.
+func (s *Store) added(soul string) {
+	s.idxMu.Lock()
+	s.idx.Add(soul)
+	s.idxMu.Unlock()
+}
+
+// SoulsBetween implements gundb.SoulRangeStore.
+func (s *Store) SoulsBetween(_ context.Context, prefix, from, to string) ([]string, error) {
+	s.idxMu.Lock()
+	defer s.idxMu.Unlock()
+	return s.idx.Between(prefix, from, to), nil
+}
+
+// Scan implements gundb.ScanStore.
+func (s *Store) Scan(context.Context) iter.Seq2[*gundb.Node, error] {
+	return func(yield func(*gundb.Node, error) bool) {
+		s.mu.RLock()
+		nodes := make([]*gundb.Node, 0, len(s.nodes))
+		for _, n := range s.nodes {
+			nodes = append(nodes, n.Clone())
+		}
+		s.mu.RUnlock()
+		for _, n := range nodes {
+			if !yield(n, nil) {
+				return
+			}
+		}
+	}
+}
 
 // New returns an empty Store.
 func New() *Store { return &Store{nodes: map[string]*gundb.Node{}} }
@@ -43,6 +80,9 @@ func (s *Store) Get(_ context.Context, soul string) (*gundb.Node, error) {
 func (s *Store) Put(_ context.Context, n *gundb.Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.nodes[n.Soul]; !ok {
+		s.added(n.Soul)
+	}
 	s.nodes[n.Soul] = n.Clone()
 	return nil
 }
@@ -53,6 +93,7 @@ func (s *Store) PutFields(_ context.Context, soul string, changed *gundb.Node) e
 	defer s.mu.Unlock()
 	n, ok := s.nodes[soul]
 	if !ok {
+		s.added(soul)
 		s.nodes[soul] = changed.Clone()
 		return nil
 	}

@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"ella.to/gundb"
@@ -423,5 +424,56 @@ func TestPruneHistory(t *testing.T) {
 	}
 	if got, _ := s.Get(ctx, "a"); got.Fields["x"] != gundb.Number(5) || got.Fields["y"] != gundb.Number(20) {
 		t.Fatalf("latest values changed: %+v", got)
+	}
+}
+
+func TestSoulsBetweenAndScan(t *testing.T) {
+	ctx := t.Context()
+	s := open(t, t.TempDir())
+	souls := []string{"a", "a\x00", "a\x00b", "a\x01", "ab", "b", "b/1", "b/2", "b/10", "c", "c\x00\x00"}
+	for i, soul := range souls {
+		n := gundb.NewNode(soul)
+		n.Set("x", gundb.Number(float64(i)), 1)
+		n.Set("y\x00", gundb.String(soul), 1)
+		if err := s.Put(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bounds := []string{"", "a", "a\x00", "a\x00a", "a\x01", "b", "b/", "b/1", "b/2", "c", "d"}
+	for _, prefix := range []string{"", "a", "a\x00", "b/", "c", "z"} {
+		for _, from := range bounds {
+			for _, to := range bounds {
+				var want []string
+				for _, soul := range souls {
+					if strings.HasPrefix(soul, prefix) && (from == "" || soul >= from) && (to == "" || soul <= to) {
+						want = append(want, soul)
+					}
+				}
+				got, err := s.SoulsBetween(ctx, prefix, from, to)
+				if err != nil {
+					t.Fatal(err)
+				}
+				slices.Sort(got)
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Fatalf("SoulsBetween(%q, %q, %q) = %q, want %q", prefix, from, to, got, want)
+				}
+			}
+		}
+	}
+	seen := 0
+	for n, err := range s.Scan(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := s.Get(ctx, n.Soul)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sameNode(t, n, want)
+		seen++
+	}
+	if seen != len(souls) {
+		t.Fatalf("scanned %d nodes, want %d", seen, len(souls))
 	}
 }

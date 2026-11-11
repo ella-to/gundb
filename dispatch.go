@@ -243,19 +243,15 @@ func (db *DB) handleSoulLex(p *peer, m *message) {
 		db.relayGet(p, m)
 		return
 	}
-	souls, err := ss.ListSouls(db.ctx, deref(l.Prefix))
+	souls, err := listSouls(db.ctx, ss, l)
 	if err != nil {
 		db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})
 		return
 	}
-	slices.SortFunc(souls, jsCompare)
 	// Each chunk is sent once the next match shows more are coming, so only
 	// one chunk of nodes is held at a time.
 	var chunk graph
 	for _, soul := range souls {
-		if !l.matchSoul(soul) {
-			continue
-		}
 		n, err := db.store.Get(db.ctx, soul)
 		if err != nil {
 			db.reply(p, &message{Ack: m.ID, Err: errJSON(err)})

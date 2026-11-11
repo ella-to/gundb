@@ -58,11 +58,40 @@ func (db *DB) Souls(ctx context.Context, q Lex) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	all, err := ss.ListSouls(ctx, q.Prefix)
+	return listSouls(ctx, ss, l)
+}
+
+// listSouls returns the stored souls l selects, in JS string order: only
+// those in its range when the store can list a range (SoulRangeStore).
+func listSouls(ctx context.Context, ss SoulStore, l *lex) ([]string, error) {
+	var all []string
+	var err error
+	if rs, ok := ss.(SoulRangeStore); ok && l.Eq == nil && byteOrdered(l.Gt) && byteOrdered(l.Lt) {
+		all, err = rs.SoulsBetween(ctx, deref(l.Prefix), deref(l.Gt), deref(l.Lt))
+	} else {
+		all, err = ss.ListSouls(ctx, deref(l.Prefix))
+	}
 	if err != nil {
 		return nil, err
 	}
 	souls := slices.DeleteFunc(all, func(soul string) bool { return !l.matchSoul(soul) })
 	slices.SortFunc(souls, jsCompare)
 	return souls, nil
+}
+
+// byteOrdered reports whether comparing any string with bound in byte order
+// gives what JS's UTF-16 order gives. The two differ only where a
+// character from U+E000 up meets one from U+10000 up; a bound made of
+// characters below U+D800 never meets either case at the place two
+// strings first differ.
+func byteOrdered(bound *string) bool {
+	if bound == nil {
+		return true
+	}
+	for _, r := range *bound {
+		if r >= 0xD800 {
+			return false
+		}
+	}
+	return true
 }

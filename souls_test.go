@@ -155,3 +155,35 @@ func TestSoulLexHonoursCanRead(t *testing.T) {
 		t.Fatalf("%q %v", souls, err)
 	}
 }
+
+// A range is listed in JS string order, also with bounds byte order would
+// get wrong, which are answered without the store's range lookup.
+func TestSoulsRange(t *testing.T) {
+	ctx := t.Context()
+	db := newDB(t)
+	souls := []string{"m/a", "m/b", "m/c", "m/", "m/\U00010000", "n/a"}
+	for _, soul := range souls {
+		if err := db.Get(soul).Put(ctx, map[string]any{"v": 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		q    Lex
+		want []string
+	}{
+		{Lex{Prefix: "m/", From: "m/b", To: "m/c"}, []string{"m/b", "m/c"}},
+		{Lex{Prefix: "m/", From: "m/b"}, []string{"m/b", "m/c", "m/\U00010000", "m/"}},
+		// In JS order U+10000 (a surrogate pair) sorts before U+E000.
+		{Lex{Prefix: "m/", From: "m/\U00010000"}, []string{"m/\U00010000", "m/"}},
+		{Lex{Prefix: "m/", To: "m/\U00010000"}, []string{"m/a", "m/b", "m/c", "m/\U00010000"}},
+		{Lex{From: "m/c", To: "n/a"}, []string{"m/c", "m/\U00010000", "m/", "n/a"}},
+	} {
+		got, err := db.Souls(ctx, tc.q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Fatalf("%+v: got %q, want %q", tc.q, got, tc.want)
+		}
+	}
+}

@@ -64,10 +64,11 @@ type Store struct {
 }
 
 var (
-	_ gundb.FieldReader = (*Store)(nil)
-	_ gundb.SyncStore   = (*Store)(nil)
-	_ gundb.SoulStore   = (*Store)(nil)
-	_ gundb.LiveReader  = (*Store)(nil)
+	_ gundb.FieldReader    = (*Store)(nil)
+	_ gundb.SyncStore      = (*Store)(nil)
+	_ gundb.SoulRangeStore = (*Store)(nil)
+	_ gundb.ScanStore      = (*Store)(nil)
+	_ gundb.LiveReader     = (*Store)(nil)
 )
 
 // Version is one past write of a field.
@@ -343,6 +344,90 @@ func (s *Store) ListSouls(_ context.Context, prefix string) ([]string, error) {
 		ok = it.SeekGE(next)
 	}
 	return souls, it.Error()
+}
+
+// SoulsBetween implements gundb.SoulRangeStore: it seeks to the first soul
+// of the range and stops after the last, one step per soul.
+func (s *Store) SoulsBetween(_ context.Context, prefix, from, to string) ([]string, error) {
+	lower := latestPrefix(prefix)
+	lower = lower[:len(lower)-2] // any soul starting with prefix
+	hi := upper(lower)
+	if from != "" {
+		if f := latestPrefix(from); bytes.Compare(f[:len(f)-2], lower) > 0 {
+			lower = f[:len(f)-2] // from, and every soul after it
+		}
+	}
+	if to != "" {
+		t := latestPrefix(to) // ends 0x00 0x01; 0x00 0x02 is past all of to's fields
+		t[len(t)-1]++
+		if hi == nil || bytes.Compare(t, hi) < 0 {
+			hi = t
+		}
+	}
+	it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: hi})
+	if err != nil {
+		return nil, fmt.Errorf("pebblestore: %w", err)
+	}
+	defer it.Close()
+	var souls []string
+	for ok := it.First(); ok; {
+		soul, _, err := unescape(it.Key()[1:])
+		if err != nil {
+			return nil, err
+		}
+		souls = append(souls, soul)
+		next := latestPrefix(soul)
+		next[len(next)-1]++
+		ok = it.SeekGE(next)
+	}
+	return souls, it.Error()
+}
+
+// Scan implements gundb.ScanStore: one pass over the latest values.
+func (s *Store) Scan(context.Context) iter.Seq2[*gundb.Node, error] {
+	return func(yield func(*gundb.Node, error) bool) {
+		it, err := s.db.NewIter(&pebble.IterOptions{LowerBound: []byte{'L'}, UpperBound: []byte{'L' + 1}})
+		if err != nil {
+			yield(nil, fmt.Errorf("pebblestore: %w", err))
+			return
+		}
+		defer it.Close()
+		var n *gundb.Node
+		var prefix []byte // the soul part of n's keys
+		for it.First(); it.Valid(); it.Next() {
+			key := it.Key()
+			if n == nil || !bytes.HasPrefix(key, prefix) {
+				if n != nil && !yield(n, nil) {
+					return
+				}
+				soul, rest, err := unescape(key[1:])
+				if err != nil {
+					yield(nil, err)
+					return
+				}
+				n = gundb.NewNode(soul)
+				prefix = append(prefix[:0], key[:len(key)-len(rest)]...)
+			}
+			v := it.Value()
+			if len(v) < 8 {
+				yield(nil, fmt.Errorf("pebblestore: corrupt value for %q", n.Soul))
+				return
+			}
+			val, err := decodeValue(v[8:])
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			n.Set(string(key[len(prefix):]), val, math.Float64frombits(binary.BigEndian.Uint64(v)))
+		}
+		if err := it.Error(); err != nil {
+			yield(nil, fmt.Errorf("pebblestore: %w", err))
+			return
+		}
+		if n != nil {
+			yield(n, nil)
+		}
+	}
 }
 
 // History returns every stored version of a field, newest first.

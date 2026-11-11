@@ -1,6 +1,9 @@
 package gundb
 
-import "context"
+import (
+	"context"
+	"iter"
+)
 
 // Store persists nodes. The runtime does all HAM merging; a Store is a plain
 // soul -> node map.
@@ -81,4 +84,28 @@ type SyncStore interface {
 type SoulStore interface {
 	Store
 	ListSouls(ctx context.Context, prefix string) ([]string, error)
+}
+
+// SoulRangeStore is an optional extension of SoulStore that lists a range
+// of souls without listing every soul with the prefix. A LEX query with
+// bounds (DB.Souls with From or To, {"#": {">": from, "<": to}} from
+// GUN.js) then costs what it returns.
+//
+// SoulsBetween returns every stored soul that starts with prefix and lies
+// between from and to, both inclusive, in byte order; an empty from or to
+// is no bound. The order of the result does not matter.
+type SoulRangeStore interface {
+	SoulStore
+	SoulsBetween(ctx context.Context, prefix, from, to string) ([]string, error)
+}
+
+// ScanStore is an optional extension of Store that reads every node in one
+// pass. With Options.Quota, New counts what is stored with it instead of
+// listing every soul and reading each node on its own.
+//
+// Scan yields each stored node once, in any order. A node yielded is the
+// caller's, as with Get.
+type ScanStore interface {
+	Store
+	Scan(ctx context.Context) iter.Seq2[*Node, error]
 }
