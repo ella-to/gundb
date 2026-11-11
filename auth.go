@@ -142,7 +142,7 @@ func (f *fanout) build(db *DB, m *message, raw []byte, kept int) readable {
 		}
 	}
 	cp := *m
-	cp.Put, cp.Hash = keep, nil
+	cp.Put, cp.Hash, cp.raw = keep, nil, nil
 	if len(keep) == 0 {
 		cp.Put = nil
 	}

@@ -1,6 +1,7 @@
 package gundb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,7 @@ func (db *DB) handleIn(p *peer, m *message, f *frameSync) {
 	}
 	if m.ID == "" {
 		m.ID = randomID(9)
+		m.raw = nil // what we pass on must carry the ID
 	}
 	// A handshake carrying our own PID means we dialled ourselves. Check it
 	// before dedup: the message ID is one we created, so dedup would hide it.
@@ -87,7 +89,7 @@ func (db *DB) handleDam(p *peer, m *message) {
 
 func (db *DB) handleAck(p *peer, m *message, f *frameSync) {
 	if len(m.Put) > 0 && !p.reads() {
-		m.Put = nil // a peer we only write to: its data never comes in
+		m.Put, m.raw = nil, nil // a peer we only write to: its data never comes in
 	}
 	if len(m.Put) > 0 {
 		// Data answering a get counts as a write by whoever sent it, and is
@@ -110,18 +112,18 @@ func (db *DB) handleAck(p *peer, m *message, f *frameSync) {
 		}
 		if err != nil {
 			db.log.Debug("gundb: dropped reply", "peer", p.conn.RemoteAddr(), "err", err)
-			m.Put = nil
+			m.Put, m.raw = nil, nil
 		}
 	}
 	if r := db.answer(p, m); r != nil {
 		if r.to != nil && len(m.Put) > 0 { // data for a get we are relaying
-			db.sendTo(r.to, m, db.encode(m), nil)
+			db.sendTo(r.to, m, db.wire(m), nil)
 		}
 		return
 	}
 	if to := db.dup.via(m.Ack); to != nil && to != p {
 		db.dup.track(m.Ack, nil) // keep the route alive for chunked replies
-		db.sendTo(to, m, db.encode(m), nil)
+		db.sendTo(to, m, db.wire(m), nil)
 	}
 }
 
@@ -168,10 +170,10 @@ func (db *DB) putDone(p *peer, m *message, changed graph, stale bool, err error)
 		// Some signed fields lost HAM unverified: pass on only what won,
 		// which was verified, never data that might be forged.
 		cp := *m
-		cp.Put, cp.Hash = changed, nil
+		cp.Put, cp.Hash, cp.raw = changed, nil, nil
 		m = &cp
 	}
-	raw := db.encode(m)
+	raw := db.wire(m)
 	memo := &fanout{}
 	for _, q := range db.recipients(changed) {
 		if q != p && !m.sentTo(q.getPID()) {
@@ -332,7 +334,7 @@ func (db *DB) relayGet(p *peer, m *message) {
 	timer = time.AfterFunc(db.wait, finish)
 	stop = context.AfterFunc(db.ctx, finish)
 	db.reqMu.Unlock()
-	raw := db.encode(m)
+	raw := db.wire(m)
 	for _, o := range others {
 		o.send(raw)
 	}
@@ -377,6 +379,19 @@ func (db *DB) reply(p *peer, m *message) {
 	m.ID = randomID(9)
 	db.dup.track(m.ID, nil)
 	p.send(db.encode(m))
+}
+
+// wire returns m as it goes on the wire: as it was received if it is
+// unchanged, else encoded. A message received in a batch is copied out of
+// it, so the queues it waits in don't keep the whole frame alive.
+func (db *DB) wire(m *message) []byte {
+	switch {
+	case m.raw == nil:
+		return db.encode(m)
+	case cap(m.raw) > 2*len(m.raw):
+		m.raw = bytes.Clone(m.raw)
+	}
+	return m.raw
 }
 
 func (db *DB) encode(m *message) []byte {

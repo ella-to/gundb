@@ -45,7 +45,7 @@ func (n *Node) MarshalJSON() ([]byte, error) { return n.appendJSON(nil, true) }
 // UnmarshalJSON parses the GUN wire form. Like the reference it rejects
 // nodes without a soul, fields without a state, and invalid values.
 func (n *Node) UnmarshalJSON(data []byte) error {
-	dec := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	dec := jsontext.NewDecoder(bytes.NewBuffer(data), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
 	if err := n.UnmarshalJSONFrom(dec); err != nil {
 		return err
 	}

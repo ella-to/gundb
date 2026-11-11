@@ -3,10 +3,13 @@ package gundb
 import (
 	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	"ella.to/gundb/internal/js"
 )
@@ -33,6 +36,10 @@ type message struct {
 	Hash json.RawMessage `json:"##,omitempty"`
 	Sent string          `json:"><,omitempty"` // peers the sender already relayed to
 	More json.RawMessage `json:"%,omitempty"`  // set on every chunk of a reply except the last
+
+	// raw is the message as it was received, while it is unchanged: it
+	// is passed on as it is instead of being encoded again.
+	raw []byte
 }
 
 func (m *message) empty() bool {
@@ -212,33 +219,303 @@ func cmpOr(a, b *string, ok func(*string) bool) *string {
 var heartbeat = []byte("[]")
 
 // readFrame decodes one wire frame: a single message object or an array of
-// them. Messages that fail to decode are skipped and reported in the error,
-// so one bad message never drops the rest of a batch.
+// them, in one pass. Messages that fail to decode are skipped and reported
+// in the error, so one bad message never drops the rest of a batch; a frame
+// that is not valid JSON is dropped whole.
+//
+// Each message keeps the bytes it was received as (message.raw), slices of
+// data, to be passed on as they are.
 func readFrame(data []byte) ([]message, error) {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
 		return nil, nil
 	}
-	var raws []json.RawMessage
+	dec := decoders.Get().(*jsontext.Decoder)
+	defer decoders.Put(dec)
+	// A bytes.Buffer is parsed in place, without copying it.
+	dec.Reset(bytes.NewBuffer(data), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
 	switch data[0] {
 	case '[':
-		if err := json.Unmarshal(data, &raws); err != nil {
+		if _, err := dec.ReadToken(); err != nil {
 			return nil, fmt.Errorf("gundb: bad batch: %w", err)
 		}
+		var msgs []message
+		var errs []error
+		for dec.PeekKind() != ']' {
+			m, err := readMessage(dec, data)
+			if err != nil {
+				// Skip the rest of the bad message; JSON that is not well
+				// formed drops the whole frame.
+				for dec.StackDepth() > 1 {
+					if _, err := dec.ReadToken(); err != nil {
+						return nil, fmt.Errorf("gundb: bad batch: %w", err)
+					}
+				}
+				if isSyntax(err) {
+					return nil, fmt.Errorf("gundb: bad batch: %w", err)
+				}
+				errs = append(errs, err)
+				continue
+			}
+			msgs = append(msgs, m)
+		}
+		if _, err := dec.ReadToken(); err != nil {
+			return nil, fmt.Errorf("gundb: bad batch: %w", err)
+		}
+		if _, err := dec.ReadToken(); err != io.EOF {
+			return nil, errors.New("gundb: bad batch: trailing data")
+		}
+		return msgs, errors.Join(errs...)
 	case '{':
-		raws = []json.RawMessage{data}
+		m, err := readMessage(dec, data)
+		if err == nil {
+			if _, end := dec.ReadToken(); end != io.EOF {
+				err = errors.New("gundb: trailing data")
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return []message{m}, nil
 	default:
 		return nil, fmt.Errorf("gundb: bad frame starting with %q", data[0])
 	}
-	msgs := make([]message, 0, len(raws))
-	var errs []error
-	for _, r := range raws {
-		var m message
-		if err := json.Unmarshal(r, &m); err != nil {
-			errs = append(errs, err)
+}
+
+// decoders are reused across frames, as encoding/json reuses its own.
+var decoders = sync.Pool{New: func() any { return jsontext.NewDecoder(bytes.NewBuffer(nil)) }}
+
+// isSyntax reports whether err means the JSON is not well formed.
+func isSyntax(err error) bool {
+	var se *jsontext.SyntacticError
+	return errors.As(err, &se) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// readMessage reads one message object from dec, which reads data. It
+// accepts what json.Unmarshal into message accepted, with field names
+// matched exactly.
+func readMessage(dec *jsontext.Decoder, data []byte) (message, error) {
+	var m message
+	start := dec.InputOffset()
+	switch dec.PeekKind() {
+	case 'n': // null: an empty message, ignored
+		_, err := dec.ReadToken()
+		return m, err
+	case '{':
+	default:
+		if err := dec.SkipValue(); err != nil {
+			return m, err
+		}
+		return m, errors.New("gundb: message is not an object")
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return m, err
+	}
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return m, err
+		}
+		switch key := name.String(); key {
+		case "#", "@", "dam", "pid", "><":
+			s, err := readString(dec)
+			if err != nil {
+				return m, fmt.Errorf("gundb: message %q: %w", key, err)
+			}
+			switch key {
+			case "#":
+				m.ID = s
+			case "@":
+				m.Ack = s
+			case "dam":
+				m.Dam = s
+			case "pid":
+				m.PID = s
+			default:
+				m.Sent = s
+			}
+		case "put":
+			if m.Put, err = readGraph(dec); err != nil {
+				return m, err
+			}
+		case "get":
+			if m.Get, err = readGet(dec, data); err != nil {
+				return m, err
+			}
+		case "ok", "err", "##", "%":
+			raw, err := readRaw(dec, data)
+			if err != nil {
+				return m, err
+			}
+			switch key {
+			case "ok":
+				m.OK = raw
+			case "err":
+				m.Err = raw
+			case "##":
+				m.Hash = raw
+			default:
+				m.More = raw
+			}
+		default:
+			if err := dec.SkipValue(); err != nil {
+				return m, err
+			}
+		}
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return m, err
+	}
+	m.raw = data[start:dec.InputOffset()]
+	m.raw = m.raw[bytes.IndexByte(m.raw, '{'):]
+	return m, nil
+}
+
+// readString reads a string, or null as "".
+func readString(dec *jsontext.Decoder) (string, error) {
+	switch dec.PeekKind() {
+	case '"', 'n':
+		tok, err := dec.ReadToken()
+		if err != nil || tok.Kind() == 'n' {
+			return "", err
+		}
+		return tok.String(), nil
+	}
+	if err := dec.SkipValue(); err != nil {
+		return "", err
+	}
+	return "", errors.New("not a string")
+}
+
+// readRaw reads any value and returns it as data holds it.
+func readRaw(dec *jsontext.Decoder, data []byte) (json.RawMessage, error) {
+	start := dec.InputOffset()
+	if err := dec.SkipValue(); err != nil {
+		return nil, err
+	}
+	raw := bytes.TrimLeft(data[start:dec.InputOffset()], " \t\r\n:")
+	return json.RawMessage(raw), nil
+}
+
+// readGraph reads a put's {soul: node, ...}, or null.
+func readGraph(dec *jsontext.Decoder) (graph, error) {
+	switch dec.PeekKind() {
+	case 'n':
+		_, err := dec.ReadToken()
+		return nil, err
+	case '{':
+	default:
+		if err := dec.SkipValue(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("gundb: put is not an object")
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	g := graph{}
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		soul := name.String()
+		if dec.PeekKind() == 'n' {
+			if _, err := dec.ReadToken(); err != nil {
+				return nil, err
+			}
+			g[soul] = nil // refused by check, like the reference
 			continue
 		}
-		msgs = append(msgs, m)
+		n := new(Node)
+		if err := n.UnmarshalJSONFrom(dec); err != nil {
+			return nil, err
+		}
+		g[soul] = n
 	}
-	return msgs, errors.Join(errs...)
+	_, err := dec.ReadToken()
+	return g, err
+}
+
+// readGet reads a get's {"#": soul, ".": key}, or null. Either may be a
+// LEX object instead; the get's JSON is kept, to pass it on unchanged.
+func readGet(dec *jsontext.Decoder, data []byte) (*getQuery, error) {
+	start := dec.InputOffset()
+	switch dec.PeekKind() {
+	case 'n':
+		_, err := dec.ReadToken()
+		return nil, err
+	case '{':
+	default:
+		if err := dec.SkipValue(); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("gundb: get is not an object")
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	q := &getQuery{}
+	for dec.PeekKind() != '}' {
+		name, err := dec.ReadToken()
+		if err != nil {
+			return nil, err
+		}
+		switch name.String() {
+		case "#": // the last "#" counts
+			q.Soul, q.SoulLex = "", nil
+			switch dec.PeekKind() {
+			case '"':
+				tok, err := dec.ReadToken()
+				if err != nil {
+					return nil, err
+				}
+				q.Soul = tok.String()
+			case '{':
+				raw, err := dec.ReadValue()
+				if err != nil {
+					return nil, err
+				}
+				var l lex
+				switch {
+				case json.Unmarshal(raw, &l) != nil: // not a soul; answered as not found
+				case l.Eq != nil:
+					q.Soul = *l.Eq
+				default:
+					q.SoulLex = &l
+				}
+			default: // not a soul; answered as not found
+				if err := dec.SkipValue(); err != nil {
+					return nil, err
+				}
+			}
+		case ".":
+			q.Key, q.KeyLex = "", nil
+			switch dec.PeekKind() {
+			case '"', 'n':
+				if q.Key, err = readString(dec); err != nil {
+					return nil, err
+				}
+			default:
+				raw, err := dec.ReadValue()
+				if err != nil {
+					return nil, err
+				}
+				q.KeyLex = new(lex)
+				if err := json.Unmarshal(raw, q.KeyLex); err != nil {
+					return nil, fmt.Errorf("gundb: get key: %w", err)
+				}
+			}
+		default:
+			if err := dec.SkipValue(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if _, err := dec.ReadToken(); err != nil {
+		return nil, err
+	}
+	raw := bytes.TrimLeft(data[start:dec.InputOffset()], " \t\r\n:")
+	q.raw = json.RawMessage(raw)
+	return q, nil
 }
