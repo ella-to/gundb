@@ -244,6 +244,25 @@ func unsign(n *Node) *Node {
 	return n
 }
 
+// unsignValue is unsign for one value of soul.
+func unsignValue(soul string, v Value) Value {
+	s, ok := v.(String)
+	if !ok || strings.HasPrefix(soul, "~@") || sea.PubOf(soul) == "" {
+		return v
+	}
+	if plain, ok := signedValue(string(s)); ok {
+		return plain
+	}
+	raw, ok := sea.FieldValue(string(s))
+	if !ok {
+		return v
+	}
+	if plain, err := decodeValue(raw); err == nil {
+		return plain
+	}
+	return v
+}
+
 // signedValue reads the value out of a stored signed field written in the
 // form SEA writes it, {":":value,"~":"signature"}, without a JSON parser.
 // Reads of user data do this for every field, every time. Anything not in

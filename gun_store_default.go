@@ -68,6 +68,16 @@ func (s *memoryStore) GetFields(_ context.Context, soul string, fields []string)
 	return n, nil
 }
 
+// getField reads one field without copying the node, for reader.field.
+func (s *memoryStore) getField(soul, field string) Value {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if n := s.nodes[soul]; n != nil {
+		return n.Fields[field]
+	}
+	return nil
+}
+
 func (s *memoryStore) ListSouls(_ context.Context, prefix string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

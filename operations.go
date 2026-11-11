@@ -480,22 +480,37 @@ func (db *DB) peerGone(p *peer) {
 	}
 }
 
-// interest records a soul we have asked peers for. Peers remember who
-// asked for what and push every later change, so after the first answer
-// the local copy stays current without asking again.
+// interest records a soul, or one field of it, that we have asked peers
+// for. Peers remember who asked for what and push every later change, so
+// after the first answer the local copy stays current without asking
+// again.
 type interest struct{ done chan struct{} }
+
+// interestKey names an interest: a whole node (key "") or one field.
+type interestKey struct{ soul, key string }
 
 // sync makes sure soul has been requested from peers, waiting (at most
 // db.wait) for the first answer.
-func (db *DB) sync(ctx context.Context, soul string) {
+func (db *DB) sync(ctx context.Context, soul string) { db.syncKey(ctx, interestKey{soul: soul}) }
+
+// syncField is sync for one field of soul: only that field is requested,
+// unless the whole node already was.
+func (db *DB) syncField(ctx context.Context, soul, key string) {
+	db.syncKey(ctx, interestKey{soul, key})
+}
+
+func (db *DB) syncKey(ctx context.Context, k interestKey) {
 	db.interestMu.Lock()
-	in, ok := db.interest[soul]
+	in, ok := db.interest[k]
+	if !ok && k.key != "" {
+		in, ok = db.interest[interestKey{soul: k.soul}] // the node covers its fields
+	}
 	if !ok {
 		in = &interest{done: make(chan struct{})}
-		db.interest[soul] = in
+		db.interest[k] = in
 		go func() {
 			defer close(in.done)
-			db.ask(soul)
+			db.ask(k)
 		}()
 	}
 	db.interestMu.Unlock()
@@ -506,11 +521,11 @@ func (db *DB) sync(ctx context.Context, soul string) {
 	}
 }
 
-func (db *DB) ask(soul string) { db.query(db.ctx, &getQuery{Soul: soul}) }
+func (db *DB) ask(k interestKey) { db.query(db.ctx, &getQuery{Soul: k.soul, Key: k.key}) }
 
 // query sends q to every peer and waits (at most db.wait) until the answers
 // are in. The data that comes back is merged into the store. A get for one
-// soul also offers the peers our copy of it.
+// soul also offers the peers our copy of it (or of the one field asked for).
 func (db *DB) query(ctx context.Context, q *getQuery) {
 	ctx, cancel := context.WithTimeout(ctx, db.wait)
 	defer cancel()
@@ -520,7 +535,7 @@ func (db *DB) query(ctx context.Context, q *getQuery) {
 	id := randomID(9)
 	db.dup.track(id, nil)
 	if q.Soul != "" {
-		db.offer(q.Soul, db.peersFor(PeerWrite))
+		db.offer(interestKey{q.Soul, q.Key}, db.peersFor(PeerWrite))
 	}
 	peers := db.peersFor(PeerRead)
 	r := db.newRequest(id, false, peers)
@@ -535,39 +550,59 @@ func (db *DB) query(ctx context.Context, q *getQuery) {
 	}
 }
 
-// resubscribe re-sends a get for every soul of interest to a new peer, like
-// the reference does on "hi", so it pushes us their changes too. It offers
-// our copy of each as well.
+// resubscribe re-sends a get for every soul (or field) of interest to a new
+// peer, like the reference does on "hi", so it pushes us their changes
+// too. It offers our copy of each as well.
 func (db *DB) resubscribe(p *peer) {
 	db.interestMu.Lock()
-	souls := make([]string, 0, len(db.interest))
-	for soul := range db.interest {
-		souls = append(souls, soul)
+	keys := make([]interestKey, 0, len(db.interest))
+	for k := range db.interest {
+		keys = append(keys, k)
 	}
 	db.interestMu.Unlock()
-	for _, soul := range souls {
+	for _, k := range keys {
 		if p.writes() {
-			db.offer(soul, []*peer{p})
+			db.offer(k, []*peer{p})
 		}
 		if p.reads() {
-			m := &message{ID: randomID(9), Get: &getQuery{Soul: soul}}
+			m := &message{ID: randomID(9), Get: &getQuery{Soul: k.soul, Key: k.key}}
 			db.dup.track(m.ID, nil)
 			p.send(db.encode(m))
 		}
 	}
 }
 
-// offer sends peers our copy of soul. They already have most of it, and HAM
-// drops what they have, but it delivers writes they never got: those made
-// offline in an earlier session (the send queue lives in memory, so a page
-// reload loses it, while the store keeps the data), or data a relay lost
-// when it restarted.
-func (db *DB) offer(soul string, peers []*peer) {
-	n, err := db.store.Get(db.ctx, soul)
-	if err != nil || n == nil || len(n.Fields) == 0 || len(peers) == 0 {
+// offer sends peers our copy of a node, or of one field of it. They
+// already have most of it, and HAM drops what they have, but it delivers
+// writes they never got: those made offline in an earlier session (the
+// send queue lives in memory, so a page reload loses it, while the store
+// keeps the data), or data a relay lost when it restarted.
+func (db *DB) offer(k interestKey, peers []*peer) {
+	if len(peers) == 0 {
 		return
 	}
-	m := &message{ID: randomID(9), Put: graph{soul: n}}
+	var n *Node
+	var err error
+	if fr, ok := db.store.(FieldReader); ok && k.key != "" {
+		n, err = fr.GetFields(db.ctx, k.soul, []string{k.key})
+	} else {
+		n, err = db.store.Get(db.ctx, k.soul)
+	}
+	if err != nil || n == nil || len(n.Fields) == 0 {
+		return
+	}
+	if k.key != "" {
+		for f := range n.Fields {
+			if f != k.key {
+				delete(n.Fields, f)
+				delete(n.States, f)
+			}
+		}
+		if len(n.Fields) == 0 {
+			return
+		}
+	}
+	m := &message{ID: randomID(9), Put: graph{k.soul: n}}
 	db.dup.track(m.ID, nil)
 	raw := db.encode(m)
 	memo := &fanout{}

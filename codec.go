@@ -18,6 +18,10 @@ import (
 // maxDepth bounds how many links a read follows.
 const maxDepth = 64
 
+// maxFieldReads is how many fields of one node build reads one by one
+// before it reads the whole node instead.
+const maxFieldReads = 8
+
 var errArray = errors.New("arrays are not supported by GUN; use Set to build a list")
 
 // reader reads nodes for a Ref, either from the local store only (live
@@ -46,8 +50,36 @@ func (r *reader) node(soul string) (*Node, error) {
 	return unsign(n), err
 }
 
+// field reads one field of soul: from the store only that field if it can
+// (FieldReader), and from peers only that field unless the whole node was
+// asked for already. nil means it is not there.
+func (r *reader) field(soul, key string) (Value, error) {
+	if r.seen != nil {
+		r.seen[soul] = true
+	}
+	if r.net {
+		r.db.syncField(r.ctx, soul, key)
+	}
+	if ms, ok := r.db.store.(*memoryStore); ok { // the default: no copy at all
+		return unsignValue(soul, ms.getField(soul, key)), nil
+	}
+	var n *Node
+	var err error
+	if fr, ok := r.db.store.(FieldReader); ok {
+		n, err = fr.GetFields(r.ctx, soul, []string{key})
+	} else {
+		n, err = r.db.store.Get(r.ctx, soul)
+	}
+	if err != nil || n == nil {
+		return nil, err
+	}
+	return unsignValue(soul, n.Fields[key]), nil
+}
+
 // at follows path from its root node through links and returns the value
 // at its end. A root path yields Link{root}. nil means nothing is there.
+// Each step reads one field, so a path through a large node costs the same
+// as one through a small one.
 func (r *reader) at(path []string) (Value, error) {
 	var v Value = Link{Soul: path[0]}
 	for _, key := range path[1:] {
@@ -55,12 +87,9 @@ func (r *reader) at(path []string) (Value, error) {
 		if !ok {
 			return nil, nil
 		}
-		n, err := r.node(l.Soul)
-		if err != nil || n == nil {
+		var err error
+		if v, err = r.field(l.Soul, key); err != nil || v == nil {
 			return nil, err
-		}
-		if v = n.Fields[key]; v == nil {
-			return nil, nil
 		}
 	}
 	return v, nil
@@ -145,8 +174,8 @@ func appendPlain(b []byte, v Value) []byte {
 func (r *reader) soulOf(path []string) string {
 	soul := path[0]
 	for i, key := range path[1:] {
-		if n, _ := r.node(soul); n != nil {
-			if l, ok := n.Fields[key].(Link); ok {
+		if v, _ := r.field(soul, key); v != nil {
+			if l, ok := v.(Link); ok {
 				soul = l.Soul
 				continue
 			}
@@ -266,8 +295,10 @@ func encoded(f reflect.StructField) bool {
 // gets the soul "parent/key", exactly like gun.put does.
 func (r *reader) build(g graph, soul string, obj map[string]any, state float64) error {
 	n := g.node(soul)
+	// The links of soul's nested objects: read one field per object, and
+	// the whole node once when there are many (one get instead of many).
 	var cur *Node
-	loaded := false
+	reads := 0
 	for k, v := range obj {
 		if k == "_" { // metadata of a node read back from GUN
 			continue
@@ -286,15 +317,23 @@ func (r *reader) build(g graph, soul string, obj map[string]any, state float64) 
 			continue
 		}
 		child := metaSoul(m)
-		if child == "" && !loaded {
+		if child == "" {
+			var old Value
 			var err error
-			if cur, err = r.node(soul); err != nil {
+			if reads++; reads <= maxFieldReads {
+				old, err = r.field(soul, k)
+			} else {
+				if reads == maxFieldReads+1 {
+					cur, err = r.node(soul)
+				}
+				if cur != nil {
+					old = cur.Fields[k]
+				}
+			}
+			if err != nil {
 				return err
 			}
-			loaded = true
-		}
-		if child == "" && cur != nil {
-			if l, ok := cur.Fields[k].(Link); ok {
+			if l, ok := old.(Link); ok {
 				child = l.Soul
 			}
 		}

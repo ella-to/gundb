@@ -226,7 +226,7 @@ func BenchmarkResubscribe(b *testing.B) {
 				}
 				done := make(chan struct{})
 				close(done)
-				db.interest[soul] = &interest{done: done}
+				db.interest[interestKey{soul: soul}] = &interest{done: done}
 			}
 			b.ReportAllocs()
 			for b.Loop() {

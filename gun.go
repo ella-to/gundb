@@ -144,7 +144,7 @@ type DB struct {
 	pending map[string]*request
 
 	interestMu sync.Mutex
-	interest   map[string]*interest
+	interest   map[interestKey]*interest
 
 	watchMu  sync.Mutex
 	watchers map[string]map[*watcher]struct{}
@@ -217,7 +217,7 @@ func New(opts ...Options) *DB {
 		peers:     map[*peer]struct{}{},
 		changed:   make(chan struct{}),
 		pending:   map[string]*request{},
-		interest:  map[string]*interest{},
+		interest:  map[interestKey]*interest{},
 		watchers:  map[string]map[*watcher]struct{}{},
 		mergeSeed: maphash.MakeSeed(),
 		subs:      map[string]map[*peer]struct{}{},
