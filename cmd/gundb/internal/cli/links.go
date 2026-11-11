@@ -51,9 +51,16 @@ func (cl *client) linkTarget(ctx context.Context, path string) (*gundb.Ref, stri
 	if err != nil {
 		return nil, "", err
 	}
-	ref, err := cl.ref(ctx, path)
-	if err != nil {
-		return nil, "", err
+	// The target is read, never written: --obf does not create a scope for
+	// it, and a target outside any scope is a plain path.
+	var ref *gundb.Ref
+	if cl.obf {
+		ref, _, err = cl.obfRef(ctx, path, false)
+	}
+	if ref == nil {
+		if ref, err = cl.plainRef(ctx, path); err != nil {
+			return nil, "", err
+		}
 	}
 	n, err := ref.Node(ctx)
 	if errors.Is(err, gundb.ErrNotFound) && len(keys) > 1 {
@@ -102,7 +109,7 @@ It removes every key of path that links to the node, so it also undoes
 put --link, and the link a write like put users/2/name leaves in users:
 
   gundb unset users --link users/2              # removes users.2`,
-		Flags:        clientFlags(linkFlag()),
+		Flags:        clientFlags(linkFlag(), obfFlag()),
 		OnUsageError: usageError,
 		Action: func(ctx context.Context, c *ucli.Command) error {
 			arg, err := args(c, "path")
@@ -122,6 +129,7 @@ put --link, and the link a write like put users/2/name leaves in users:
 				return err
 			}
 			defer cl.close()
+			cl.obf, cl.writing = c.Bool("obf"), true
 			ref, err := cl.ref(ctx, path)
 			if err != nil {
 				return err

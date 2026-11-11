@@ -25,8 +25,11 @@ func (a *App) getCommand() *ucli.Command {
   gundb get ~/notes --dec -u ali -p secret123      # decrypt your own notes
   gundb get ~@ali/profile                          # ali's public profile
   gundb get inbox/bob --dec --from ali -u bob -p … # decrypt what ali sent you
-  gundb get users/1 --links                        # links unfollowed, and the soul`,
-		Flags:        clientFlags(decFlag(), verifyFlag(), fromFlag(), linksFlag()),
+  gundb get users/1 --links                        # links unfollowed, and the soul
+  gundb get ~/vault --obf --dec -u ali -p …        # an obfuscated scope, real names
+  gundb get ~/vault --obf --links -u ali -p …      # the map: names, tokens and souls
+  gundb get ~ --obf -u ali -p …                    # your obfuscated scopes`,
+		Flags:        clientFlags(decFlag(), verifyFlag(), fromFlag(), linksFlag(), obfFlag()),
 		OnUsageError: usageError,
 		Action: func(ctx context.Context, c *ucli.Command) error {
 			arg, err := args(c, "path")
@@ -42,6 +45,15 @@ func (a *App) getCommand() *ucli.Command {
 				return err
 			}
 			defer cl.close()
+			cl.obf = c.Bool("obf")
+			if keys, _ := splitPath(path); cl.obf && len(keys) == 1 && keys[0] == "~" {
+				scopes, err := cl.listScopes(ctx)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(c.Root().Writer, encode(scopes, true))
+				return nil
+			}
 			ref, err := cl.ref(ctx, path)
 			if err != nil {
 				return err
@@ -51,7 +63,12 @@ func (a *App) getCommand() *ucli.Command {
 				return err
 			}
 			var v any
-			if c.Bool("links") {
+			switch {
+			case c.Bool("links") && cl.obf:
+				if v, err = mapNode(ctx, ref, cl.lastScope, path); err != nil {
+					return explain(err, "read "+path, cl.timeout)
+				}
+			case c.Bool("links"):
 				node, err := cl.storedNode(ctx, ref, path)
 				if err != nil {
 					return err
@@ -59,7 +76,7 @@ func (a *App) getCommand() *ucli.Command {
 				if v, err = o.walk(node, path); err != nil {
 					return err
 				}
-			} else {
+			default:
 				raw, err := ref.Once[json.RawMessage](ctx)
 				if err != nil {
 					return explain(err, "read "+path, cl.timeout)
@@ -76,8 +93,8 @@ func (a *App) getCommand() *ucli.Command {
 }
 
 // writeFlags are the flags of put and set.
-func writeFlags() []ucli.Flag {
-	return clientFlags(stringFlag(), signFlag(), encFlag(), toFlag(), linkFlag())
+func writeFlags(more ...ucli.Flag) []ucli.Flag {
+	return clientFlags(append([]ucli.Flag{stringFlag(), signFlag(), encFlag(), toFlag(), linkFlag(), obfFlag()}, more...)...)
 }
 
 const writeExamples = `
@@ -100,10 +117,23 @@ func (a *App) putCommand() *ucli.Command {
   gundb put ~/notes/1 'secret' --enc -u ali -p secret123
   gundb put inbox/bob 'hi Bob' --enc --to bob --sign -u ali -p secret123
   gundb put users/1/best --link users/2     # a link to another node
-` + writeExamples,
-		Flags:        writeFlags(),
+  gundb put ~/vault/bank 'IBAN …' --obf --enc -u ali -p …   # names and value hidden
+  gundb put ~/vault --obf --to bob -u ali -p …              # let bob read ~@ali/vault
+  gundb put ~/vault --obf --rotate --to bob -u ali -p …     # new key; only bob keeps access
+` + writeExamples + `
+--obf keeps the names of an obfuscated scope (~/<scope>/...) from the server:
+the first write to one of yours creates it. With --obf, --enc encrypts with
+the scope's key, so everyone with access reads it, and --to gives users
+(comma-separated) access.`,
+		Flags:        writeFlags(rotateFlag()),
 		OnUsageError: usageError,
 		Action: func(ctx context.Context, c *ucli.Command) error {
+			switch {
+			case c.Bool("rotate"):
+				return a.rotate(ctx, c)
+			case c.Bool("obf") && c.IsSet("to") && c.NArg() == 1 && !c.IsSet("link"):
+				return a.grant(ctx, c)
+			}
 			return a.write(ctx, c, "put", true, func(ctx context.Context, cl *client, ref *gundb.Ref, path string, v any) (string, error) {
 				return path, ref.PutAck(ctx, v)
 			})
@@ -179,6 +209,7 @@ func (a *App) write(ctx context.Context, c *ucli.Command, verb string, put bool,
 		return err
 	}
 	defer cl.close()
+	cl.obf, cl.writing = c.Bool("obf"), true
 	ref, err := cl.ref(ctx, path)
 	if err != nil {
 		return err
@@ -201,6 +232,68 @@ func (a *App) write(ctx context.Context, c *ucli.Command, verb string, put bool,
 		return explain(err, strings.Replace(verb, "put", "write", 1)+" "+path, cl.timeout)
 	}
 	fmt.Fprintf(c.Root().Writer, "ok  %s = %s\n", at, shown)
+	if cl.obf && c.IsSet("to") {
+		return a.share(ctx, c, cl, path)
+	}
+	return nil
+}
+
+// grant runs put --obf --to without a value: it only gives access.
+func (a *App) grant(ctx context.Context, c *ucli.Command) error {
+	arg, err := args(c, "path")
+	if err != nil {
+		return err
+	}
+	ctx, cancel := operation(ctx, c)
+	defer cancel()
+	log, _ := a.logger(c)
+	cl, err := a.connect(ctx, c, log, true)
+	if err != nil {
+		return err
+	}
+	defer cl.close()
+	cl.obf, cl.writing = true, true
+	return a.share(ctx, c, cl, unexpandHome(arg[0]))
+}
+
+// share gives the users in --to access to the scope of path.
+func (a *App) share(ctx context.Context, c *ucli.Command, cl *client, path string) error {
+	names, err := cl.grant(ctx, path, c.String("to"))
+	if err != nil {
+		return err
+	}
+	s := cl.lastScope
+	if _, sc, err := cl.obfRef(ctx, path, false); err == nil {
+		s = sc
+	}
+	fmt.Fprintf(c.Root().Writer, "ok  %s can read %s; they name it ~@%s/%s with --obf\n", names, s.path(), cl.user.Alias(), s.label)
+	return nil
+}
+
+// rotate runs put --obf --rotate.
+func (a *App) rotate(ctx context.Context, c *ucli.Command) error {
+	if !c.Bool("obf") {
+		return fail("add --obf: --rotate gives an obfuscated scope a new key", "--rotate only works with --obf")
+	}
+	arg, err := args(c, "path")
+	if err != nil {
+		return err
+	}
+	path := unexpandHome(arg[0])
+	ctx, cancel := operation(ctx, c)
+	defer cancel()
+	log, _ := a.logger(c)
+	cl, err := a.connect(ctx, c, log, true)
+	if err != nil {
+		return err
+	}
+	defer cl.close()
+	cl.obf, cl.writing = true, true
+	msg, err := cl.rotate(ctx, path, c.String("to"))
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(c.Root().Writer, "ok  rotated %s: %s\n", strings.TrimSuffix(path, "/"), msg)
 	return nil
 }
 
@@ -235,6 +328,7 @@ func (a *App) writeLink(ctx context.Context, c *ucli.Command, verb string, put b
 		return err
 	}
 	defer cl.close()
+	cl.obf, cl.writing = c.Bool("obf"), true
 	ref, err := cl.ref(ctx, path)
 	if err != nil {
 		return err
@@ -267,9 +361,10 @@ changes instead of the whole value.
   gundb sub users
   gundb sub todos --map
   gundb sub ~/notes --map --dec -u ali -p secret123
+  gundb sub ~@ali/vault --map --obf --dec -u bob -p …   # an obfuscated scope
 
 --timeout only bounds connecting; sub runs until you stop it.`,
-		Flags: clientFlags(decFlag(), verifyFlag(), fromFlag(), &ucli.BoolFlag{
+		Flags: clientFlags(decFlag(), verifyFlag(), fromFlag(), obfFlag(), &ucli.BoolFlag{
 			Name:    "map",
 			Aliases: []string{"m"},
 			Usage:   "print each item that changes (key and value), not the whole value",
@@ -289,6 +384,7 @@ changes instead of the whole value.
 				return err
 			}
 			defer cl.close()
+			cl.obf = c.Bool("obf")
 			ref, err := cl.ref(setup, path)
 			if err != nil {
 				return err

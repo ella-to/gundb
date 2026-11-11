@@ -145,6 +145,11 @@ type client struct {
 	user    *gundb.User // logged in with --username, or nil
 	timeout time.Duration
 	closing atomic.Bool // close was called: disconnecting is expected
+
+	obf       bool              // --obf: paths are in obfuscated scopes
+	writing   bool              // the command writes: --obf may create a scope
+	scopes    map[string]*scope // scopes read so far, by "<owner pub>/<label>"
+	lastScope *scope            // the scope of the last path ref resolved with --obf
 }
 
 // connect connects to --addr, waiting at most until ctx is done, and with
@@ -242,7 +247,25 @@ func (cl *client) close() {
 //	~/profile      the logged-in user's space, user.Get("profile")
 //	~@ali/profile  ali's space, read-only
 //	~<pub>/profile the space of the user with that public key
+//
+// With --obf the path is in an obfuscated scope (see obf.go); without it,
+// a write to one of the user's own scopes is refused.
 func (cl *client) ref(ctx context.Context, path string) (*gundb.Ref, error) {
+	if cl.obf {
+		ref, s, err := cl.obfRef(ctx, path, cl.writing)
+		cl.lastScope = s
+		return ref, err
+	}
+	if cl.writing {
+		if err := cl.guardScope(ctx, path); err != nil {
+			return nil, err
+		}
+	}
+	return cl.plainRef(ctx, path)
+}
+
+// plainRef is ref without --obf.
+func (cl *client) plainRef(ctx context.Context, path string) (*gundb.Ref, error) {
 	keys, err := splitPath(path)
 	if err != nil {
 		return nil, err

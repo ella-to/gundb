@@ -32,7 +32,7 @@ func encFlag() ucli.Flag {
 func toFlag() ucli.Flag {
 	return &ucli.StringFlag{
 		Name:  "to",
-		Usage: "with --enc, encrypt for this `user` (alias or public key) instead of yourself",
+		Usage: "with --enc, encrypt for this `user` (alias or public key) instead of yourself; with --obf, give these users (comma-separated) access to the scope",
 	}
 }
 func stringFlag() ucli.Flag {
@@ -94,7 +94,8 @@ func parseValue(arg string, asString bool, stdin io.Reader) (any, error) {
 // a signed and encrypted value is signed ciphertext, like SEA does it.
 func (cl *client) seal(ctx context.Context, c *ucli.Command, v any) (any, error) {
 	sign, enc := c.Bool("sign"), c.Bool("enc")
-	if c.IsSet("to") && !enc {
+	obf := cl.obf && cl.lastScope != nil
+	if c.IsSet("to") && !enc && !obf {
 		return nil, fail("add --enc to encrypt for that user", "--to only works with --enc")
 	}
 	if !sign && !enc {
@@ -104,7 +105,13 @@ func (cl *client) seal(ctx context.Context, c *ucli.Command, v any) (any, error)
 		return nil, fail("log in with --username and --password", "--sign and --enc use your keys, but you are not logged in")
 	}
 	pair := cl.user.Pair()
-	if enc {
+	switch {
+	case enc && obf: // the scope's key: everyone with access reads it
+		var err error
+		if v, err = sea.Encrypt(v, cl.lastScope.key.ValueKey()); err != nil {
+			return nil, fmt.Errorf("could not encrypt: %w", err)
+		}
+	case enc:
 		to := userKeys{alias: "you", epub: pair.EPub}
 		if who := c.String("to"); who != "" {
 			var err error
@@ -150,6 +157,17 @@ func (cl *client) newOpener(ctx context.Context, c *ucli.Command, path string) (
 		return nil, fail("add --dec or --verify", "--from only works with --dec or --verify")
 	}
 	if !o.verify {
+		return o, nil
+	}
+	if s := cl.lastScope; cl.obf && s != nil {
+		// The owner is in the path; values are encrypted with the scope's key.
+		if c.IsSet("from") {
+			return nil, fail("drop --from: the scope's owner signed and encrypted it", "--from does not work with --obf")
+		}
+		o.pub, o.from, o.inside = s.owner.pub, strings.TrimPrefix(s.owner.alias, "~@"), true
+		if dec {
+			o.secret = s.key.ValueKey()
+		}
 		return o, nil
 	}
 	if dec && cl.user == nil {
