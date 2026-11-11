@@ -934,6 +934,14 @@ db := gundb.New(gundb.Options{RouteByInterest: true})
 
 A get it cannot answer then goes only to the peers it dialled (`Options.Peers`) and to the clients that asked for the same node; its own writes go to the peers it dialled and to the clients that asked for the nodes written, the way it always passes on clients' writes. Writes made offline by a client still reach the relay: clients offer their copy of what they read when they connect. `gundb server` works this way unless you pass `--ask-every-peer`.
 
+When bandwidth costs more than CPU, compress the WebSocket frames:
+
+```go
+db := gundb.New(gundb.Options{Compress: true})
+```
+
+Browsers and GUN.js on Node offer compression (permessage-deflate), so the relay compresses with every client that does; others connect as before. GUN's JSON shrinks to between a third and a tenth of its size, and each frame costs some CPU to compress. `gundb server --compress` does the same.
+
 ### One-way peers: read only, write only
 
 A peer in `Options.Peers` syncs both ways: this DB sends it every write and asks it for data. The `gundb_mode` query parameter in its URL makes it one way: `?gundb_mode=read` or `?gundb_mode=write` (`?gundb_mode=both`, or no parameter, is the default). `ReadFrom` and `WriteTo` add it for you:
@@ -2908,6 +2916,8 @@ The server asks only `--peers`, and the clients that asked for the same
 node, for data it does not have (see
 [a relay in front of many clients](#a-relay-in-front-of-many-clients));
 `--ask-every-peer` asks every connected client, like a GUN.js relay.
+`--compress` compresses frames with the clients that offer it (browsers
+do), for less bandwidth and some CPU.
 
 With `--max-nodes` or `--max-bytes`, every SEA user may keep that much in
 their space (`~/...`), and a write past it fails with `quota exceeded`

@@ -14,6 +14,7 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -38,6 +39,9 @@ const maxFrame = 64 << 20
 type Dialer struct {
 	// Options is passed to websocket.Dial (headers, HTTP client, ...).
 	Options *websocket.DialOptions
+	// Compress offers to compress frames (permessage-deflate, each frame
+	// on its own). The server decides; see AcceptOptions.Compress.
+	Compress bool
 }
 
 // Dial connects to addr. http:// and https:// URLs are dialled as ws:// and
@@ -50,7 +54,16 @@ func (d Dialer) Dial(ctx context.Context, addr string) (transport.Conn, error) {
 	case strings.HasPrefix(url, "https://"):
 		url = "wss://" + strings.TrimPrefix(url, "https://")
 	}
-	c, _, err := websocket.Dial(ctx, url, d.Options)
+	opts := d.Options
+	if d.Compress {
+		o := websocket.DialOptions{}
+		if opts != nil {
+			o = *opts
+		}
+		o.CompressionMode = websocket.CompressionNoContextTakeover
+		opts = &o
+	}
+	c, _, err := websocket.Dial(ctx, url, opts)
 	if err != nil {
 		return nil, fmt.Errorf("ws: dial %s: %w", addr, err)
 	}
@@ -62,7 +75,24 @@ func (d Dialer) Dial(ctx context.Context, addr string) (transport.Conn, error) {
 // allowed because GUN peers are cross-origin by design; call
 // websocket.Accept yourself and wrap it with NewConn to restrict that.
 func Accept(w http.ResponseWriter, r *http.Request) (transport.Conn, error) {
-	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	return AcceptWith(w, r, AcceptOptions{})
+}
+
+// AcceptOptions tunes AcceptWith.
+type AcceptOptions struct {
+	// Compress compresses frames (permessage-deflate, each frame on its
+	// own) with peers that offer it, as browsers and GUN.js on Node do.
+	// GUN's JSON shrinks to a third or less, for some CPU per frame.
+	Compress bool
+}
+
+// AcceptWith is Accept with options.
+func AcceptWith(w http.ResponseWriter, r *http.Request, o AcceptOptions) (transport.Conn, error) {
+	opts := &websocket.AcceptOptions{InsecureSkipVerify: true}
+	if o.Compress {
+		opts.CompressionMode = websocket.CompressionNoContextTakeover
+	}
+	c, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -91,14 +121,32 @@ func (c *Conn) Send(ctx context.Context, frame []byte) error {
 	return nil
 }
 
-// Recv reads the next frame.
+// Recv reads the next frame. It is read into a buffer reused across
+// frames, then copied once at its exact size, instead of growing a new
+// buffer frame after frame.
 func (c *Conn) Recv(ctx context.Context) ([]byte, error) {
-	_, data, err := c.ws.Read(ctx)
+	_, r, err := c.ws.Reader(ctx)
 	if err != nil {
 		return nil, closedOr(err)
 	}
-	return data, nil
+	buf := readBufs.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= maxPooled {
+			readBufs.Put(buf)
+		}
+	}()
+	buf.Reset()
+	if _, err := buf.ReadFrom(r); err != nil {
+		return nil, closedOr(err)
+	}
+	return bytes.Clone(buf.Bytes()), nil
 }
+
+// readBufs are the buffers Recv reads into; one larger than maxPooled is
+// let go, so one huge frame does not keep its memory.
+var readBufs = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+const maxPooled = 1 << 20
 
 // Ping sends a WebSocket ping and waits for the pong. It needs Recv to be
 // running at the same time, which is how gundb uses a Conn.

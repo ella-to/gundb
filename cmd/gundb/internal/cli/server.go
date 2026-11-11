@@ -88,6 +88,10 @@ the shell). Browsers connect with Gun(['http://localhost:8765/gun']).`,
 				Usage: "with --store pebble, skip the fsync after each write: faster, but a crash can lose the last writes",
 			},
 			&ucli.BoolFlag{
+				Name:  "compress",
+				Usage: "compress WebSocket frames with clients that offer it (browsers do): about a third of the bandwidth, for some CPU",
+			},
+			&ucli.BoolFlag{
 				Name:  "ask-every-peer",
 				Usage: "ask every connected client for data this server does not have, like a GUN.js relay; by default only --peers and the clients that asked for the same node are asked",
 			},
@@ -139,6 +143,7 @@ func (a *App) serve(ctx context.Context, c *ucli.Command) error {
 		// Clients (browsers, the gundb cli) keep no data others need:
 		// don't ask each of them for what the server does not have.
 		RouteByInterest: !c.Bool("ask-every-peer"),
+		Compress:        c.Bool("compress"),
 	})
 	defer db.Close()
 

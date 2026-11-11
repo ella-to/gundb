@@ -93,4 +93,10 @@ func benchSendRecv(b *testing.B, accept func(http.ResponseWriter, *http.Request)
 
 func BenchmarkSendRecv(b *testing.B) {
 	b.Run("default", func(b *testing.B) { benchSendRecv(b, ws.Accept, ws.Dialer{}) })
+	b.Run("deflate", func(b *testing.B) {
+		accept := func(w http.ResponseWriter, r *http.Request) (transport.Conn, error) {
+			return ws.AcceptWith(w, r, ws.AcceptOptions{Compress: true})
+		}
+		benchSendRecv(b, accept, ws.Dialer{Compress: true})
+	})
 }

@@ -109,6 +109,13 @@ type Options struct {
 	// others need, such as browsers: one read of a node nobody has then
 	// costs a message per upstream peer, not one per client.
 	RouteByInterest bool
+
+	// Compress compresses WebSocket frames (permessage-deflate) with the
+	// peers that connect to this DB and offer it, as browsers do, and offers
+	// it to the peers it dials with the default Dialer. GUN's JSON shrinks
+	// to about a third, for some CPU per frame: worth it when bandwidth
+	// costs more than CPU.
+	Compress bool
 }
 
 // PeerInfo describes one connection, for Options.OnConnect and
@@ -178,6 +185,7 @@ type DB struct {
 	quota        *quota // nil without Options.Quota
 
 	routeByInterest bool
+	compress        bool
 }
 
 // Errors returned by DB and Ref methods.
@@ -211,7 +219,7 @@ func New(opts ...Options) *DB {
 		o.Store = NewMemoryStore()
 	}
 	if o.Dialer == nil {
-		o.Dialer = ws.Dialer{}
+		o.Dialer = ws.Dialer{Compress: o.Compress}
 	}
 	if o.Wait <= 0 {
 		o.Wait = time.Second
@@ -252,6 +260,7 @@ func New(opts ...Options) *DB {
 		onDisconnect: o.OnDisconnect,
 
 		routeByInterest: o.RouteByInterest,
+		compress:        o.Compress,
 	}
 	if o.Quota != nil {
 		// Count what is already stored before any peer can write.
@@ -378,7 +387,7 @@ func (db *DB) Serve(ctx context.Context, l transport.Listener) error {
 // of the DB: refuse the request there, or store the session in the
 // request's context.
 func (db *DB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	conn, err := ws.Accept(w, r)
+	conn, err := ws.AcceptWith(w, r, ws.AcceptOptions{Compress: db.compress})
 	if err != nil {
 		db.log.Debug("gundb: websocket upgrade failed", "remote", r.RemoteAddr, "err", err)
 		return

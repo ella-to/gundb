@@ -217,6 +217,29 @@ func TestJSClientsWithGoRelay(t *testing.T) {
 	})
 }
 
+// GUN.js clients through a Go relay that compresses frames: the ws package
+// GUN.js uses on Node offers permessage-deflate, so it is negotiated.
+func TestJSClientsWithCompressingGoRelay(t *testing.T) {
+	requireNode(t)
+	ctx := t.Context()
+	relay := gundb.New(gundb.Options{Compress: true})
+	defer relay.Close()
+	srv := httptest.NewServer(relay)
+	defer srv.Close()
+	peer := srv.URL + "/gun"
+
+	long := strings.Repeat("compressible ", 200)
+	wait := startJS(t, peer, "watch", "chat", "msg", long)
+	time.Sleep(300 * time.Millisecond)
+	assertJSON(t, runJS(t, peer, "put", "chat", `{"msg":"`+long+`"}`), `{"ok":true}`)
+	assertJSON(t, wait(), `"`+long+`"`)
+	if msg, err := relay.Get("chat").Get("msg").Once[string](ctx); err != nil || msg != long {
+		t.Fatalf("relay has %d bytes, %v", len(msg), err)
+	}
+	relay.Get("mark").Put(ctx, Person{Name: "Mark", Pet: &Pet{Name: "Fluffy"}})
+	assertJSON(t, runJS(t, peer, "once", "mark", "pet", "name"), `"Fluffy"`)
+}
+
 // GUN.js browser clients logging in to a Go relay with write rules. The
 // token rides in the peer URL, as browsers cannot set WebSocket headers.
 func TestJSClientsWithAuthRelay(t *testing.T) {
