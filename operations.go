@@ -90,7 +90,8 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 		stale = len(pending) > 0
 	}
 
-	changed, later := graph{}, graph{}
+	changed = graph{}
+	var later graph // writes from the future, held: made when there is one
 	var wake float64
 	machine := db.state.Next()
 	var deltas []ownerDelta // with a quota: how this write changes each owner
@@ -116,6 +117,9 @@ func (db *DB) applyFrom(ctx context.Context, g graph, skip checked, enforce bool
 					late = append(late, fieldRef{soul, k, v, state, kind})
 				}
 				if r == hamDefer {
+					if later == nil {
+						later = graph{}
+					}
 					later.node(soul).Set(k, v, state)
 					wake = max(wake, state)
 					continue
@@ -283,6 +287,11 @@ func (db *DB) mayWin(ctx context.Context, g graph, sigs []fieldRef, machine floa
 // in g it links to. A reader that sees a new link then also finds the node
 // behind it, instead of a dangling link while the write is half applied.
 func childrenFirst(g graph) []string {
+	if len(g) == 1 { // nothing to order
+		for soul := range g {
+			return []string{soul}
+		}
+	}
 	order := make([]string, 0, len(g))
 	done := make(map[string]bool, len(g))
 	var visit func(soul string)
@@ -307,6 +316,9 @@ func childrenFirst(g graph) []string {
 // current returns the stored node a merge of in compares against: only the
 // fields in touches, if the store can read just those (FieldReader).
 func (db *DB) current(ctx context.Context, soul string, in *Node) (*Node, error) {
+	if ms, ok := db.store.(*memoryStore); ok { // the default
+		return ms.getFieldsOf(soul, in.Fields), nil
+	}
 	var cur *Node
 	var err error
 	if fr, ok := db.store.(FieldReader); ok { // PutFields writes only these back

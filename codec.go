@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"ella.to/gundb/internal/js"
 )
@@ -455,8 +457,12 @@ func (r *reader) build(g graph, soul string, obj map[string]any, state float64) 
 }
 
 // toTree turns any Go value into plain JSON data via encoding/json, so json
-// tags, omitempty and custom marshalers all apply. Numbers stay json.Number.
+// tags, omitempty and custom marshalers all apply. Numbers stay json.Number,
+// or float64 for values that were plain already (see plainTree).
 func toTree(v any) (any, error) {
+	if t, ok := plainTree(v, 0); ok {
+		return t, nil
+	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("gundb: %w", err)
@@ -470,10 +476,59 @@ func toTree(v any) (any, error) {
 	return out, nil
 }
 
+// plainTree returns v as toTree would, without encoding it, when it holds
+// only what JSON keeps as it is: valid UTF-8 strings, finite numbers,
+// bools, nil and maps of those. Numbers come back as float64. Anything else
+// (a struct, a *Ref, a slice, a json.Number, a float32, which encoding/json
+// writes at its own precision, a cycle) returns false, for toTree to
+// encode.
+func plainTree(v any, depth int) (any, bool) {
+	switch x := v.(type) {
+	case nil, bool:
+		return x, true
+	case string:
+		return x, utf8.ValidString(x) // encoding/json replaces invalid UTF-8
+	case float64:
+		return x, !math.IsNaN(x) && !math.IsInf(x, 0)
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case int32:
+		return float64(x), true
+	case uint:
+		return float64(x), true
+	case uint64:
+		return float64(x), true
+	case uint32:
+		return float64(x), true
+	case map[string]any:
+		if x == nil {
+			return nil, true
+		}
+		if depth > 100 {
+			return nil, false // perhaps a cycle: let encoding/json say
+		}
+		for k, e := range x {
+			if !utf8.ValidString(k) {
+				return nil, false
+			}
+			if _, ok := plainTree(e, depth+1); !ok {
+				return nil, false
+			}
+		}
+		return x, true // read only, never changed
+	}
+	return nil, false
+}
+
 func leaf(v any) (Value, error) {
 	switch x := v.(type) {
 	case nil:
 		return Null{}, nil
+	case float64, int, int64, int32, uint, uint64, uint32: // from plainTree
+		f, _ := plainTree(x, 0)
+		return Number(f.(float64)), nil
 	case bool:
 		return Bool(x), nil
 	case string:

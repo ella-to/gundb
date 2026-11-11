@@ -109,6 +109,24 @@ func (s *memoryStore) GetFields(_ context.Context, soul string, fields []string)
 	return n, nil
 }
 
+// getFieldsOf returns the stored fields of soul that fields names, for a
+// merge, without building a list of names first. Never nil.
+func (s *memoryStore) getFieldsOf(soul string, fields map[string]Value) *Node {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	stored := s.nodes[soul]
+	n := &Node{Soul: soul, Fields: make(map[string]Value, len(fields)), States: make(map[string]float64, len(fields))}
+	if stored == nil {
+		return n
+	}
+	for k := range fields {
+		if v, ok := stored.Fields[k]; ok {
+			n.Fields[k], n.States[k] = v, stored.States[k]
+		}
+	}
+	return n
+}
+
 // getField reads one field without copying the node, for reader.field.
 func (s *memoryStore) getField(soul, field string) Value {
 	s.mu.RLock()

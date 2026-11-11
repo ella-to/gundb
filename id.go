@@ -11,11 +11,21 @@ import (
 // ASCII order, so counters written in it sort like numbers.
 const idChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXZabcdefghijklmnopqrstuvwxyz"
 
-// randomID returns an n-character random string (message IDs use 9).
+// randomID returns an n-character random string (message IDs use 9). One
+// random 64-bit number gives 10 characters (61^10 < 2^64), so a message ID
+// costs one call to the generator, not nine.
 func randomID(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = idChars[rand.N(len(idChars))]
+	var stack [32]byte
+	b := stack[:0]
+	if n > len(stack) {
+		b = make([]byte, 0, n)
+	}
+	for len(b) < n {
+		r := rand.Uint64()
+		for range min(10, n-len(b)) {
+			b = append(b, idChars[r%uint64(len(idChars))])
+			r /= uint64(len(idChars))
+		}
 	}
 	return string(b)
 }

@@ -38,6 +38,9 @@ func ham(machine, incomingState, currentState float64, incoming, current Value) 
 	case incomingState > currentState:
 		return hamIncoming
 	}
+	if incoming == current { // the common tie: the same write again
+		return hamSame
+	}
 	switch c := jsCompare(lexical(incoming), lexical(current)); {
 	case c == 0:
 		return hamSame

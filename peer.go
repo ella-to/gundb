@@ -53,6 +53,10 @@ const (
 	maxBatch = 100
 )
 
+// maxKeptFrame is the largest batch buffer writeLoop keeps for the next
+// batch; a larger one is let go.
+const maxKeptFrame = 1 << 20
+
 // sendTimeout is how long sending one frame may take before the peer is
 // dropped.
 var sendTimeout = 30 * time.Second
@@ -219,6 +223,9 @@ func (p *peer) writeLoop() {
 	deadline := time.AfterFunc(sendTimeout, cancel)
 	deadline.Stop()
 	defer deadline.Stop()
+	// A batch is joined into one buffer, reused from frame to frame: Send
+	// does not keep the frame it is given.
+	var buf []byte
 	for {
 		var frame []byte
 		select {
@@ -234,11 +241,7 @@ func (p *peer) writeLoop() {
 			case 1:
 				frame = batch[0]
 			default:
-				size := len(batch) + 1 // brackets and commas
-				for _, raw := range batch {
-					size += len(raw)
-				}
-				frame = append(make([]byte, 0, size), '[')
+				frame = append(buf[:0], '[')
 				for i, raw := range batch {
 					if i > 0 {
 						frame = append(frame, ',')
@@ -246,6 +249,9 @@ func (p *peer) writeLoop() {
 					frame = append(frame, raw...)
 				}
 				frame = append(frame, ']')
+				if cap(frame) <= maxKeptFrame {
+					buf = frame
+				}
 			}
 		}
 		deadline.Reset(sendTimeout)

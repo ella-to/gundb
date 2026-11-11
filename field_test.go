@@ -18,7 +18,7 @@ func TestPathReadsFetchOneField(t *testing.T) {
 	if err := relay.Get("list").Put(ctx, fields); err != nil {
 		t.Fatal(err)
 	}
-	clear(relay.interest) // or the relay offers the client what it wrote
+	forget(relay) // or the relay offers the client what it wrote
 	client := newDB(t)
 	link(t, relay, client)
 
@@ -101,7 +101,7 @@ func TestLargeNodeInChunks(t *testing.T) {
 	if err := origin.Get("big").Put(ctx, fields); err != nil {
 		t.Fatal(err)
 	}
-	clear(origin.interest)
+	forget(origin)
 
 	direct := newDB(t)
 	link(t, origin, direct)
@@ -112,11 +112,19 @@ func TestLargeNodeInChunks(t *testing.T) {
 
 	relay := newDB(t)
 	link(t, origin, relay) // the relay dials origin
-	clear(relay.interest)
+	forget(relay)
 	client := newDB(t)
 	link(t, relay, client)
 	got, err = client.Get("big").Once[map[string]int](ctx)
 	if err != nil || len(got) != 2500 || got["k0"] != 0 {
 		t.Fatalf("read %d fields through a relay, %v", len(got), err)
 	}
+}
+
+// forget drops every interest of db, so it offers nothing to new peers.
+func forget(db *DB) {
+	db.interestMu.Lock()
+	defer db.interestMu.Unlock()
+	clear(db.interest)
+	clear(db.fieldInterest)
 }
