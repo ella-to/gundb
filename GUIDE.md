@@ -32,6 +32,7 @@ go get ella.to/gundb   # needs Go 1.27+
 - [9. Users and encryption (SEA)](#9-users-and-encryption-sea)
   - [Encrypted group chat with a shared key](#encrypted-group-chat-with-a-shared-key)
   - [Encrypted group chat with sender keys (a ratchet)](#encrypted-group-chat-with-sender-keys-a-ratchet)
+  - [Hide the names: sealed scopes](#hide-the-names-sealed-scopes)
 - [10. Browser + Go chat](#10-browser--go-chat)
 - [11. Persist to disk](#11-persist-to-disk)
 - [12. Read history](#12-read-history)
@@ -44,6 +45,7 @@ go get ella.to/gundb   # needs Go 1.27+
   - [Sign](#sign)
   - [Encrypt for yourself: a vault](#encrypt-for-yourself-a-vault)
   - [Share a secret with one person](#share-a-secret-with-one-person)
+  - [Hide the names too: --obf](#hide-the-names-too---obf)
   - [Encrypted group chat](#encrypted-group-chat)
   - [See the graph live](#see-the-graph-live)
   - [Write your own client](#write-your-own-client)
@@ -2604,6 +2606,124 @@ Things to know:
   aren't unique. Compare keys out of band (a safety number or QR code) before
   you trust a member.
 
+### Hide the names: sealed scopes
+
+Encryption hides values, not names. A relay sees every soul and field it stores: `~<pub>/vault/accounts/main`, `bank`, `pin`, and when each was written. When the names say too much, seal them: a *sealed scope* stores tokens in their place, which mean nothing without the scope's key and cannot be guessed, while whoever holds the key reads and writes with the real names.
+
+<!-- example: examples/obfuscate/main.go -->
+```go
+// Hide the names, not only the values: a sealed scope stores tokens the
+// relay cannot read or guess, and the key that reads them is shared with
+// whoever you choose.
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+
+	"ella.to/gundb"
+	"ella.to/gundb/sea"
+	"ella.to/gundb/sea/pathmap"
+)
+
+type Account struct {
+	Bank string `json:"bank"` // encrypted with the scope's key
+	PIN  string `json:"pin"`
+}
+
+func main() {
+	ctx := context.Background()
+	relay := gundb.New()
+	defer relay.Close()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	check(err)
+	go http.Serve(l, relay)
+	url := "ws://" + l.Addr().String() + "/gun"
+	alices := gundb.New(gundb.Options{Peers: []string{url}})
+	bobs := gundb.New(gundb.Options{Peers: []string{url}})
+	defer alices.Close()
+	defer bobs.Close()
+
+	alice, err := alices.CreateUser(ctx, "alice", "alice's password")
+	check(err)
+	bob, err := bobs.CreateUser(ctx, "bob", "bob's password")
+	check(err)
+
+	// Alice makes a scope: a key, and a root in her space that nothing
+	// links to.
+	key, err := pathmap.NewKey()
+	check(err)
+	root, err := pathmap.NewRoot(alice.Pub())
+	check(err)
+	vault := alice.Soul(root).Sealed(key) // signed by alice, names sealed
+
+	bank, err := sea.Encrypt("IBAN DE89 3704 0044", key.ValueKey())
+	check(err)
+	check(vault.Get("accounts").Get("main").PutAck(ctx, Account{Bank: bank, PIN: "unset"}))
+
+	// She gives bob a grant: the key and the root, encrypted with the
+	// secret only the two of them share, under a field only they can name.
+	secret, err := sea.Secret(bob.Pair().EPub, alice.Pair())
+	check(err)
+	grant, err := pathmap.SealGrant(pathmap.Grant{Key: key.Bytes(), Root: root, Label: "vault", Epoch: 1}, secret)
+	check(err)
+	grants := alice.Soul(pathmap.GrantsNode(alice.Pub()))
+	check(grants.Get(pathmap.GrantField(secret, "vault")).PutAck(ctx, grant))
+
+	// What the relay holds: tokens, and a link to a node named by tokens.
+	stored, err := relay.Get(root).Node(ctx)
+	check(err)
+	for field, v := range stored.Fields {
+		if l, ok := v.(gundb.Link); ok {
+			fmt.Printf("relay: %s links to %s\n", field, l.Soul)
+		}
+	}
+
+	// Bob works out the same field, opens his grant, and reads with the
+	// real names.
+	shared, err := sea.Secret(alice.Pair().EPub, bob.Pair())
+	check(err)
+	sealed, err := bobs.Get(pathmap.GrantsNode(alice.Pub())).Get(pathmap.GrantField(shared, "vault")).Once[string](ctx)
+	check(err)
+	g, err := pathmap.OpenGrant(sealed, shared)
+	check(err)
+	bobsKey, err := pathmap.KeyFrom(g.Key)
+	check(err)
+	acct, err := bobs.Get(g.Root).Sealed(bobsKey).Get("accounts").Get("main").Once[Account](ctx)
+	check(err)
+	iban, err := sea.Decrypt(acct.Bank, bobsKey.ValueKey())
+	check(err)
+	fmt.Println("bob reads accounts/main:", string(iban), "pin", acct.PIN)
+}
+
+func check(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+```
+relay: i0J8zPj3_vTDd3KEk31B4JRMu7rGVUKERdyU0HYsviM links to ~9xXw…83c/cUbcXZTNQoNJr_y7zJqqZg/i0J8zPj3_vTDd3KEk31B4JRMu7rGVUKERdyU0HYsviM
+bob reads accounts/main: "IBAN DE89 3704 0044" pin unset
+```
+
+- **`Ref.Sealed(key)`** seals every key below the ref, wherever it meets a soul: following a path, `Put` and `Set`, and the souls of the child nodes a `Put` creates, which are named after the sealed keys. `Once`, `On`, `Map().On`, `Node` and `Links` give the real names back. `*pathmap.Key` is the sealer; any `gundb.KeyCodec` works.
+- **A token is deterministic and bound to its node.** Two devices that write `bank` offline write the same field, and HAM merges them as usual; `title` in two nodes gives two unrelated tokens, so a relay cannot count how often a name is used. Names are padded, which hides their length up to 16 bytes.
+- **`User.Soul(root)`** is a ref to a node in the user's space, signed by the user, that nothing links to: `~alice` does not list the scope. `pathmap.NewRoot` picks a random root.
+- **The key is the map.** There is no table of names to store or keep in sync: whoever has the key turns any name into its token and back. Share it with a **grant**, encrypted with the secret two users share (`sea.Secret`), under a field only those two can work out (`pathmap.GrantField`): bob finds his with one read, and the relay learns neither the scope's name nor who has access.
+- **Values are still values.** Encrypt them with `key.ValueKey()`, so everyone with the key reads them.
+
+Things to know:
+
+- **What stays visible:** whose space it is (`~<pub>/` stays in every soul, so peers can check signatures), how many nodes and fields there are, when they were written, the sizes of values, and which nodes link to which.
+- **Revoking is a new key.** Someone who had the key keeps it: to cut them off, copy the data to a new root under a new key and grant it only to the others (`gundb put --obf --rotate` does it). What they could read before, they could have kept, and a relay with history keeps the old tokens and values.
+- **Features that read names see tokens:** LEX queries by prefix and `CanRead`/`CanWrite` rules written against field names. GUN.js and `gundb visual` show tokens.
+- **Lose the key, lose the names**, and the values encrypted with it. The CLI keeps the owner's own grant in their space, encrypted for them, so their password is the backup.
+
 ## 10. Browser + Go chat
 
 A Go bot and browsers running GUN.js share one chat room. Open http://localhost:8765 in two tabs. The page is [`examples/chat/index.html`](examples/chat/index.html).
@@ -3085,6 +3205,83 @@ error: cannot decrypt ~@alice/shared/bob/wifi with the key you share with alice
 To take it back, delete it: `gundb put '~/shared/bob/wifi' null`. Bob may
 have kept a copy, as with any secret you share.
 
+### Hide the names too: --obf
+
+`--enc` hides values; the server still sees the path, `~alice/vault/bank`. An
+*obfuscated scope* hides the names as well: with `--obf`, the path you type is
+the real one, and the client stores tokens in its place (see
+[sealed scopes](#hide-the-names-sealed-scopes) for how). The first write to a
+scope of yours creates it:
+
+```sh
+$ gundb put '~/vault/bank' 'IBAN DE89 3704 0044' --obf --enc -u alice -p alice-secret
+ok  ~/vault/bank = (encrypted)
+
+$ gundb put '~/vault/pin' 4711 --obf --enc -u alice -p alice-secret
+ok  ~/vault/pin = (encrypted)
+
+$ gundb get '~/vault' --obf --dec -u alice -p alice-secret
+{
+  "bank": "IBAN DE89 3704 0044",
+  "pin": 4711
+}
+```
+
+With `--obf`, `--enc` and `--dec` use the scope's own key, so everyone you
+share the scope with reads the values too. What the server holds is a node no
+other node links to, named and filled with tokens. `--links` shows the map:
+
+```sh
+$ gundb get '~/vault' --obf --links -u alice -p alice-secret
+{
+  "_": { "#": "~7DOi…YHU/-2-RpWhCzf3hd8ifb1DXSA" },
+  "bank": { "field": "Rgr9D6sEm9BLm7TlPnHn-5BG4dPVENak4qD9BJWdY6E", "value": "SEA{\"ct\":…}" },
+  "pin":  { "field": "3emY0FzEl4qfVFgMxKF3PHSX3BGcDONBaaZZda1Ck1c", "value": "SEA{\"ct\":…}" }
+}
+
+$ gundb get '~' --obf -u alice -p alice-secret          # your scopes
+{ "vault": { "readers": [], "soul": "~7DOi…YHU/-2-RpWhCzf3hd8ifb1DXSA" } }
+```
+
+Nobody else can read it until you share it (the server does see that it is
+in your space). `--to` gives users access (comma-separated); they name it from
+your space:
+
+```sh
+$ gundb get '~@alice/vault' --obf --dec -u bob -p bob-secret
+error: you have no access to an obfuscated ~@alice/vault
+hint:  ask alice to share it: gundb put '~/vault' --obf --to <you>
+
+$ gundb put '~/vault' --obf --to bob -u alice -p alice-secret
+ok  bob can read ~/vault; they name it ~@alice/vault with --obf
+
+$ gundb get '~@alice/vault/bank' --obf --dec -u bob -p bob-secret
+"IBAN DE89 3704 0044"
+```
+
+To take access back, give the scope a new key: `--rotate` copies everything to
+a new root, encrypted again, clears the old one, and keeps only the readers
+named with `--to`:
+
+```sh
+$ gundb put '~/vault' --obf --rotate --to carol -u alice -p alice-secret
+ok  rotated ~/vault: new key and root, 1 node(s) cleared from the old one; 1 reader(s) kept; dropped bob
+
+$ gundb get '~@alice/vault/bank' --obf --dec -u bob -p bob-secret
+error: you have no access to an obfuscated ~@alice/vault
+```
+
+Forgetting `--obf` cannot leak the names: a write to one of your scopes without
+it is refused.
+
+```sh
+$ gundb put '~/vault/note' hi -u alice -p alice-secret
+error: ~/vault is obfuscated: without --obf its names would be stored in clear
+hint:  run it again with --obf
+```
+
+`set`, `unset` and `sub` take `--obf` too.
+
 ### Encrypted group chat
 
 For more than two people, `gundb group` runs a group chat with sender keys,
@@ -3171,9 +3368,11 @@ error: this device has no group keys for bob
 
 ### Things to know
 
-- **Paths are not secret.** `--enc` hides values, not keys: the relay sees
-  `~alice/vault/bank`, and when it was written. Use dull key names
-  (`~/vault/1`) when the name says too much.
+- **Paths are not secret without `--obf`.** `--enc` hides values, not keys:
+  the relay sees `~alice/vault/bank`, and when it was written. Put the data
+  in an [obfuscated scope](#hide-the-names-too---obf) when the names say too
+  much. Even then the relay sees whose space it is, how many nodes there are
+  and when they were written.
 - **A relay with `--store pebble` keeps every version.** Encrypted values
   stay encrypted in its history, but deleting a secret doesn't remove the
   old ciphertext from the relay's disk.

@@ -30,21 +30,22 @@ underneath, see [GUIDE.md](GUIDE.md), section 14 for the CLI.
   - [14. Share a secret with one person](#14-share-a-secret-with-one-person)
   - [15. Private messages: encrypted and signed](#15-private-messages-encrypted-and-signed)
   - [16. Watch your encrypted notes live](#16-watch-your-encrypted-notes-live)
+  - [17. Hide the names too](#17-hide-the-names-too)
 - **Part 3: Group chat**
-  - [17. Set up each person's device](#17-set-up-each-persons-device)
-  - [18. Create a group and invite two people](#18-create-a-group-and-invite-two-people)
-  - [19. Talk](#19-talk)
-  - [20. Live chat](#20-live-chat)
-  - [21. Someone joins late](#21-someone-joins-late)
-  - [22. Remove a member](#22-remove-a-member)
-  - [23. A new device, without the keys](#23-a-new-device-without-the-keys)
+  - [18. Set up each person's device](#18-set-up-each-persons-device)
+  - [19. Create a group and invite two people](#19-create-a-group-and-invite-two-people)
+  - [20. Talk](#20-talk)
+  - [21. Live chat](#21-live-chat)
+  - [22. Someone joins late](#22-someone-joins-late)
+  - [23. Remove a member](#23-remove-a-member)
+  - [24. A new device, without the keys](#24-a-new-device-without-the-keys)
 - **Part 4: Running servers**
-  - [24. Keep data on disk](#24-keep-data-on-disk)
-  - [25. Two relays in sync](#25-two-relays-in-sync)
-  - [26. A read replica](#26-a-read-replica)
-  - [27. A write-only backup](#27-a-write-only-backup)
-  - [28. Quotas](#28-quotas)
-  - [29. See the graph](#29-see-the-graph)
+  - [25. Keep data on disk](#25-keep-data-on-disk)
+  - [26. Two relays in sync](#26-two-relays-in-sync)
+  - [27. A read replica](#27-a-read-replica)
+  - [28. A write-only backup](#28-a-write-only-backup)
+  - [29. Quotas](#29-quotas)
+  - [30. See the graph](#30-see-the-graph)
 - [When something goes wrong](#when-something-goes-wrong)
 - [Start over](#start-over)
 
@@ -84,7 +85,7 @@ Two habits that save trouble:
   is an extra argument.
 
 Optionally, open **terminal 3** with `gundb visual` (see
-[29](#29-see-the-graph)) and watch the graph change as you go.
+[29](#30-see-the-graph)) and watch the graph change as you go.
 
 ---
 
@@ -743,6 +744,65 @@ because it holds alice's keys.
 
 ---
 
+## 17. Hide the names too
+
+In [13](#13-a-private-vault) the values were secret, but the server still saw
+`vault/bank` and `vault/pin`. An obfuscated scope hides the names as well:
+with `--obf` you type the real path, and the server stores tokens.
+
+```sh
+$ gundb put '~/safe/bank' 'IBAN DE89 3704 0044' --obf --enc -u alice -p alice-secret
+ok  ~/safe/bank = (encrypted)
+
+$ gundb put '~/safe/pin' 4711 --obf --enc -u alice -p alice-secret
+ok  ~/safe/pin = (encrypted)
+
+$ gundb get '~/safe' --obf --dec -u alice -p alice-secret
+{
+  "bank": "IBAN DE89 3704 0044",
+  "pin": 4711
+}
+```
+
+See what the server keeps: one node, which nothing links to, with fields
+named by tokens.
+
+```sh
+$ gundb get '~/safe' --obf --links -u alice -p alice-secret
+{
+  "_": { "#": "~7DOi…YHU/-2-RpWhCzf3hd8ifb1DXSA" },
+  "bank": { "field": "Rgr9D6sEm9BLm7TlPnHn-5BG4dPVENak4qD9BJWdY6E", "value": "SEA{…}" },
+  "pin": { "field": "3emY0FzEl4qfVFgMxKF3PHSX3BGcDONBaaZZda1Ck1c", "value": "SEA{…}" }
+}
+
+$ gundb get '~@alice' -u bob -p bob-secret      # alice's node does not mention it
+```
+
+Share it with bob, then take it back with a new key:
+
+```sh
+$ gundb get '~@alice/safe' --obf --dec -u bob -p bob-secret
+error: you have no access to an obfuscated ~@alice/safe
+hint:  ask alice to share it: gundb put '~/safe' --obf --to <you>
+
+$ gundb put '~/safe' --obf --to bob -u alice -p alice-secret
+ok  bob can read ~/safe; they name it ~@alice/safe with --obf
+
+$ gundb get '~@alice/safe/pin' --obf --dec -u bob -p bob-secret
+4711
+
+$ gundb put '~/safe' --obf --rotate -u alice -p alice-secret
+ok  rotated ~/safe: new key and root, 1 node(s) cleared from the old one; dropped bob
+
+$ gundb get '~@alice/safe/pin' --obf --dec -u bob -p bob-secret
+error: you have no access to an obfuscated ~@alice/safe
+```
+
+**Check:** `gundb put '~/safe/note' hi -u alice -p alice-secret`, without
+`--obf`, fails with `~/safe is obfuscated`: a forgotten flag cannot store the
+names in clear. `gundb get '~' --obf -u alice -p alice-secret` lists your
+scopes.
+
 # Part 3: Group chat
 
 `gundb group` is an end-to-end encrypted group chat with sender keys, the
@@ -754,7 +814,7 @@ In real life each person runs these commands on their own machine. Here
 all three share one machine, which works: the device directory keeps one
 file per user and server.
 
-## 17. Set up each person's device
+## 18. Set up each person's device
 
 Each person runs `init` once per device. Until they do, they can't create
 groups or be added to one:
@@ -774,7 +834,7 @@ $ gundb group init -u carol -p carol-secret
 ok  carol can now create and join groups (keys in /tmp/gundb-scenarios/localhost_8765/carol.json)
 ```
 
-## 18. Create a group and invite two people
+## 19. Create a group and invite two people
 
 Alice creates `team` and adds bob and carol. She calls it `team`; everyone
 else calls it `alice/team`.
@@ -792,7 +852,7 @@ bob
 carol
 ```
 
-## 19. Talk
+## 20. Talk
 
 ```sh
 $ gundb group send team 'welcome to the team chat!' -u alice -p alice-secret
@@ -837,7 +897,7 @@ is deleted after use. `read` still shows the whole conversation because
 each device keeps what it already read, in its device file. Run `read`
 twice and compare: same history, no network secrets reused.
 
-## 20. Live chat
+## 21. Live chat
 
 `group sub` prints the conversation so far, then each message as it
 arrives. Carol keeps it open in terminal 3:
@@ -860,7 +920,7 @@ $ gundb group send team 'yes, shipping now' -u alice -p alice-secret
 2026-11-06 07:27  alice: yes, shipping now
 ```
 
-## 21. Someone joins late
+## 22. Someone joins late
 
 Dave joins after the conversation started. He reads from the moment he
 joined, never the history.
@@ -896,7 +956,7 @@ $ gundb group read alice/team -u dave -p dave-secret
 
 **Check:** nothing from before `welcome dave!` ever shows up for dave.
 
-## 22. Remove a member
+## 23. Remove a member
 
 Alice removes carol. Everyone's next message goes out on a new chain whose
 key carol never gets.
@@ -931,7 +991,7 @@ error: you can't add yourself
 hint:  you own it
 ```
 
-## 23. A new device, without the keys
+## 24. A new device, without the keys
 
 Group keys never leave the device. Bob's password alone, on a new laptop
 (a fresh `--dir`), opens nothing:
@@ -954,7 +1014,7 @@ and he reads from then on.
 
 Stop the server in terminal 1 (Ctrl-C) before these; each starts its own.
 
-## 24. Keep data on disk
+## 25. Keep data on disk
 
 `--store pebble` keeps everything on disk, every version included.
 
@@ -988,7 +1048,7 @@ error: cannot open the data directory ./data: pebblestore: resource temporarily 
 hint:  is another gundb server using it? each server needs its own --data
 ```
 
-## 25. Two relays in sync
+## 26. Two relays in sync
 
 Relays sync with `--peers`. Start two:
 
@@ -1026,7 +1086,7 @@ Only the side that dials (the one with `--peers`) keeps writes for a
 peer that's away; give each relay `--peers` pointing at the other if
 either may go down.
 
-## 26. A read replica
+## 27. A read replica
 
 `?gundb_mode=read` on a URL in `--peers` follows that server without ever
 writing to it.
@@ -1087,7 +1147,7 @@ client writes on it too: in Go, `CanWrite` returning `false` (see
 GUIDE.md, "One-way peers"). The primary, for its part, gets nothing from
 the replica: its gets to the replica are answered "not found".
 
-## 27. A write-only backup
+## 28. A write-only backup
 
 `?gundb_mode=write` sends every write to a server and never takes anything
 from it. Here, a backup that keeps everything on disk. Even a restored
@@ -1153,7 +1213,7 @@ error: bad --peers: peer "http://localhost:8766/gun?gundb_mode=reed": gundb_mode
 hint:  add ?gundb_mode=read to only read from a peer, ?gundb_mode=write to only write to it, or leave it out for both ways
 ```
 
-## 28. Quotas
+## 29. Quotas
 
 `--max-nodes` and `--max-bytes` give every SEA user the same quota for
 their space. A tiny one, to hit it quickly:
@@ -1214,7 +1274,7 @@ GUIDE.md: "Quotas: plans and usage" and "Billing with quotas".
 
 Unset the variables when you're done: `unset GUNDB_USERNAME GUNDB_PASSWORD`.
 
-## 29. See the graph
+## 30. See the graph
 
 `gundb visual` opens a page in your browser that draws everything on the
 server as a live graph:
