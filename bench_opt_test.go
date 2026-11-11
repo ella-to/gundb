@@ -24,7 +24,7 @@ func benchPeer(b *testing.B, db *DB, register bool) *peer {
 	go p.writeLoop()
 	if register {
 		db.peersMu.Lock()
-		db.peers[p] = struct{}{}
+		db.addPeerLocked(p)
 		db.peersMu.Unlock()
 	}
 	return p

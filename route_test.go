@@ -2,6 +2,7 @@ package gundb
 
 import (
 	"context"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -17,12 +18,12 @@ func routePeer(t *testing.T, db *DB, dialled bool) (*peer, *fakeConn) {
 	p := &peer{db: db, conn: conn, ctx: ctx, cancel: cancel, id: randomID(16), outWake: make(chan struct{}, 1), wants: map[string]bool{}}
 	go p.writeLoop()
 	db.peersMu.Lock()
-	db.peers[p] = struct{}{}
 	if dialled {
 		o := &outbound{url: "ws://upstream", mode: PeerBoth, live: p}
 		p.origin = o
 		db.outbound = append(db.outbound, o)
 	}
+	db.addPeerLocked(p)
 	db.peersMu.Unlock()
 	return p, conn
 }
@@ -113,4 +114,29 @@ func TestRelayGetAsksEveryPeerByDefault(t *testing.T) {
 	if len(db.pending) != 0 {
 		t.Fatalf("%d requests still pending", len(db.pending))
 	}
+}
+
+// The counts of peers we read from and write to follow one-way peers as
+// they come and go.
+func TestPeerCounts(t *testing.T) {
+	db := newDB(t)
+	a, b := newDB(t), newDB(t)
+	srvA, srvB := httptest.NewServer(a), httptest.NewServer(b)
+	db.Connect(ReadFrom(srvA.URL + "/gun"))
+	db.Connect(WriteTo(srvB.URL + "/gun"))
+	counts := func() (int, int, int) {
+		db.peersMu.Lock()
+		defer db.peersMu.Unlock()
+		return db.reading, db.writing, len(db.peers)
+	}
+	eventually(t, func() bool { r, w, n := counts(); return r == 1 && w == 1 && n == 2 })
+	if db.alone(PeerRead) || db.alone(PeerWrite) {
+		t.Fatal("alone with peers both ways")
+	}
+	srvA.Close()
+	a.Close() // closes its connections, which the server no longer tracks
+	eventually(t, func() bool { r, w, n := counts(); return r == 0 && w == 1 && n == 1 })
+	srvB.Close()
+	b.Close()
+	eventually(t, func() bool { r, w, n := counts(); return r == 0 && w == 0 && n == 0 })
 }

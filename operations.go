@@ -397,10 +397,8 @@ func (db *DB) write(ctx context.Context, g graph, ack bool, signed checked) erro
 func (db *DB) alone(way PeerMode) bool {
 	db.peersMu.Lock()
 	defer db.peersMu.Unlock()
-	for p := range db.peers {
-		if p.flows(way) {
-			return false
-		}
+	if db.flowingLocked(way) > 0 {
+		return false
 	}
 	for _, o := range db.outbound {
 		if o.flows(way) {

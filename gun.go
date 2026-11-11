@@ -151,6 +151,8 @@ type DB struct {
 
 	peersMu  sync.Mutex
 	peers    map[*peer]struct{}
+	reading  int // connected peers we read from
+	writing  int // connected peers we write to
 	outbound []*outbound
 	changed  chan struct{} // closed and replaced whenever connectivity changes
 
@@ -391,18 +393,25 @@ func (db *DB) signalLocked() {
 	db.changed = make(chan struct{})
 }
 
+// flowingLocked returns how many connected peers take part in way.
+// Callers hold peersMu.
+func (db *DB) flowingLocked(way PeerMode) int {
+	switch way {
+	case PeerRead:
+		return db.reading
+	case PeerWrite:
+		return db.writing
+	}
+	return len(db.peers)
+}
+
 // connected waits until at least one peer is connected. It returns false
 // straight away when there is no peer to wait for, i.e. nothing connected
 // and no configured peer still on its first dial attempt.
 func (db *DB) connected(ctx context.Context, way PeerMode) bool {
 	for {
 		db.peersMu.Lock()
-		n, ch := 0, db.changed
-		for p := range db.peers {
-			if p.flows(way) {
-				n++
-			}
-		}
+		n, ch := db.flowingLocked(way), db.changed
 		trying := false
 		for _, o := range db.outbound {
 			trying = trying || (o.trying && o.flows(way))

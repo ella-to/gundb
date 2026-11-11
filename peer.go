@@ -76,7 +76,7 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 		conn.Close()
 		return
 	}
-	db.peers[p] = struct{}{}
+	db.addPeerLocked(p)
 	var queued [][]byte
 	if o != nil {
 		o.live, o.trying, queued, o.queue = p, false, o.queue, nil
@@ -112,7 +112,7 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 		db.interestMu.Unlock()
 	}
 	db.peersMu.Lock()
-	delete(db.peers, p)
+	db.removePeerLocked(p)
 	if o != nil && o.live == p {
 		o.live = nil
 	}
@@ -123,6 +123,31 @@ func (db *DB) run(rules context.Context, conn transport.Conn, o *outbound) {
 	db.log.Debug("gundb: peer disconnected", "peer", conn.RemoteAddr())
 	if db.onDisconnect != nil {
 		db.onDisconnect(p.rules, p.info())
+	}
+}
+
+// addPeerLocked and removePeerLocked keep db.peers and its counts.
+// Callers hold peersMu.
+func (db *DB) addPeerLocked(p *peer) {
+	db.peers[p] = struct{}{}
+	if p.reads() {
+		db.reading++
+	}
+	if p.writes() {
+		db.writing++
+	}
+}
+
+func (db *DB) removePeerLocked(p *peer) {
+	if _, ok := db.peers[p]; !ok {
+		return
+	}
+	delete(db.peers, p)
+	if p.reads() {
+		db.reading--
+	}
+	if p.writes() {
+		db.writing--
 	}
 }
 
