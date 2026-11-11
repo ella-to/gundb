@@ -169,6 +169,12 @@ func (u *User) Root() *Ref { return &Ref{db: u.db, path: []string{"~" + u.pair.P
 // gun.user().get(key) in JS. Puts through it are signed by the user.
 func (u *User) Get(key string) *Ref { return u.Root().Get(key) }
 
+// Soul returns a ref to the node soul, which must be in the user's space
+// ("~"+Pub+"/..."), signed by the user like Root. Unlike u.Get(key), nothing
+// links to it: it is found only by those who know its soul, such as the
+// root of a sealed scope (see Ref.Sealed).
+func (u *User) Soul(soul string) *Ref { return &Ref{db: u.db, path: []string{soul}, user: u} }
+
 // sign replaces every value in g that belongs to the user's space with a
 // SEA signature over it, and returns which fields it signed: they need no
 // check when the write is applied. Nodes outside the user's space are left

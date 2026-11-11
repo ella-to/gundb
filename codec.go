@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"reflect"
 	"slices"
@@ -45,6 +44,28 @@ type reader struct {
 	// links written as links because of the path they were reached by.
 	tree *treeCache
 	cuts int
+
+	codec KeyCodec // seals the keys read and written; nil for plain names
+}
+
+// seal returns the field name stands for in soul.
+func (r *reader) seal(soul, name string) string {
+	if r.codec == nil {
+		return name
+	}
+	return r.codec.Seal(soul, name)
+}
+
+// open returns the name field of soul stands for: the field itself if it
+// is not sealed.
+func (r *reader) open(soul, field string) string {
+	if r.codec == nil {
+		return field
+	}
+	if name, ok := r.codec.Open(soul, field); ok {
+		return name
+	}
+	return field
 }
 
 func (r *reader) node(soul string) (*Node, error) {
@@ -96,7 +117,7 @@ func (r *reader) at(path []string) (Value, error) {
 			return nil, nil
 		}
 		var err error
-		if v, err = r.field(l.Soul, key); err != nil || v == nil {
+		if v, err = r.field(l.Soul, r.seal(l.Soul, key)); err != nil || v == nil {
 			return nil, err
 		}
 	}
@@ -145,8 +166,8 @@ func (r *reader) objectJSON(b []byte, soul string, path map[string]bool) ([]byte
 	defer delete(path, soul)
 	b = append(b, '{')
 	first := true
-	for _, k := range slices.Sorted(maps.Keys(n.Fields)) {
-		v := n.Fields[k]
+	for _, f := range r.sortedFields(n) {
+		k, v := f.name, n.Fields[f.field]
 		if _, deleted := v.(Null); deleted {
 			continue
 		}
@@ -179,6 +200,19 @@ func (r *reader) objectJSON(b []byte, soul string, path map[string]bool) ([]byte
 		cache.put(soul, b[start:], children)
 	}
 	return b, true, nil
+}
+
+// namedField is a field of a node and the name it stands for.
+type namedField struct{ name, field string }
+
+// sortedFields returns the fields of n sorted by the names they stand for.
+func (r *reader) sortedFields(n *Node) []namedField {
+	out := make([]namedField, 0, len(n.Fields))
+	for k := range n.Fields {
+		out = append(out, namedField{r.open(n.Soul, k), k})
+	}
+	slices.SortFunc(out, func(a, b namedField) int { return strings.Compare(a.name, b.name) })
+	return out
 }
 
 // treeCache keeps, for one Ref.On subscription, the JSON objectJSON wrote
@@ -282,13 +316,19 @@ func appendPlain(b []byte, v Value) []byte {
 func (r *reader) soulOf(path []string) string {
 	soul := path[0]
 	for i, key := range path[1:] {
-		if v, _ := r.field(soul, key); v != nil {
+		if v, _ := r.field(soul, r.seal(soul, key)); v != nil {
 			if l, ok := v.(Link); ok {
 				soul = l.Soul
 				continue
 			}
 		}
-		return soul + "/" + strings.Join(path[i+1:], "/")
+		if r.codec == nil {
+			return soul + "/" + strings.Join(path[i+1:], "/")
+		}
+		for _, k := range path[i+1:] { // each child is named after its sealed key
+			soul += "/" + r.seal(soul, k)
+		}
+		return soul
 	}
 	return soul
 }
@@ -310,7 +350,7 @@ func fetchRefs(ctx context.Context, v any) {
 	var wg sync.WaitGroup
 	refsIn(reflect.ValueOf(v), 0, func(r *Ref) {
 		if len(r.path) > 1 { // a root ref's soul is its key
-			wg.Go(func() { (&reader{db: r.db, ctx: ctx, net: true}).soulOf(r.path) })
+			wg.Go(func() { r.reader(ctx, true).soulOf(r.path) })
 		}
 	})
 	wg.Wait()
@@ -412,16 +452,17 @@ func (r *reader) build(g graph, soul string, obj map[string]any, state float64) 
 			continue
 		}
 		m, isObj := v.(map[string]any)
+		sk := r.seal(soul, k)
 		if !isObj {
 			val, err := leaf(v)
 			if err != nil {
 				return fmt.Errorf("gundb: %s.%s: %w", soul, k, err)
 			}
-			n.Set(k, val, state)
+			n.Set(sk, val, state)
 			continue
 		}
 		if s, ok := linkOf(m); ok {
-			n.Set(k, Link{Soul: s}, state)
+			n.Set(sk, Link{Soul: s}, state)
 			continue
 		}
 		child := metaSoul(m)
@@ -429,13 +470,13 @@ func (r *reader) build(g graph, soul string, obj map[string]any, state float64) 
 			var old Value
 			var err error
 			if reads++; reads <= maxFieldReads {
-				old, err = r.field(soul, k)
+				old, err = r.field(soul, sk)
 			} else {
 				if reads == maxFieldReads+1 {
 					cur, err = r.node(soul)
 				}
 				if cur != nil {
-					old = cur.Fields[k]
+					old = cur.Fields[sk]
 				}
 			}
 			if err != nil {
@@ -446,9 +487,9 @@ func (r *reader) build(g graph, soul string, obj map[string]any, state float64) 
 			}
 		}
 		if child == "" {
-			child = soul + "/" + k
+			child = soul + "/" + sk
 		}
-		n.Set(k, Link{Soul: child}, state)
+		n.Set(sk, Link{Soul: child}, state)
 		if err := r.build(g, child, m, state); err != nil {
 			return err
 		}

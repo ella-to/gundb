@@ -133,7 +133,7 @@ func (w *mapWatch) update(rd *reader) []mapChange {
 			continue
 		}
 		w.last[k] = b
-		out = append(out, mapChange{k, b})
+		out = append(out, mapChange{rd.open(w.list, k), b})
 	}
 	return out
 }

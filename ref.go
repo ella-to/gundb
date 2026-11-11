@@ -16,14 +16,45 @@ import (
 // Creating a Ref does no work; methods read and write. A Ref is safe for
 // concurrent use.
 type Ref struct {
-	db   *DB
-	path []string
-	user *User // signs writes into the user's space; nil for other refs
+	db    *DB
+	path  []string
+	user  *User    // signs writes into the user's space; nil for other refs
+	codec KeyCodec // seals the keys of the path; nil for plain names
+}
+
+// KeyCodec seals the names of a part of the graph, so that what is stored
+// (and what relays see) are tokens that mean nothing without it. Seal
+// returns the field that stands for name in the node soul; Open returns
+// the name a field stands for, with ok false for a field it did not seal.
+// Both must be deterministic. *pathmap.Key is one (package sea/pathmap).
+type KeyCodec interface {
+	Seal(soul, name string) string
+	Open(soul, field string) (name string, ok bool)
+}
+
+// Sealed returns this ref with every key below it sealed by c: Get, Put,
+// Set, Once, On, Map, Node and Links take and give the real names, and
+// the graph holds the sealed ones. The child nodes a Put creates are
+// named after the sealed keys too, so their souls say nothing either.
+//
+//	vault := db.Get(root).Sealed(key)            // or user.Soul(root).Sealed(key)
+//	vault.Get("bank").Put(ctx, "IBAN DE89 ...")  // stored under a token
+//	iban, _ := vault.Get("bank").Once[string](ctx)
+//
+// Only names are sealed, not values: encrypt those too (key.ValueKey with
+// package sea). Refs made from this one with Get keep c.
+func (r *Ref) Sealed(c KeyCodec) *Ref {
+	return &Ref{db: r.db, path: r.path, user: r.user, codec: c}
 }
 
 // Get returns a reference to the field key of this node.
 func (r *Ref) Get(key string) *Ref {
-	return &Ref{db: r.db, path: append(slices.Clip(r.path), key), user: r.user}
+	return &Ref{db: r.db, path: append(slices.Clip(r.path), key), user: r.user, codec: r.codec}
+}
+
+// reader returns a reader for r's reads.
+func (r *Ref) reader(ctx context.Context, net bool) *reader {
+	return &reader{db: r.db, ctx: ctx, net: net, codec: r.codec}
 }
 
 // Key returns the last key of the path (the soul, for a root ref).
@@ -69,8 +100,7 @@ func (r *Ref) addTo(ctx context.Context, g graph, v any, state float64) error {
 	if _, isLink := linkOf(obj); !ok || isLink {
 		return errRootPut(r.path[0])
 	}
-	rd := &reader{db: r.db, ctx: ctx, net: true}
-	return rd.build(g, r.path[0], obj, state)
+	return r.reader(ctx, true).build(g, r.path[0], obj, state)
 }
 
 // write signs g if r belongs to a user, and writes it.
@@ -138,7 +168,7 @@ func (r *Ref) setTo(ctx context.Context, g graph, v any, state float64) (*Ref, e
 //	name, err := db.Get("alice").Get("name").Once[string](ctx)
 func (r *Ref) Once[T any](ctx context.Context) (T, error) {
 	var zero T
-	rd := &reader{db: r.db, ctx: ctx, net: true}
+	rd := r.reader(ctx, true)
 	v, err := rd.at(r.path)
 	if err != nil {
 		return zero, err
@@ -163,13 +193,14 @@ func (r *Ref) Once[T any](ctx context.Context) (T, error) {
 // Node reads the node here as it is stored, without following its links,
 // like gun.once in JS: a linked node comes back as a Link holding its soul,
 // and only this node is requested from peers. Deleted fields are kept, as
-// Null, and SEA-signed values are returned unwrapped. It returns ErrNotFound
+// Null, and SEA-signed values are returned unwrapped. Through a Sealed ref
+// the field names are the real ones. It returns ErrNotFound
 // if there is no node here, and an error if the value here is not a node.
 //
 //	n, err := db.Get("todos").Node(ctx)
 //	for key, v := range n.Fields { ... }
 func (r *Ref) Node(ctx context.Context) (*Node, error) {
-	rd := &reader{db: r.db, ctx: ctx, net: true}
+	rd := r.reader(ctx, true)
 	v, err := rd.at(r.path)
 	if err != nil {
 		return nil, err
@@ -184,6 +215,14 @@ func (r *Ref) Node(ctx context.Context) (*Node, error) {
 		}
 		if n == nil {
 			return nil, ErrNotFound
+		}
+		if r.codec != nil { // the real names, not the sealed ones
+			opened := &Node{Soul: n.Soul, Fields: make(map[string]Value, len(n.Fields)), States: make(map[string]float64, len(n.Fields))}
+			for k, v := range n.Fields {
+				name := rd.open(n.Soul, k)
+				opened.Fields[name], opened.States[name] = v, n.States[k]
+			}
+			n = opened
 		}
 		return n, nil
 	default:
@@ -230,7 +269,7 @@ func (r *Ref) On[T any](fn func(T)) (off func()) {
 	tree := newTreeCache() // only what changed is read again
 	return r.db.watch(func(rd *reader) func() {
 		tree.update(rd.changed)
-		rd.tree = tree
+		rd.tree, rd.codec = tree, r.codec
 		v, err := rd.at(r.path)
 		if err != nil || v == nil {
 			return nil
@@ -249,8 +288,10 @@ func (r *Ref) On[T any](fn func(T)) (off func()) {
 	})
 }
 
-// root returns a ref to the node soul that signs like r does.
-func (r *Ref) root(soul string) *Ref { return &Ref{db: r.db, path: []string{soul}, user: r.user} }
+// root returns a ref to the node soul that signs and seals like r does.
+func (r *Ref) root(soul string) *Ref {
+	return &Ref{db: r.db, path: []string{soul}, user: r.user, codec: r.codec}
+}
 
 // Map returns a view over the items of the node at this ref (the entries of
 // a Set, or the fields of any node), like gun.map() in JS.
@@ -261,8 +302,7 @@ func (r *Ref) Map() *MapRef { return &MapRef{ref: r} }
 // this DB knows it; Put and Set first read from peers the souls of the
 // refs they are given, so there they link to the node as peers have it.
 func (r *Ref) MarshalJSON() ([]byte, error) {
-	rd := &reader{db: r.db, ctx: r.db.ctx}
-	return Link{Soul: rd.soulOf(r.path)}.MarshalJSON()
+	return Link{Soul: r.reader(r.db.ctx, false).soulOf(r.path)}.MarshalJSON()
 }
 
 // MapRef is the result of Ref.Map.
@@ -279,6 +319,7 @@ func (m *MapRef) On[T any](fn func(key string, v T)) (off func()) {
 	r := m.ref
 	w := newMapWatch(r.path)
 	return r.db.watch(func(rd *reader) func() {
+		rd.codec = r.codec
 		type item struct {
 			key string
 			val T
