@@ -35,7 +35,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"strings"
+	"sync"
 
 	"ella.to/gundb/sea"
 )
@@ -48,7 +51,7 @@ var b64 = base64.RawURLEncoding
 // Key is the key of one scope. It is safe for concurrent use.
 type Key struct {
 	raw   []byte
-	mac   []byte       // keys the HMAC that makes the IV
+	macs  sync.Pool    // HMACs keyed for the IV, reused: one costs several allocations
 	block cipher.Block // AES-256, encrypts the padded name
 	val   string       // the key values in the scope are encrypted with
 }
@@ -71,12 +74,14 @@ func KeyFrom(raw []byte) (*Key, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Key{
+	k := &Key{
 		raw:   append([]byte(nil), raw...),
-		mac:   derive(raw, "mac"),
 		block: block,
 		val:   base64.StdEncoding.EncodeToString(derive(raw, "val")),
-	}, nil
+	}
+	mac := derive(raw, "mac")
+	k.macs.New = func() any { return hmac.New(sha256.New, mac) }
+	return k, nil
 }
 
 // derive returns the subkey of raw for purpose.
@@ -125,11 +130,14 @@ func (k *Key) Open(soul, field string) (name string, ok bool) {
 
 // iv is the synthetic IV: the first 16 bytes of HMAC(soul, 0, padded name).
 func (k *Key) iv(soul string, p []byte) []byte {
-	m := hmac.New(sha256.New, k.mac)
-	m.Write([]byte(soul))
+	m := k.macs.Get().(hash.Hash)
+	defer k.macs.Put(m)
+	m.Reset()
+	io.WriteString(m, soul)
 	m.Write([]byte{0})
 	m.Write(p)
-	return m.Sum(nil)[:aes.BlockSize]
+	var sum [sha256.Size]byte
+	return append([]byte(nil), m.Sum(sum[:0])[:aes.BlockSize]...)
 }
 
 // pad pads name to a multiple of 16 bytes, PKCS #7 style: n bytes of n.

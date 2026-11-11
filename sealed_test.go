@@ -184,3 +184,44 @@ func TestSealedUserScopeThroughRelay(t *testing.T) {
 		t.Fatalf("alice's node lists %v", slices.Collect(maps.Keys(n.Fields)))
 	}
 }
+
+// BenchmarkSealed is the cost of sealing: the same three-key path written
+// and read plain and through Ref.Sealed.
+func BenchmarkSealed(b *testing.B) {
+	key, err := pathmap.NewKey()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, sealed := range []bool{false, true} {
+		name := "plain"
+		if sealed {
+			name = "sealed"
+		}
+		db := New()
+		defer db.Close()
+		ctx := context.Background()
+		ref := db.Get("scope")
+		if sealed {
+			ref = ref.Sealed(key)
+		}
+		ref = ref.Get("accounts").Get("main")
+		b.Run("put/"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				i++
+				if err := ref.Put(ctx, map[string]any{"bank": "IBAN", "n": i}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("once/"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ref.Once[map[string]any](ctx); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
